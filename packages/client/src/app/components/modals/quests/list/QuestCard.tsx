@@ -184,6 +184,7 @@ export const QuestCard = ({
           text={getButtonText(status)}
           onClick={() => {
             triggerQuestDetailsModal(quest.entity);
+            if (getButtonText(status) === 'Complete' && quest.complete === false) complete(quest);
           }}
         />
       </ButtonRow>

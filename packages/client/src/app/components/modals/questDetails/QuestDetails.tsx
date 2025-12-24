@@ -10,15 +10,18 @@ import { getAccount, queryAccountFromEmbedded } from 'network/shapes/Account';
 import {
   Quest,
   filterOngoingQuests,
+  findNextQuestInChain,
   getBaseQuest,
   getQuestByEntityIndex,
   meetsObjectives,
   parseQuestObjectives,
   parseQuestStatus,
   populateQuest,
+  queryQuestInstance,
   queryRegistryQuests,
 } from 'network/shapes/Quest';
 import { BaseQuest } from 'network/shapes/Quest/quest';
+import { getFromDescription } from 'network/shapes/utils/parse';
 import { didActionSucceed } from 'network/utils';
 import { useComponentEntities } from 'network/utils/hooks';
 import { playClick } from 'utils/sounds';
@@ -54,6 +57,14 @@ export const QuestDetailsModal: UIComponent = {
           populate: (base: BaseQuest) => populateQuest(world, components, base),
           parseObjectives: (quest: Quest) =>
             parseQuestObjectives(world, components, account, quest),
+          describeEntity: (type: string, index: number) =>
+            getFromDescription(world, components, type, index),
+          findNextInChain: (questIndex: number) => {
+            const registry = queryRegistryQuests(components).map((e) =>
+              getBaseQuest(world, components, e)
+            );
+            return findNextQuestInChain(world, components, account, questIndex, registry);
+          },
         },
       };
     })();
@@ -63,7 +74,7 @@ export const QuestDetailsModal: UIComponent = {
 
     const { actions, api, components, world } = network;
     const { IsRegistry, OwnsQuestID, IsComplete } = components;
-    const { getBase, populate, parseObjectives } = utils;
+    const { getBase, populate, parseObjectives, describeEntity, findNextInChain } = utils;
 
     const isModalOpen = useVisibility((s) => s.modals.questDialogue);
     const setModals = useVisibility((s) => s.setModals);
@@ -100,7 +111,12 @@ export const QuestDetailsModal: UIComponent = {
       }
 
       const base = getBase(questIndex);
-      const populated = populate(base);
+      // this will avoid teh accept button buggin out
+      const instance = queryQuestInstance(world, base.index, data.accountEntity);
+      const entityToUse = instance ?? questIndex;
+
+      const actualBase = getBase(entityToUse);
+      const populated = populate(actualBase);
       const parsed = parseObjectives(populated);
       const filtered = filterOngoingQuests([parsed]);
       setQuest(filtered[0]);
@@ -147,12 +163,28 @@ export const QuestDetailsModal: UIComponent = {
       handleStateUpdate(tx, true);
     };
 
+    // journey onwards to next quest in chain
+    const journeyOnwards = () => {
+      if (quest?.index === undefined) {
+        setModals({ questDialogue: false });
+        playClick();
+        return;
+      }
+      const nextQuest = findNextInChain(quest.index);
+      setModals({ questDialogue: false });
+      if (nextQuest) {
+        useSelected.setState({ questIndex: nextQuest.entity });
+        setTimeout(() => setModals({ questDialogue: true }), 250);
+      }
+      playClick();
+    };
+
     if (!quest) return <></>;
 
     return (
       <ModalWrapper
         id='questDialogue'
-        header={<Header>{quest?.name}</Header>}
+        header={<Header color='#5e4a14ff'>{quest?.name}</Header>}
         canExit
         backgroundColor={`#f8f6e4`}
         noScroll
@@ -166,15 +198,20 @@ export const QuestDetailsModal: UIComponent = {
         />
         <Bottom
           color='#5e4a14ff'
+          rewards={quest.rewards}
+          objectives={quest.objectives}
+          describeEntity={describeEntity}
           buttons={{
             AcceptButton: {
               backgroundColor: '#f8f6e4',
-              onClick: () => {
-                acceptQuest(quest);
-                playClick();
-              },
-              disabled: quest.startTime !== 0,
-              label: 'Accept',
+              onClick: quest.complete
+                ? journeyOnwards
+                : () => {
+                    acceptQuest(quest);
+                    playClick();
+                  },
+              disabled: quest.complete ? !findNextInChain(quest.index) : quest.startTime !== 0,
+              label: quest.complete ? 'Journey Onwards' : 'Accept',
             },
             CompleteButton: {
               backgroundColor: '#f8f6e4',
@@ -192,11 +229,11 @@ export const QuestDetailsModal: UIComponent = {
   },
 };
 
-const Header = styled.div`
+const Header = styled.div<{ color?: string }>`
   border-color: white;
   padding: 0.7vw 1vw 0.2vw 1vw;
   width: 95%;
-
+  color: ${({ color }) => color};
   font-size: 1.4vw;
   font-weight: bold;
   line-height: 2vw;
