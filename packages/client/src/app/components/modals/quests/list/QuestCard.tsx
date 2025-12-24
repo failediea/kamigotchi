@@ -1,7 +1,8 @@
 import styled from 'styled-components';
 
-import { ActionListButton, IconButton, Overlay, TextTooltip } from 'app/components/library';
+import { ActionListButton, IconButton, TextTooltip } from 'app/components/library';
 import { triggerQuestDetailsModal } from 'app/triggers/triggerQuestDetailsModal';
+import { mainQuestIcon } from 'assets/images/icons/misc';
 import { Allo } from 'network/shapes/Allo';
 import { parseConditionalTracking } from 'network/shapes/Conditional';
 import { meetsObjectives, Objective, Quest } from 'network/shapes/Quest';
@@ -51,7 +52,7 @@ export const QuestCard = ({
   const getFactionStamp = (quest: Quest) => {
     const reward = quest.rewards.find((r) => r.type === 'REPUTATION');
     if (!reward) return null;
-    const index = reward.index;
+    const index = reward.index ?? 0;
 
     let iconKey = '';
     if (index === 1) iconKey = 'agency';
@@ -61,7 +62,12 @@ export const QuestCard = ({
     const key = `faction-${index}`;
     if (!imageCache.has(key)) {
       const icon = getFactionImage(iconKey ?? 'agency');
-      const component = <Image src={icon} size={1.8} />;
+      const entity = describeEntity('FACTION', index);
+      const component = (
+        <TextTooltip key={key} text={[entity.name]} direction='row'>
+          <IconImage src={icon} size={1.8} />
+        </TextTooltip>
+      );
       imageCache.set(key, component);
     }
 
@@ -135,11 +141,22 @@ export const QuestCard = ({
   /////////////////
   // RENDER
   const factionStamp = getFactionStamp(quest);
+  const isMainQuest = quest.typeComp === 'MAIN';
+  
   return (
-    <Container key={quest.id} completed={status === 'COMPLETED'}>
+    <Container key={quest.id} completed={status === 'COMPLETED'} isMainQuest={isMainQuest}>
       <Title>
         {quest.name}
-        {factionStamp && <Faction>{factionStamp}</Faction>}
+        <IconsContainer>
+          {isMainQuest && (
+            <Faction>
+              <TextTooltip text={['Main Questline']} direction='row'>
+                <IconImage src={mainQuestIcon} size={1.8} />
+              </TextTooltip>
+            </Faction>
+          )}
+          {factionStamp && <Faction>{factionStamp}</Faction>}
+        </IconsContainer>
       </Title>
       <Section key='objectives' style={{ display: quest.objectives.length > 0 ? 'block' : 'none' }}>
         <SubTitle>Objectives</SubTitle>
@@ -161,13 +178,6 @@ export const QuestCard = ({
           ))}
         </Row>
       </Section>
-      {quest.typeComp === 'MAIN' && (
-        <Overlay top={4.5} right={2}>
-          <div style={{ display: 'flex', flexDirection: 'row', justifyContent: 'space-between' }}>
-            {quest.typeComp.toLowerCase()}
-          </div>
-        </Overlay>
-      )}
       <ButtonRow>
         <IconButton
           scale={2.5}
@@ -181,13 +191,13 @@ export const QuestCard = ({
   );
 };
 
-const Container = styled.div<{ completed?: boolean }>`
+const Container = styled.div<{ completed?: boolean; isMainQuest?: boolean }>`
   position: relative;
   border: solid black 0.15vw;
   border-radius: 1.2vw;
   padding: 1.2vw;
   margin: 0.9vw;
-  background-color: #fff;
+  background-color: ${({ isMainQuest }) => (isMainQuest ? '#E8F5E9' : '#fff')};
 
   display: flex;
   flex-flow: column nowrap;
@@ -212,11 +222,21 @@ const Title = styled.div`
   flex-wrap: nowrap;
 `;
 
+const IconsContainer = styled.div`
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.3vw;
+`;
+
 const Faction = styled.div`
   border: 0.15vw solid #e4c270;
   border-radius: 6.5vw;
   height: 2vw;
   width: 2vw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 `;
 
 const Section = styled.div`
@@ -257,12 +277,19 @@ const ConditionText = styled.div<{ objective: boolean }>`
   align-items: center;
   border: solid black 0.15vw;
   border-radius: 0.3vw;
+  background-color: #fff;
 `;
 
 const Image = styled.img<{ size: number }>`
   height: ${({ size }) => size}vw;
   width: ${({ size }) => size}vw;
   margin-right: ${({ size }) => size * 0.2}vw;
+  user-drag: none;
+`;
+
+const IconImage = styled.img<{ size: number }>`
+  height: ${({ size }) => size}vw;
+  width: ${({ size }) => size}vw;
   user-drag: none;
 `;
 
