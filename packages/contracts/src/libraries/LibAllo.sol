@@ -209,6 +209,7 @@ library LibAllo {
       if (type_.eq("ITEM_DROPTABLE")) commitIDs[i] = giveDT(world, components, alloID, amt, mult, targetID);
       else if (type_.eq("STAT")) giveStat(components, indexComp.get(alloID), amt, mult, targetID);
       else if (type_.eq("BONUS")) giveBonus(components, alloID, mult, targetID);
+      else if (type_.eq("CLEAR_BONUS")) LibBonus.clearAll(components, targetID);
       else giveBasic(world, components, type_, indexComp.get(alloID), amt, mult, targetID);
     }
   }
