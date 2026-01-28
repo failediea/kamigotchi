@@ -1,11 +1,88 @@
-import { EntityID } from 'engine/recs';
+import { DroptableReveal, SacrificeReveal, subscribeToFeed } from 'clients/kamiden';
+import { EntityID, World } from 'engine/recs';
 import { formatEntityID } from 'engine/utils';
-import { subscribeToFeed, DroptableReveal } from 'clients/kamiden';
-import { getItemDetailsByIndex } from 'network/shapes/Item';
-import { NotificationSystem } from '../NotificationSystem';
-import { NetworkLayer } from 'network/';
+import { Components, NetworkLayer } from 'network/';
 import { getAccountFromEmbedded } from 'network/shapes/Account';
+import { getItemByIndex } from 'network/shapes/Item';
+import { getKami } from 'network/shapes/Kami';
 import { log } from 'utils/logger';
+import { NotificationSystem } from '../NotificationSystem';
+
+type RevealBase = {
+  HolderID: string;
+  CommitID: string;
+  ItemIndices: number[];
+  ItemAmounts: string[];
+  Timestamp: number;
+};
+
+type ParsedRevealItem = {
+  index: number;
+  amount: string;
+  name: string;
+};
+
+function parseRevealResults(
+  world: World,
+  components: Components,
+  reveal: RevealBase
+): ParsedRevealItem[] {
+  const results: ParsedRevealItem[] = [];
+
+  for (let i = 0; i < reveal.ItemIndices.length; i++) {
+    const amount = reveal.ItemAmounts[i];
+    const rawIndex = reveal.ItemIndices[i];
+
+    if (!amount || amount === '0') continue;
+
+    const item = getItemByIndex(world, components, rawIndex);
+    if (item.index === 0) continue;
+
+    results.push({
+      index: item.index,
+      amount,
+      name: item.name,
+    });
+  }
+
+  return results;
+}
+
+function processReveal(
+  world: World,
+  components: Components,
+  notifications: NotificationSystem,
+  reveal: RevealBase,
+  accountID: string,
+  config: { logPrefix: string; notifPrefix: string; title: string }
+): void {
+  const holderID = formatEntityID(reveal.HolderID);
+  if (holderID !== accountID) return;
+
+  if (reveal.ItemIndices.length !== reveal.ItemAmounts.length) {
+    log.warn(`${config.logPrefix}: misaligned arrays`, { commitID: reveal.CommitID });
+    return;
+  }
+
+  const commitID = formatEntityID(reveal.CommitID);
+  const notifId = `${config.notifPrefix}-${commitID}` as EntityID;
+  if (notifications.has(notifId)) return;
+
+  const results = parseRevealResults(world, components, reveal);
+  if (results.length === 0) return;
+
+  const descriptionText = 'Received: ' + results.map((r) => `x${r.amount} ${r.name}`).join(', ');
+
+  notifications.add({
+    id: notifId,
+    title: config.title,
+    description: descriptionText,
+    itemIndices: results.map((r) => r.index),
+    itemAmounts: results.map((r) => r.amount),
+    time: (reveal.Timestamp * 1000).toString(),
+    modal: 'inventory',
+  });
+}
 
 export function setupKamidenRevealHandler(
   network: NetworkLayer,
@@ -21,61 +98,22 @@ export function setupKamidenRevealHandler(
 
     feed.DroptableReveals.forEach((reveal: DroptableReveal) => {
       log.debug('Got reveal');
-      const holderID = formatEntityID(reveal.HolderID);
-      if (holderID !== accountID) return;
-
-      if (reveal.ItemIndices.length !== reveal.ItemAmounts.length) {
-        console.warn('DroptableReveal: misaligned arrays', reveal.CommitID);
-        return;
-      }
-
-      const commitID = formatEntityID(reveal.CommitID);
-      const notifId = `DroptableReveal-${commitID}` as EntityID;
-      if (notifications.has(notifId)) return;
-
-      const results: string[] = [];
-      for (let i = 0; i < reveal.ItemIndices.length; i++) {
-        const rawAmount = reveal.ItemAmounts[i];
-
-        // Validate input is a valid integer string before parsing
-        if (typeof rawAmount !== 'string' || !/^-?\d+$/.test(rawAmount)) {
-          log.warn(`DroptableReveal: invalid ItemAmount at index ${i}`, { commitID, rawAmount });
-          continue;
-        }
-
-        let parsedAmountBigInt: bigint;
-        try {
-          parsedAmountBigInt = BigInt(rawAmount);
-        } catch (e) {
-          log.warn(`DroptableReveal: failed to parse ItemAmount at index ${i}`, { commitID, rawAmount, error: e });
-          continue;
-        }
-
-        if (parsedAmountBigInt <= 0n) continue;
-
-        // Check if value exceeds safe integer range to avoid precision loss
-        if (parsedAmountBigInt > BigInt(Number.MAX_SAFE_INTEGER)) {
-          log.warn(`DroptableReveal: ItemAmount exceeds safe integer range at index ${i}`, { commitID, rawAmount });
-          continue;
-        }
-
-        const amount = Number(parsedAmountBigInt);
-        if (!Number.isSafeInteger(amount) || amount <= 0) continue;
-
-        const item = getItemDetailsByIndex(world, components, reveal.ItemIndices[i]);
-        if (item.index === 0) continue;
-
-        results.push(`x${amount} ${item.name}`);
-      }
-
-      if (results.length === 0) return;
-
-      notifications.add({
-        id: notifId,
+      processReveal(world, components, notifications, reveal, accountID, {
+        logPrefix: 'DroptableReveal',
+        notifPrefix: 'DroptableReveal',
         title: 'Items revealed!',
-        description: 'Received: ' + results.join(', '),
-        time: (reveal.Timestamp * 1000).toString(),
-        modal: 'inventory',
+      });
+    });
+
+    feed.SacrificeReveals.forEach((reveal: SacrificeReveal) => {
+      log.debug('Got sacrifice reveal');
+      const kamiIndex = world.entityToIndex.get(formatEntityID(reveal.KamiID));
+      const kami = getKami(world, components, kamiIndex!);
+      const kamiName = kami?.name ?? 'Kami';
+      processReveal(world, components, notifications, reveal, accountID, {
+        logPrefix: 'SacrificeReveal',
+        notifPrefix: 'sacrificeReveal',
+        title: `${kamiName} sacrificed!`,
       });
     });
   });
