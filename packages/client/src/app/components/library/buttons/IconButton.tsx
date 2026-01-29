@@ -1,57 +1,97 @@
 import { SvgIconComponent } from '@mui/icons-material';
 import { ForwardedRef, forwardRef } from 'react';
-import styled from 'styled-components';
+import styled, { css } from 'styled-components';
 
-import { clickFx, hoverFx, pulseFx } from 'app/styles/effects';
+import { clickFx, hoverFx, pulseFx, shakeFx } from 'app/styles/effects';
 import { playClick } from 'utils/sounds';
 
-interface Props {
-  img?: string | SvgIconComponent;
-  onClick: Function;
-  text?: string;
-  width?: number;
-  color?: string;
-  disabled?: boolean;
-  fullWidth?: boolean;
-  pulse?: boolean;
-  balance?: number;
-  corner?: boolean;
-  cornerAlt?: boolean;
-  radius?: number;
-  scale?: number;
-  scaleOrientation?: 'vw' | 'vh';
-  shadow?: boolean;
-  flatten?: `left` | `right`; // flattens a side, for use with dropdowns
-}
-
-// ActionButton is a text button that triggers an Action when clicked
+// IconButton is a button that triggers an action when clicked
+// TODO: clean up these parameters as nested objects
 export const IconButton = forwardRef(function IconButton(
-  props: Props,
+  {
+    img,
+    onClick,
+    text,
+    disabled,
+    color,
+    fullWidth,
+    pulse,
+    shadow,
+    width,
+    flatten,
+    balance,
+    corner,
+    cornerAlt,
+    radius = 0.45,
+    scale = 2.5,
+    scaleOrientation = 'vw',
+    icon,
+    filter,
+    noBorder,
+    shake,
+    cooldownBackground,
+  }: {
+    onClick: Function;
+    img?: string | SvgIconComponent; // TODO: get rid of all svg icons and mui references
+    text?: string;
+    width?: number;
+    shake?: boolean;
+
+    // general styling
+    color?: string;
+    disabled?: boolean;
+    fullWidth?: boolean;
+    pulse?: boolean;
+    cooldownBackground?: string;
+
+    balance?: number; // shows a balance on icon (for Inventory)
+    corner?: boolean; // indicates button has options
+    cornerAlt?: boolean; // open page in new tab indicator
+
+    radius?: number;
+    scale?: number;
+    scaleOrientation?: 'vw' | 'vh';
+    shadow?: boolean;
+    flatten?: `left` | `right`; // flattens a side, for use with dropdowns
+    noBorder?: boolean;
+    icon?: {
+      size?: number;
+      inset?: { px?: number; x?: number; y?: number };
+      color?: string;
+      position?: 'left' | 'right';
+    };
+    filter?: string;
+  },
   ref: ForwardedRef<HTMLButtonElement>
 ) {
-  const { img, onClick, text, disabled } = props;
-  const { color, fullWidth, pulse, shadow, width, flatten } = props; // general styling
-  const { balance, corner } = props; // IconListButton options
-  const { cornerAlt } = props; // open page in new tab indicator
-
-  const radius = props.radius ?? 0.45;
-  const scale = props.scale ?? 2.5;
-  const scaleOrientation = props.scaleOrientation ?? 'vw';
-
   // layer on a sound effect
   const handleClick = async () => {
     playClick();
     await onClick();
   };
 
+  const resolvedIconInsetPx = icon?.inset?.px ?? 0;
+  const resolvedIconInsetXpx = icon?.inset?.x ?? undefined;
+  const resolvedIconInsetYpx = icon?.inset?.y ?? undefined;
+
   const MyImage = () => {
     if (img) {
       if (typeof img === 'string') {
-        return <Image src={img} scale={scale} orientation={scaleOrientation} />;
+        return (
+          <Image
+            src={img}
+            scale={scale}
+            orientation={scaleOrientation}
+            iconInsetPx={resolvedIconInsetPx}
+            iconInsetXpx={resolvedIconInsetXpx}
+            iconInsetYpx={resolvedIconInsetYpx}
+            filter={filter}
+          />
+        );
       }
-
+      // This allows the use of MUI icons, we want this to use placeholders until Lux has the icons ready
       const Icon = img;
-      return <Icon />;
+      return <Icon sx={{ fontSize: `${scale * 0.75}${scaleOrientation}` }} />;
     }
   };
 
@@ -69,21 +109,25 @@ export const IconButton = forwardRef(function IconButton(
       shadow={shadow}
       ref={ref}
       flatten={flatten}
+      noBorder={noBorder}
+      filter={filter}
+      shake={shake}
+      cooldownBackground={cooldownBackground}
     >
       {MyImage()}
       {text && (
-        <Text scale={scale} orientation={scaleOrientation}>
+        <Text scale={scale} orientation={scaleOrientation} withIcon={!!img}>
           {text}
         </Text>
       )}
-      {balance && <Balance>{balance}</Balance>}
+      {balance !== undefined && <Balance>{balance}</Balance>}
       {corner && <Corner radius={radius - 0.15} orientation={scaleOrientation} flatten={flatten} />}
       {cornerAlt && <CornerAlt radius={radius - 0.15} orientation={scaleOrientation} />}
     </Container>
   );
 });
 
-interface ContainerProps {
+const Container = styled.button<{
   width?: number;
   color: string;
   scale: number;
@@ -94,11 +138,13 @@ interface ContainerProps {
   pulse?: boolean;
   flatten?: `left` | `right`;
   shadow?: boolean;
-}
-
-const Container = styled.button<ContainerProps>`
+  noBorder?: boolean;
+  filter?: string;
+  shake?: boolean;
+  cooldownBackground?: string;
+}>`
   position: relative;
-  border: solid black 0.15vw;
+  border: ${({ noBorder }) => (noBorder ? 'none' : 'solid black 0.15vw')};
   border-radius: ${({ radius, orientation }) => `${radius}${orientation}`};
 
   height: ${({ scale, orientation }) => `${scale}${orientation}`};
@@ -111,7 +157,8 @@ const Container = styled.button<ContainerProps>`
   flex-flow: row nowrap;
   justify-content: center;
   align-items: center;
-  background-color: ${({ color, disabled }) => (disabled ? '#bbb' : color)};
+  background: ${({ color, disabled, cooldownBackground }) =>
+    cooldownBackground || (disabled ? '#bbb' : color)};
   box-shadow: ${({ shadow, scale }) => shadow && `0 0 ${scale * 0.1}vw black`};
 
   cursor: ${({ disabled }) => (disabled ? 'help' : 'pointer')};
@@ -126,33 +173,48 @@ const Container = styled.button<ContainerProps>`
         ` border-top-left-radius: 0;
       border-bottom-left-radius: 0;
   `}
+
+  ${({ pulse }) => pulse && pulseAnimationRule}
+  ${({ shake }) => shake && shakeAnimationRule}
+
   &:hover {
     animation: ${() => hoverFx()} 0.2s;
     transform: scale(1.05);
+    z-index: 1;
   }
   &:active {
     animation: ${() => clickFx()} 0.3s;
   }
-
-  ${({ pulse }) => pulse && `animation: ${pulseFx} 2.5s ease-in-out infinite;`}
 `;
 
-const Image = styled.img<{ scale: number; orientation: string }>`
-  width: ${({ scale }) => scale * 0.75}${({ orientation }) => orientation};
-  height: ${({ scale }) => scale * 0.75}${({ orientation }) => orientation};
-  ${({ scale }) => (scale > 4.5 ? 'image-rendering: pixelated;' : '')}
+const Image = styled.img<{
+  scale: number;
+  orientation: string;
+  iconInsetPx?: number;
+  iconInsetXpx?: number;
+  iconInsetYpx?: number;
+  filter?: string;
+}>`
+  width: ${({ scale, orientation, iconInsetPx, iconInsetXpx }) =>
+    `calc(${scale * 0.75}${orientation} - ${iconInsetXpx ?? iconInsetPx ?? 0}px)`};
+  height: ${({ scale, orientation, iconInsetPx, iconInsetYpx }) =>
+    `calc(${scale * 0.75}${orientation} - ${iconInsetYpx ?? iconInsetPx ?? 0}px)`};
+  ${({ scale }) => (scale > 4 ? 'image-rendering: pixelated;' : '')}
   user-drag: none;
+  ${({ filter }) => filter && `filter: ${filter};`}
 `;
 
-const Text = styled.div<{ scale: number; orientation: string }>`
+const Text = styled.div<{ scale: number; orientation: string; withIcon?: boolean }>`
   font-size: ${({ scale }) => scale * 0.3}${({ orientation }) => orientation};
+  padding: ${({ withIcon }) => (withIcon ? '0' : '0 0.6vw')};
 `;
 
 // TODO: get this scaling correctly with parent hover
 const Corner = styled.div<{ radius: number; orientation: string; flatten?: string }>`
   position: absolute;
   border: solid black ${({ radius }) => radius}${({ orientation }) => orientation};
-  border-bottom-right-radius: ${({ radius, flatten }) => (flatten === 'right' ? 0 : radius - 0.15)}${({ orientation }) => orientation};
+  border-bottom-right-radius: ${({ radius, flatten }) =>
+      flatten === 'right' ? 0 : radius - 0.15}${({ orientation }) => orientation};
   border-color: transparent black black transparent;
   bottom: 0;
   right: 0;
@@ -185,4 +247,12 @@ const Balance = styled.div`
   align-items: center;
   justify-content: center;
   padding: 0.2vw;
+`;
+
+const pulseAnimationRule = css`
+  animation: ${pulseFx} 2.5s ease-in-out infinite;
+`;
+
+const shakeAnimationRule = css`
+  animation: ${shakeFx} 0.5s ease-in-out infinite;
 `;

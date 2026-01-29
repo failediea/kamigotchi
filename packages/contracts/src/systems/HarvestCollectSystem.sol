@@ -25,6 +25,14 @@ contract HarvestCollectSystem is System {
     uint256 accID = LibAccount.getByOperator(components, msg.sender);
     uint256 kamiID = LibHarvest.getKami(components, id);
 
+    // (ach) temporary blocker for temple of the wheel
+    if (LibKami.getRoom(components, kamiID) == 19) {
+      require(
+        LibAccount.getIndex(components, accID) == 833,
+        "you aren't even supposed to be here.."
+      );
+    }
+
     // standard checks (ownership, cooldown, state)
     LibHarvest.verifyIsHarvest(components, id);
     LibKami.verifyAccount(components, kamiID, accID);
@@ -36,15 +44,61 @@ contract HarvestCollectSystem is System {
     LibKami.verifyHealthy(components, kamiID);
     LibKami.verifyRoom(components, kamiID, accID);
 
+    // collect harvest
+    LibAccount.updateLastTs(components, accID);
+    return abi.encode(_collect(id, accID, kamiID));
+  }
+
+  /// @dev executes, but does not revert on failure
+  function executeAllowFailure(bytes memory arguments) public returns (bytes memory) {
+    uint256 id = abi.decode(arguments, (uint256));
+    uint256 accID = LibAccount.getByOperator(components, msg.sender);
+    uint256 kamiID = LibHarvest.getKami(components, id);
+
+    if (!LibHarvest.isHarvest(components, id)) return abi.encode(0);
+    if (!LibKami.checkAccount(components, kamiID, accID)) return abi.encode(0);
+    if (!LibKami.isState(components, kamiID, "HARVESTING")) return abi.encode(0);
+    if (LibKami.onCooldown(components, kamiID)) return abi.encode(0);
+
+    LibKami.sync(components, kamiID);
+    if (!LibKami.isHealthy(components, kamiID)) return abi.encode(0);
+    if (!LibKami.checkRoom(components, kamiID, accID)) return abi.encode(0);
+
+    LibAccount.updateLastTs(components, accID);
+    return abi.encode(_collect(id, accID, kamiID));
+  }
+
+  function executeTyped(uint256 id) public returns (bytes memory) {
+    return execute(abi.encode(id));
+  }
+
+  // naive batched execution - todo: optimize
+  function executeBatched(uint256[] memory ids) public returns (bytes[] memory) {
+    bytes[] memory results = new bytes[](ids.length);
+    for (uint256 i; i < ids.length; i++) results[i] = execute(abi.encode(ids[i]));
+    return results;
+  }
+
+  /// @dev executes, but does not revert on failure. returns 0 for array entry instead
+  function executeBatchedAllowFailure(uint256[] memory ids) public returns (bytes[] memory) {
+    bytes[] memory results = new bytes[](ids.length);
+    for (uint256 i; i < ids.length; i++) results[i] = executeAllowFailure(abi.encode(ids[i]));
+    return results;
+  }
+
+  ///////////////
+  // INTERNALS
+
+  function _collect(uint256 id, uint256 accID, uint256 kamiID) internal returns (uint256) {
     // process collection
     uint256 output = LibHarvest.claim(components, id, accID);
     LibExperience.inc(components, kamiID, output);
-    LibKami.setLastActionTs(components, kamiID, block.timestamp);
+    LibKami.resetCooldown(components, kamiID);
 
     // scavenge
     uint256 nodeID = LibHarvest.getNode(components, id);
     uint32 nodeIndex = LibNode.getIndex(components, nodeID);
-    LibNode.scavenge(components, nodeIndex, output, accID); // implicit existance check
+    LibNode.scavenge(components, nodeIndex, output, accID); // implicit existence check
 
     // reset action bonuses
     LibBonus.resetUponHarvestAction(components, kamiID);
@@ -62,17 +116,6 @@ contract HarvestCollectSystem is System {
     LibHarvest.emitLog(world, "HARVEST_COLLECT", accID, kamiID, nodeIndex, output);
     LibAccount.updateLastTs(components, accID);
 
-    return abi.encode(output);
-  }
-
-  function executeTyped(uint256 id) public returns (bytes memory) {
-    return execute(abi.encode(id));
-  }
-
-  // naive batched execution - todo: optimize
-  function executeBatched(uint256[] memory ids) public returns (bytes[] memory) {
-    bytes[] memory results = new bytes[](ids.length);
-    for (uint256 i; i < ids.length; i++) results[i] = execute(abi.encode(ids[i]));
-    return results;
+    return output;
   }
 }

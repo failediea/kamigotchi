@@ -1,4 +1,4 @@
-import { defineComponent, World, Type, Component, Metadata, SchemaOf } from "@mud-classic/recs";
+import { Component, defineComponent, Metadata, SchemaOf, Type, World } from 'engine/recs';
 
 export function defineNotificationComponent<T = undefined>(world: World) {
   const Notification = defineComponent(
@@ -8,8 +8,11 @@ export function defineNotificationComponent<T = undefined>(world: World) {
       description: Type.String,
       time: Type.String,
       modal: Type.OptionalString,
+      questIndex: Type.OptionalNumber,
+      itemIndices: Type.OptionalNumberArray,
+      itemAmounts: Type.OptionalStringArray,
     },
-    { id: "Notification" }
+    { id: 'Notification' }
   );
   return Notification as Component<SchemaOf<typeof Notification>, Metadata, T>;
 }

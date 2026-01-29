@@ -1,4 +1,4 @@
-import { EntityIndex } from '@mud-classic/recs';
+import { EntityIndex } from 'engine/recs';
 import { useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 
@@ -9,19 +9,28 @@ import { Kami } from 'network/shapes/Kami';
 import { AllyKards } from './AllyKards';
 import { EnemyCards } from './EnemyKards';
 
-interface Props {
-  account: Account;
-  kamiEntities: {
-    account: EntityIndex[];
-    node: EntityIndex[];
-  };
+export const Kards = ({
+  actions,
+  data,
+  display,
+  utils,
+  tick,
+}: {
   actions: {
     collect: (kami: Kami) => void;
     liquidate: (allyKami: Kami, enemyKami: Kami) => void;
     stop: (kami: Kami) => void;
   };
+  data: {
+    account: Account;
+    kamiEntities: {
+      account: EntityIndex[];
+      node: EntityIndex[];
+    };
+  };
   display: {
     UseItemButton: (kami: Kami, account: Account) => JSX.Element;
+    CastItemButton: (kami: Kami, account: Account) => JSX.Element;
   };
   utils: {
     getBonuses: (entity: EntityIndex) => BonusInstance[];
@@ -29,12 +38,11 @@ interface Props {
     getOwner: (kamiEntity: EntityIndex) => BaseAccount;
     getTempBonuses: (kami: Kami) => Bonus[];
   };
-}
-
-export const Kards = (props: Props) => {
-  const { actions, kamiEntities, account, display, utils } = props;
+  tick: number;
+}) => {
+  const { account, kamiEntities } = data;
   const { getKami } = utils;
-  const { modals } = useVisibility();
+  const nodeModalVisible = useVisibility((s) => s.modals.node);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [allies, setAllies] = useState<Kami[]>([]);
@@ -43,14 +51,6 @@ export const Kards = (props: Props) => {
   const [alliesUpdating, setAlliesUpdating] = useState(false);
   const [enemyEntities, setEnemyEntities] = useState<EntityIndex[]>([]);
   const [visibleEnemies, setVisibleEnemies] = useState(0); // count of visible enemies
-  const [lastRefresh, setLastRefresh] = useState(Date.now());
-
-  // ticking
-  useEffect(() => {
-    const refreshClock = () => setLastRefresh(Date.now());
-    const timerId = setInterval(refreshClock, 2500);
-    return () => clearInterval(timerId);
-  }, []);
 
   // identify ally vs enemy kamis whenever the list of kamis changes
   useEffect(() => {
@@ -66,19 +66,19 @@ export const Kards = (props: Props) => {
 
   // populate the ally kami data as new ones come in
   useEffect(() => {
-    if (!modals.node) return;
+    if (!nodeModalVisible) return;
     setAlliesUpdating(true);
     setAllies(allyEntities.map((entity) => getKami(entity, true)));
 
     setAlliesUpdating(false);
-  }, [modals.node, allyEntities]);
+  }, [nodeModalVisible, allyEntities]);
 
   // check to refresh ally data at each interval
   useEffect(() => {
-    if (!modals.node || alliesUpdating) return;
+    if (!nodeModalVisible || alliesUpdating) return;
     const newAllies = allies.map((ally) => getKami(ally.entity));
     setAllies(newAllies);
-  }, [modals.node, lastRefresh]);
+  }, [nodeModalVisible, tick]);
 
   // scrolling effects for enemy kards
   useEffect(() => {
@@ -120,19 +120,19 @@ export const Kards = (props: Props) => {
       style={{ display: kamiEntities.node.length > 0 ? 'flex' : 'none' }}
     >
       <AllyKards
-        account={account}
-        kamis={allies}
         actions={actions}
+        data={{ account, kamis: allies }}
         display={display}
         utils={utils}
+        tick={tick}
       />
       <EnemyCards
-        account={account}
-        allies={allies}
-        enemyEntities={enemyEntities}
         actions={actions}
+        data={{ account, allies, enemyEntities }}
+        display={display}
+        state={{ limit: { val: visibleEnemies, set: setVisibleEnemies } }}
         utils={utils}
-        limit={{ val: visibleEnemies, set: setVisibleEnemies }}
+        tick={tick}
       />
     </Container>
   );
@@ -143,4 +143,5 @@ const Container = styled.div`
   flex-flow: column nowrap;
   overflow-y: auto;
   gap: 0.3vw;
+  scrollbar-gutter: stable;
 `;

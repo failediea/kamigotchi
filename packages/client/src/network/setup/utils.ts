@@ -1,29 +1,20 @@
-import { JsonRpcProvider } from '@ethersproject/providers';
 import {
   Component,
   Components,
-  EntityID,
-  EntityIndex,
-  getComponentEntities,
   getComponentValue,
-  getComponentValueStrict,
   removeComponent,
   Schema,
   setComponent,
   Type,
   World,
-} from '@mud-classic/recs';
-import { Component as SolecsComponent } from '@mud-classic/solecs';
-import ComponentAbi from '@mud-classic/solecs/abi/Component.json';
-import { toEthAddress } from '@mud-classic/utils';
-import { Contract, Signer } from 'ethers';
-import { compact, toLower } from 'lodash';
-import { IComputedValue } from 'mobx';
+} from 'engine/recs';
+import { Contract } from 'ethers';
+import { compact } from 'lodash';
 import { filter, map, Observable, Subject, timer } from 'rxjs';
 
-import { createEncoder } from 'engine/encoders';
 import { Mappings } from 'engine/types';
 import { formatEntityID } from 'engine/utils';
+import { log } from 'utils/logger';
 import { Ack, ack } from 'workers/sync';
 import {
   isNetworkComponentUpdateEvent,
@@ -82,11 +73,11 @@ export function createSystemCallStreams<
     decodeAndEmitSystemCall: (systemCall: SystemCall<C>) => {
       const { tx } = systemCall;
 
-      const systemEntityIndex = world.entityToIndex.get(toLower(formatEntityID(tx.to)) as EntityID);
-      if (!systemEntityIndex) return;
+      const systemEntityIndex = world.entityToIndex.get(formatEntityID(tx.to));
+      if (systemEntityIndex === undefined) return;
 
       const hashedSystemId = getComponentValue(systemsRegistry, systemEntityIndex)?.value;
-      if (!hashedSystemId) return;
+      if (hashedSystemId === undefined) return;
 
       const { name, contract } = getSystemContract(hashedSystemId);
 
@@ -97,46 +88,18 @@ export function createSystemCallStreams<
         systemCallStreams[name] = new Subject<DecodedSystemCall<SystemTypes>>();
       }
 
+      const rawUpdates = Array.isArray((systemCall as any).updates)
+        ? ((systemCall as any).updates as NetworkComponentUpdate[])
+        : [];
+
       systemCallStreams[name].next({
         ...systemCall,
-        updates: compact(systemCall.updates.map(decodeNetworkComponentUpdate)),
+        updates: compact(rawUpdates.map(decodeNetworkComponentUpdate)),
         systemId: name,
-        args: decodedTx.args,
+        args: decodedTx?.args ?? {},
       });
     },
   };
-}
-
-export async function createEncoders(
-  world: World,
-  components: Component<{ value: Type.String }>,
-  signerOrProvider: IComputedValue<JsonRpcProvider | Signer>
-) {
-  const encoders = {} as Record<string, ReturnType<typeof createEncoder>>;
-
-  async function fetchAndCreateEncoder(entity: EntityIndex) {
-    const componentAddress = toEthAddress(world.entities[entity]);
-    const componentId = getComponentValueStrict(components, entity).value;
-    console.info('[SyncUtils] Creating encoder for ' + componentAddress);
-    const componentContract = new Contract(
-      componentAddress,
-      ComponentAbi.abi,
-      signerOrProvider.get()
-    ) as SolecsComponent;
-    const [componentSchemaPropNames, componentSchemaTypes] = await componentContract.getSchema();
-    encoders[componentId] = createEncoder(componentSchemaPropNames, componentSchemaTypes);
-  }
-
-  // Initial setup
-  for (const entity of getComponentEntities(components)) fetchAndCreateEncoder(entity);
-
-  // Keep up to date
-  const subscription = components.update$.subscribe((update) =>
-    fetchAndCreateEncoder(update.entity)
-  );
-  world.registerDisposer(() => subscription?.unsubscribe());
-
-  return encoders;
 }
 
 /**
@@ -170,16 +133,20 @@ export function applyNetworkUpdates<C extends Components>(
         const entity =
           world.entityToIndex.get(update.entity) ?? world.registerEntity({ id: update.entity });
         const componentKey = mappings[update.component];
-        if (!componentKey) {
-          console.warn('Unknown component:', update);
+        const component = componentKey ? components[componentKey] : undefined;
+
+        if (!component) {
+          if (update.txHash !== 'EmptyNetworkEvent') {
+            log.warn('Unknown component:', update.component);
+          }
           continue;
         }
 
         if (update.value === undefined) {
           // undefined value means component removed
-          removeComponent(components[componentKey] as Component<Schema>, entity);
+          removeComponent(component as Component<Schema>, entity);
         } else {
-          setComponent(components[componentKey] as Component<Schema>, entity, update.value);
+          setComponent(component as Component<Schema>, entity, update.value);
         }
       } else if (decodeAndEmitSystemCall && isSystemCallEvent(update)) {
         decodeAndEmitSystemCall(update);

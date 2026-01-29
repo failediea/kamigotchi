@@ -1,4 +1,4 @@
-import { EntityIndex } from '@mud-classic/recs';
+import { EntityIndex } from 'engine/recs';
 import { useEffect, useState } from 'react';
 import styled from 'styled-components';
 
@@ -9,7 +9,13 @@ import { parseQuantity } from 'network/shapes/utils/parse';
 import { ActionBar } from './ActionBar';
 import { ProgressBar } from './ProgressBar';
 
-interface Props {
+export const Progress = ({
+  actions,
+  account,
+  goal,
+  accContribution,
+  utils,
+}: {
   actions: {
     contributeTx: (goal: Goal, amount: number) => void;
     claimTx: (goal: Goal) => void;
@@ -23,11 +29,7 @@ interface Props {
     getBalance: (holder: EntityIndex, index: number | undefined, type: string) => number;
     getFromDescription: (type: string, index: number) => DetailedEntity;
   };
-}
-
-export const Progress = (props: Props) => {
-  const { goal, accContribution, utils } = props;
-
+}) => {
   const [objType, setObjType] = useState<DetailedEntity>({ ObjectType: '', image: '', name: '' });
 
   useEffect(() => {
@@ -55,12 +57,7 @@ export const Progress = (props: Props) => {
             indicator
           />
         </div>
-        <ActionBar
-          actions={props.actions}
-          account={props.account}
-          goal={props.goal}
-          utils={utils}
-        />
+        <ActionBar actions={actions} account={account} goal={goal} utils={utils} />
       </Row>
       <SubText>{contributedAmtText}</SubText>
     </Container>

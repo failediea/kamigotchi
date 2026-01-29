@@ -1,16 +1,16 @@
 import styled from 'styled-components';
 
-interface Props {
+export const Input = ({
+  image,
+  amt,
+  prepend,
+  scale = 1,
+}: {
   image: string;
   amt: number;
   prepend?: string;
   scale?: number;
-}
-
-export const Input = (props: Props) => {
-  const { image, amt, prepend } = props;
-  const scale = props.scale ?? 1;
-
+}) => {
   return (
     <Container>
       <Text scale={scale}>{prepend}</Text>
@@ -22,11 +22,13 @@ export const Input = (props: Props) => {
 
 const Container = styled.div`
   position: relative;
-  display: flex;
-  flex-flow: row nowrap;
+  margin-top: 0.45vw;
 
+  display: flex;
+  flex-flow: row wrap;
   justify-content: flex-start;
   align-items: center;
+
   user-select: none;
 `;
 
@@ -35,18 +37,22 @@ const Image = styled.img<{ scale: number }>`
   position: relative;
   image-rendering: pixelated;
   user-drag: none;
+  font-size: 0.7vw;
 `;
 
 const Quantity = styled.div<{ scale: number }>`
   position: absolute;
   color: black;
-  bottom: ${({ scale }) => scale * -0.6}vw;
-  left: ${({ scale }) => scale * 4}vw;
+  bottom: ${({ scale }) => scale * -0.3}vw;
+  right: ${({ scale }) => scale * -0.6}vw;
 
   font-size: ${({ scale }) => scale * 0.6}vw;
   padding: ${({ scale }) => scale * 0.2}vw;
-  align-items: center;
-  justify-content: center;
+
+  font-weight: 900;
+  border-radius: 0.3vw;
+  background-color: rgba(255, 255, 255, 1);
+  border: solid black 0.08vw;
 `;
 
 const Text = styled.div<{ scale: number }>`

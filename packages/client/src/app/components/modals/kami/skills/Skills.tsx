@@ -9,17 +9,20 @@ import { Skill } from 'network/shapes/Skill';
 import { Details } from './Details';
 import { Matrix } from './matrix/Matrix';
 
-interface Props {
+export const Skills = ({
+  actions,
+  data,
+  state,
+  utils,
+}: {
+  actions: {
+    upgrade: (skill: Skill) => void;
+    reset: (kami: Kami) => void;
+  };
   data: {
     account: Account;
     kami: Kami;
     owner: BaseAccount;
-  };
-  actions: {
-    upgrade: (skill: Skill) => void;
-    reset: (kami: Kami) => void;
-    onyxApprove: (price: number) => void;
-    onyxRespec: (kami: Kami) => void;
   };
   state: { tick: number };
   utils: {
@@ -30,10 +33,7 @@ interface Props {
     getTreeRequirement: (skill: Skill) => number;
     parseSkillRequirement: (requirement: Condition) => string;
   };
-}
-
-export const Skills = (props: Props) => {
-  const { data, actions, state, utils } = props;
+}) => {
   const { kami } = data;
   const { tick } = state;
   const { getUpgradeError } = utils;

@@ -9,35 +9,54 @@ import {
 } from 'app/components/library';
 import { Item } from 'network/shapes';
 
-interface Props {
+export const LineItem = ({
+  options,
+  selected,
+  amt,
+  setAmt,
+  remove,
+  reverse,
+  iconOnly,
+}: {
   options: IconListButtonOption[];
   selected: Item;
   amt: number;
   setAmt: (e: ChangeEvent<HTMLInputElement>) => void;
   remove?: () => void;
   reverse?: boolean;
-}
-
-export const LineItem = (props: Props) => {
-  const { options, selected, amt, setAmt, remove, reverse } = props;
-
+  iconOnly?: boolean;
+}) => {
   return (
     <Container>
       {reverse && (
         <Quantity
-          width={16.2}
-          type='string'
+          width={8.1}
+          type='text'
+          inputMode='numeric'
+          pattern='[0-9]*'
           value={amt.toLocaleString()}
           onChange={(e) => setAmt(e)}
         />
       )}
       <TextTooltip title={selected.name} text={[selected.description]}>
-        <IconListButton img={selected.image} scale={2.7} options={options} searchable />
+        {iconOnly ? (
+          selected.image && <IconImage src={selected.image} />
+        ) : (
+          <IconListButton
+            img={selected.image}
+            scale={2.7}
+            options={options}
+            searchable
+            tooltip={{ text: [selected.description] }}
+          />
+        )}
       </TextTooltip>
       {!reverse && (
         <Quantity
-          width={16.2}
-          type='string'
+          width={8.1}
+          type='text'
+          inputMode='numeric'
+          pattern='[0-9]*'
           value={amt.toLocaleString()}
           onChange={(e) => setAmt(e)}
         />
@@ -76,6 +95,8 @@ const Quantity = styled.input<{ width?: number }>`
   color: black;
   font-size: 0.9vw;
   text-align: center;
+  overflow: hidden;
+  text-overflow: clip;
 `;
 
 const ExitContainer = styled.div`
@@ -85,4 +106,10 @@ const ExitContainer = styled.div`
   flex-flow: row nowrap;
   justify-content: center;
   align-items: center;
+`;
+
+const IconImage = styled.img`
+  width: 2.7vw;
+  height: 2.7vw;
+  image-rendering: pixelated;
 `;

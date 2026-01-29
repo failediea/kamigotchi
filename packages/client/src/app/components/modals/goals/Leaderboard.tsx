@@ -1,4 +1,4 @@
-import { EntityID } from '@mud-classic/recs';
+import { EntityID } from 'engine/recs';
 import styled from 'styled-components';
 
 import { useSelected, useVisibility } from 'app/stores';
@@ -6,18 +6,19 @@ import { Account } from 'network/shapes/Account';
 import { Score } from 'network/shapes/Score';
 import { playClick } from 'utils/sounds';
 
-interface Props {
+export const Leaderboard = ({
+  scores,
+  utils,
+}: {
   scores: Score[];
   utils: {
     getAccountByID: (id: EntityID) => Account;
   };
-}
-
-export const Leaderboard = (props: Props) => {
-  const { scores, utils } = props;
+}) => {
   const { getAccountByID } = utils;
-  const { modals, setModals } = useVisibility();
-  const { setAccount } = useSelected();
+  const accountModalOpen = useVisibility((s) => s.modals.account);
+  const setModals = useVisibility((s) => s.setModals);
+  const setAccount = useSelected((s) => s.setAccount);
 
   /////////////////
   // INTERACTION
@@ -25,7 +26,7 @@ export const Leaderboard = (props: Props) => {
   // toggle the account modal settings depending on its current state
   const handleClick = (account: Account) => {
     setAccount(account.index);
-    if (!modals.account) setModals({ account: true });
+    if (!accountModalOpen) setModals({ account: true });
     playClick();
   };
 
@@ -45,7 +46,7 @@ export const Leaderboard = (props: Props) => {
     });
   };
 
-  return <Container>{Rows(props.scores)}</Container>;
+  return <Container>{Rows(scores)}</Container>;
 };
 
 const Container = styled.div`

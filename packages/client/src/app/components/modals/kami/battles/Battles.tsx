@@ -1,4 +1,4 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
+import { EntityID, EntityIndex } from 'engine/recs';
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 
@@ -17,7 +17,16 @@ import { OwnerColumn } from './OwnerColumn';
 
 const KamidenClient = getKamidenClient();
 
-interface Props {
+interface BattleStats {
+  Kills: number;
+  Deaths: number;
+  PNL: number;
+}
+
+export const Battles = ({
+  kami,
+  utils,
+}: {
   kami: Kami;
   setKami: Dispatch<SetStateAction<Kami | undefined>>;
   tab: TabType;
@@ -29,17 +38,7 @@ interface Props {
     getOwner: (entity: EntityIndex) => Account;
     getNodeByIndex: (index: number) => Node;
   };
-}
-
-interface BattleStats {
-  Kills: number;
-  Deaths: number;
-  PNL: number;
-}
-
-export const Battles = (props: Props) => {
-  const { kami, utils } = props;
-
+}) => {
   const feedRef = useRef<HTMLDivElement>(null);
   const currentKamiIdRef = useRef(kami.id);
   const [kamidenKills, setKamidenKills] = useState<Kill[]>([]);

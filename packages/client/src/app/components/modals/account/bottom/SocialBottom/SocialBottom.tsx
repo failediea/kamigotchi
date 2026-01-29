@@ -1,4 +1,4 @@
-import { EntityIndex } from '@mud-classic/recs';
+import { EntityIndex } from 'engine/recs';
 import styled from 'styled-components';
 
 import { Account as PlayerAccount } from 'app/stores';
@@ -10,7 +10,12 @@ import { Blocked } from '../../blocked/Blocked';
 import { Friends } from '../../friends/Friends';
 import { Requests } from '../../requests/Requests';
 
-interface Props {
+export const SocialBottom = ({
+  subTab,
+  data,
+  actions,
+  utils,
+}: {
   actions: {
     acceptFren: (friendship: Friendship) => void;
     blockFren: (account: BaseAccount) => void;
@@ -29,10 +34,7 @@ interface Props {
     getAccountKamis: (accEntity: EntityIndex) => Kami[];
     getFriends: (accEntity: EntityIndex) => FriendsType;
   };
-}
-
-export const SocialBottom = (props: Props) => {
-  const { subTab, data, actions, utils } = props;
+}) => {
   const { accounts, player, isSelf } = data;
   const { getFriends } = utils;
 

@@ -1,33 +1,44 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
 import { useEffect, useState } from 'react';
-import { interval, map } from 'rxjs';
-import { v4 as uuid } from 'uuid';
 import { erc721Abi } from 'viem';
 import { useReadContracts, useWatchBlockNumber, useWriteContract } from 'wagmi';
 
-import { AccountOptions, getAccount, getAccountKamis, getAllAccounts } from 'app/cache/account';
-import { getTempBonuses } from 'app/cache/bonus';
+import {
+  AccountOptions,
+  getAccount as _getAccount,
+  getAllAccounts as _getAllAccounts,
+  getAccountKamis,
+} from 'app/cache/account';
+import { getTempBonuses as _getTempBonuses } from 'app/cache/bonus';
 import { getConfigAddress } from 'app/cache/config';
-import { getKami } from 'app/cache/kami';
+import { getKami as _getKami } from 'app/cache/kami';
 import { getNodeByIndex } from 'app/cache/node';
-import { HarvestButton, ModalHeader, ModalWrapper, UseItemButton } from 'app/components/library';
-import { UIComponent } from 'app/root/types';
-import { useAccount, useNetwork, useSelected, useTokens, useVisibility } from 'app/stores';
-import { BalPair } from 'app/stores/tokens';
+import {
+  ModalHeader,
+  ModalWrapper,
+  HarvestButton as _HarvestButton,
+  OnyxReviveButton as _OnyxReviveButton,
+  UseItemButton as _UseItemButton,
+} from 'app/components/library';
+import { UIComponent, useLayers } from 'app/root';
+import { useAccount, useNetwork, useSelected, useVisibility } from 'app/stores';
 import { KamiIcon } from 'assets/images/icons/menu';
-import { ONYX_INDEX } from 'constants/items';
+import { EntityIndex } from 'engine/recs';
 import { erc721ABI } from 'network/chain/ERC721';
 import {
   Account,
   NullAccount,
+  queryAllAccounts as _queryAllAccounts,
   queryAccountFromEmbedded,
-  queryAllAccounts,
 } from 'network/shapes/Account';
-import { getItemByIndex, Item, NullItem } from 'network/shapes/Item';
-import { calcKamiExpRequirement, Kami, queryKamiByIndex } from 'network/shapes/Kami';
-import { Node, NullNode, passesNodeReqs } from 'network/shapes/Node';
-import { getCompAddr } from 'network/shapes/utils';
-import { KamiList } from './KamiList';
+import { getItemByIndex } from 'network/shapes/Item';
+import {
+  Kami,
+  queryKamiByIndex as _queryKamiByIndex,
+  calcKamiExpRequirement,
+} from 'network/shapes/Kami';
+import { Node, NullNode, passesNodeReqs as _passesNodeReqs } from 'network/shapes/Node';
+import { KamiList } from './kamis/KamiList';
+import { SendBar } from './SendBar';
 import { Toolbar } from './Toolbar';
 import { Sort, View } from './types';
 
@@ -35,71 +46,77 @@ const REFRESH_INTERVAL = 1000;
 
 export const PartyModal: UIComponent = {
   id: 'PartyModal',
-  requirement: (layers) =>
-    interval(1000).pipe(
-      map(() => {
-        const { network } = layers;
-        const { world, components } = network;
-        const { debug } = useAccount.getState();
-        const { nodeIndex } = useSelected.getState();
-        const accountEntity = queryAccountFromEmbedded(network);
-        const kamiRefreshOptions = {
-          live: 0,
-          bonuses: 5, // set this to 3600 once we get explicit triggers for updates
-          harvest: 5, // set this to 60 once we get explicit triggers for updates
-          progress: 5,
-          skills: 5, // set this to 3600 once we get explicit triggers for updates
-          flags: 10, // set this to 3600 once we get explicit triggers for updates
-          config: 3600,
-          stats: 3600,
-          traits: 3600,
-        };
+  Render: () => {
+    const layers = useLayers();
 
-        return {
-          network,
-          data: {
-            accountEntity,
-            kamiNFTAddress: getConfigAddress(world, components, 'KAMI721_ADDRESS'),
-            spender: getCompAddr(world, components, 'component.token.allowance'),
-          },
+    /////////////////
+    // PREPARATION
 
-          display: {
-            HarvestButton: (account: Account, kami: Kami, node: Node) =>
-              HarvestButton({ network, account, kami, node }),
-            UseItemButton: (kami: Kami, account: Account, icon: string) =>
-              UseItemButton(network, kami, account, icon),
-          },
-          utils: {
-            calcExpRequirement: (lvl: number) => calcKamiExpRequirement(world, components, lvl),
-            getAccount: (entity: EntityIndex, options?: AccountOptions) =>
-              getAccount(world, components, entity, options),
-            getAllAccounts: () => getAllAccounts(world, components),
-            getTempBonuses: (kami: Kami) =>
-              getTempBonuses(world, components, kami.entity, kamiRefreshOptions.bonuses),
-            getItem: (index: number) => getItemByIndex(world, components, index),
-            getKami: (entity: EntityIndex) =>
-              getKami(world, components, entity, kamiRefreshOptions),
-            getNode: (index: number) => getNodeByIndex(world, components, index),
-            getWorldKamis: () =>
-              getAccountKamis(world, components, accountEntity, kamiRefreshOptions, debug.cache),
-            passesNodeReqs: (kami: Kami) => passesNodeReqs(world, components, nodeIndex, kami),
-            queryKamiByIndex: (index: number) => queryKamiByIndex(world, components, index),
-            queryAllAccounts: () => queryAllAccounts(components),
-          },
-        };
-      })
-    ),
+    const { network, data, display, utils } = (() => {
+      const { network } = layers;
+      const { world, components } = network;
+      const { debug } = useAccount.getState();
+      const accountEntity = queryAccountFromEmbedded(network);
+      const kamiRefreshOptions = {
+        live: 0,
+        bonuses: 5, // set this to 3600 once we get explicit triggers for updates
+        harvest: 5, // set this to 60 once we get explicit triggers for updates
+        progress: 5,
+        skills: 5, // set this to 3600 once we get explicit triggers for updates
+        flags: 10, // set this to 3600 once we get explicit triggers for updates
+        config: 3600,
+        stats: 3600,
+        traits: 3600,
+      };
 
-  Render: ({ network, display, data, utils }) => {
+      return {
+        network,
+        data: {
+          accountEntity,
+          kamiNFTAddress: getConfigAddress(world, components, 'KAMI721_ADDRESS'),
+        },
+
+        display: {
+          HarvestButton: (account: Account, kami: Kami, node: Node) =>
+            _HarvestButton({ network, account, kami, node }),
+          OnyxReviveButton: (account: Account, kami: Kami) =>
+            _OnyxReviveButton({ network, account, kami }),
+          UseItemButton: (kami: Kami, account: Account, icon: string) =>
+            _UseItemButton(network, kami, account, icon),
+        },
+        utils: {
+          calcExpRequirement: (lvl: number) => calcKamiExpRequirement(world, components, lvl),
+          getAccount: (entity: EntityIndex, options?: AccountOptions) =>
+            _getAccount(world, components, entity, options),
+          getAllAccounts: () => _getAllAccounts(world, components),
+          getTempBonuses: (kami: Kami) =>
+            _getTempBonuses(world, components, kami.entity, kamiRefreshOptions.bonuses),
+          getItem: (index: number) => getItemByIndex(world, components, index),
+          getKami: (entity: EntityIndex) => _getKami(world, components, entity, kamiRefreshOptions),
+          getNode: (index: number) => getNodeByIndex(world, components, index),
+          getWorldKamis: () =>
+            getAccountKamis(world, components, accountEntity, kamiRefreshOptions, debug.cache),
+          passesNodeReqs: (node: Node, kami: Kami) =>
+            _passesNodeReqs(world, components, node.index, kami), // TODO: use a cache function for this
+          queryKamiByIndex: (index: number) => _queryKamiByIndex(world, components, index),
+          queryAllAccounts: () => _queryAllAccounts(components),
+        },
+      };
+    })();
+
+    /////////////////
+    // INSTANTIATIONS
+
     const { actions, api } = network;
-    const { accountEntity, kamiNFTAddress, spender } = data;
-    const { getAccount, getItem, getNode } = utils;
-    const { getKami, getWorldKamis, queryKamiByIndex, queryAllAccounts } = utils;
+    const { accountEntity, kamiNFTAddress } = data;
+    const { getNode, getAccount, queryAllAccounts } = utils;
+    const { getKami, getWorldKamis, queryKamiByIndex, passesNodeReqs } = utils;
 
-    const { modals } = useVisibility();
-    const { selectedAddress, apis: ownerAPIs } = useNetwork();
-    const { balances: tokenBals } = useTokens();
     const { writeContract } = useWriteContract();
+    const selectedAddress = useNetwork((s) => s.selectedAddress);
+    const ownerAPIs = useNetwork((s) => s.apis);
+    const nodeIndex = useSelected((s) => s.nodeIndex);
+    const isModalOpen = useVisibility((s) => s.modals.party);
 
     const [account, setAccount] = useState<Account>(NullAccount);
     const [accounts, setAccounts] = useState<Account[]>([]);
@@ -111,11 +128,9 @@ export const PartyModal: UIComponent = {
 
     const [displayedKamis, setDisplayedKamis] = useState<Kami[]>(kamis);
     const [wildKamis, setWildKamis] = useState<Kami[]>([]);
-    const [onyxItem, setOnyxItem] = useState<Item>(NullItem);
-    const [onyxInfo, setOnyxInfo] = useState<BalPair>({ allowance: 0, balance: 0 });
 
     /////////////////
-    // BLOCK WATCHERS
+    // SUBSCRIPTIONS
 
     useWatchBlockNumber({
       onBlockNumber: () => refetchNFTs(),
@@ -132,15 +147,11 @@ export const PartyModal: UIComponent = {
       ],
     });
 
-    /////////////////
-    // SUBSCRIPTIONS
-
     // mounting
     useEffect(() => {
       // populate initial data
       setAccount(getAccount(accountEntity, { live: 0, inventory: 2 }));
       setKamis(getWorldKamis());
-      setOnyxItem(getItem(ONYX_INDEX));
 
       // set ticking
       const refreshClock = () => setTick(Date.now());
@@ -150,41 +161,43 @@ export const PartyModal: UIComponent = {
 
     // update account and kamis every tick or if the connnected account changes
     useEffect(() => {
-      if (!modals.party) return;
+      if (!isModalOpen) return;
 
       // update the connected account if it changes
       if (accountEntity != account.entity) {
-        setAccount(getAccount(accountEntity, { live: 0, inventory: 2 }));
+        const account = getAccount(accountEntity, { live: 0, inventory: 2 });
+        setAccount(account);
       }
 
-      // update the list of the
-      setKamis(getWorldKamis());
+      // update the list of kamis in the world
+      const worldKamis = getWorldKamis();
+      setKamis(worldKamis);
 
       // check if we need to update the list of accounts
       const accountEntities = queryAllAccounts() as EntityIndex[];
-      if (accountEntities.length > accounts.length) {
+      if (accountEntities.length - 1 > accounts.length) {
         const filtered = accountEntities.filter((entity) => entity != accountEntity);
         const newAccounts = filtered.map((entity) => getAccount(entity));
         const accountsSorted = newAccounts.sort((a, b) => a.name.localeCompare(b.name));
         setAccounts(accountsSorted);
       }
-    }, [modals.party, accountEntity, tick]);
+    }, [isModalOpen, accountEntity, tick]);
 
     // update node if the account or room changes
     useEffect(() => {
       const roomIndex = account.roomIndex;
-      setNode(getNode(roomIndex));
+      const node = getNode(roomIndex);
+      setNode(node);
     }, [accountEntity, account.roomIndex]);
 
-    // update onyx info every tick or if the connnected account changes
+    // update the node if the selected node changes
     useEffect(() => {
-      if (!onyxItem.address) return;
-      const onyxInfo = tokenBals.get(onyxItem.address);
-      setOnyxInfo(onyxInfo ?? { allowance: 0, balance: 0 });
-    }, [onyxItem, spender, tick]);
+      const node = getNode(nodeIndex);
+      setNode(node);
+    }, [nodeIndex]);
 
     // update list of wild kamis whenever that changes
-    // TOTO: properly typecast the result of the abi call
+    // TODO: properly typecast the result of the abi call
     useEffect(() => {
       const result = (nftData?.[0]?.result ?? []) as number[];
       if (result.length != wildKamis.length) {
@@ -195,44 +208,18 @@ export const PartyModal: UIComponent = {
       }
     }, [nftData]);
 
+    // if there are no world kamis and only wild, set the view to External
+    useEffect(() => {
+      if (wildKamis.length && kamis.length === 0) {
+        setView('external');
+      }
+    }, [wildKamis.length, kamis.length]);
+
     /////////////////
     // ACTIONS
 
-    // approve the spend of an ERC20 token
-    const approveOnyxTx = async (price: number) => {
-      const api = ownerAPIs.get(selectedAddress);
-      if (!api) return console.error(`API not established for ${selectedAddress}`);
-
-      const actionID = uuid() as EntityID;
-      actions.add({
-        id: actionID,
-        action: 'Approve token',
-        params: [onyxItem.address, spender, price],
-        description: `Approve ${price} ${onyxItem.name} to be spent`,
-        execute: async () => {
-          return api.erc20.approve(onyxItem.address!, spender, price);
-        },
-      });
-    };
-
-    const onyxReviveTx = async (kami: Kami) => {
-      const api = ownerAPIs.get(selectedAddress);
-      if (!api) return console.error(`API not established for ${selectedAddress}`);
-
-      const actionID = uuid() as EntityID;
-      actions.add({
-        id: actionID,
-        action: 'Onyx revive',
-        params: [kami.id],
-        description: `Reviving ${kami.name} with ONYX`,
-        execute: async () => {
-          return api.pet.onyx.revive(kami.id);
-        },
-      });
-    };
-
     // send a kami NFT to another player
-    const sendKamiTx = (kami: Kami, to: Account) => {
+    const send = (kami: Kami, to: Account) => {
       writeContract({
         abi: erc721Abi,
         address: kamiNFTAddress,
@@ -242,7 +229,7 @@ export const PartyModal: UIComponent = {
     };
 
     // import a kami from the wild to the world
-    const stakeKamiTx = (kamis: Kami[]) => {
+    const stake = (kamis: Kami[]) => {
       const api = ownerAPIs.get(selectedAddress);
       if (!api) return console.error(`API not established for ${selectedAddress}`);
 
@@ -250,9 +237,9 @@ export const PartyModal: UIComponent = {
       actions.add({
         action: 'KamiDeposit',
         params: [kamis[0].index],
-        description: `Staking Kami ${kamis[0].index}`,
+        description: `Importing Kami ${kamis[0].index}`,
         execute: async () => {
-          return api.bridge.ERC721.kami.batch.stake(indices);
+          return api.portal.ERC721.kami.batch.stake(indices);
         },
       });
     };
@@ -306,7 +293,7 @@ export const PartyModal: UIComponent = {
     };
 
     /////////////////
-    // DISPLAY
+    // RENDER
 
     return (
       <ModalWrapper
@@ -319,34 +306,28 @@ export const PartyModal: UIComponent = {
         <Toolbar
           actions={{
             addKami: (kamis: Kami[]) => start(kamis, node),
+            collectKami: (kamis: Kami[]) => collect(kamis),
             stopKami: (kamis: Kami[]) => stop(kamis),
-            collect: (kamis: Kami[]) => collect(kamis),
+            stakeKami: (kamis: Kami[]) => stake(kamis),
           }}
           controls={{ sort, setSort, view, setView }}
-          data={{ kamis, wildKamis }}
+          data={{ account, kamis, wildKamis }}
           state={{ displayedKamis, setDisplayedKamis, tick }}
-          utils={utils}
+          utils={{ passesNodeReqs: (kami: Kami) => passesNodeReqs(node, kami) }}
         />
         <KamiList
-          actions={{
-            onyxApprove: approveOnyxTx,
-            onyxRevive: onyxReviveTx,
-            addKamis: (kamis: Kami[]) => start(kamis, node),
-            stakeKamis: stakeKamiTx,
-            sendKamis: sendKamiTx,
-          }}
           controls={{ view }}
-          data={{
-            account,
-            accounts,
-            kamis,
-            wildKamis,
-            node,
-            onyx: onyxInfo,
-          }}
+          data={{ account, accounts, kamis, wildKamis, node }}
           display={display}
           state={{ displayedKamis, tick }}
           utils={utils}
+        />
+        <SendBar
+          actions={{ sendKami: (k: Kami, a: Account) => send(k, a) }}
+          controls={{ sort, view }}
+          data={{ accounts }}
+          state={{ kamis: displayedKamis }}
+          isVisible={isModalOpen && view === 'external'}
         />
       </ModalWrapper>
     );

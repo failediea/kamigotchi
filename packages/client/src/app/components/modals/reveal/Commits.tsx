@@ -2,11 +2,15 @@ import styled from 'styled-components';
 
 import { ActionButton } from 'app/components/library';
 
-import { EntityID } from '@mud-classic/recs';
+import { EntityID } from 'engine/recs';
 import { Commit, canRevealCommit } from 'network/shapes/Commit';
 import { getTimeDeltaString } from 'utils/time';
 
-interface Props {
+export const Commits = ({
+  actions,
+  data,
+  utils,
+}: {
   actions: {
     revealTx: (commits: EntityID[]) => Promise<void>;
   };
@@ -17,11 +21,7 @@ interface Props {
   utils: {
     getCommitState: (id: EntityID) => string;
   };
-}
-
-export const Commits = (props: Props) => {
-  const { actions, data, utils } = props;
-
+}) => {
   /////////////////
   // LOGIC
 

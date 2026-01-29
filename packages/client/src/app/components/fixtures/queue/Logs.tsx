@@ -1,4 +1,4 @@
-import { EntityIndex, getComponentValueStrict } from '@mud-classic/recs';
+import { EntityIndex, getComponentValueStrict } from 'engine/recs';
 import moment from 'moment';
 import { useEffect } from 'react';
 import styled from 'styled-components';
@@ -10,16 +10,13 @@ import { DefaultChain } from 'constants/chains';
 import { NetworkLayer } from 'network/';
 import { ActionState, ActionStateString } from 'network/systems/ActionSystem/constants';
 
-interface Props {
+export const Logs = ({
+  network: { actions },
+  actionIndices,
+}: {
   network: NetworkLayer;
   actionIndices: EntityIndex[];
-}
-
-export const Logs = (props: Props) => {
-  const {
-    network: { actions },
-    actionIndices,
-  } = props;
+}) => {
   const ActionComponent = actions!.Action;
 
   // scroll to bottom when tx added

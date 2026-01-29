@@ -6,7 +6,12 @@ import { useVisibility } from 'app/stores';
 import { Account } from 'network/shapes/Account';
 import { Kami } from 'network/shapes/Kami';
 
-interface Props {
+export const KamiView = ({
+  data,
+  state,
+  utils,
+  isVisible,
+}: {
   data: {
     account: Account;
   };
@@ -20,23 +25,20 @@ interface Props {
     getAccountKamis: () => Kami[];
   };
   isVisible: boolean;
-}
-
-export const KamiView = (props: Props) => {
-  const { data, state, utils, isVisible } = props;
+}) => {
   const { account } = data;
   const { setQuantity, selectedKamis, setSelectedKamis, tick } = state;
   const { getAccountKamis } = utils;
-  const { modals } = useVisibility();
+  const gachaModalVisible = useVisibility((s) => s.modals.gacha);
 
   const [partyKamis, setPartyKamis] = useState<Kami[]>([]);
 
   // update the list of kamis when the account changes (if visible)
   useEffect(() => {
-    if (!isVisible || !modals.gacha) return;
+    if (!isVisible || !gachaModalVisible) return;
     const party = getAccountKamis();
     setPartyKamis(party);
-  }, [account, tick]);
+  }, [account, tick, gachaModalVisible]);
 
   /////////////////
   // INTERACTION

@@ -1,17 +1,21 @@
 import { useEffect, useState } from 'react';
-import { interval, map } from 'rxjs';
 import styled from 'styled-components';
 
-import { getAccount } from 'app/cache/account';
+import { getAccount as _getAccount } from 'app/cache/account';
 import { getInventoryBalance } from 'app/cache/inventory';
 import { cleanNPCListings, getNPCByIndex, NPC, NullNPC, refreshNPCListings } from 'app/cache/npc';
 import { ModalWrapper } from 'app/components/library';
 import { UIComponent } from 'app/root/types';
+import { useLayers } from 'app/root/hooks';
 import { useSelected, useVisibility } from 'app/stores';
 import { MUSU_INDEX } from 'constants/items';
 import { Account, NullAccount, queryAccountFromEmbedded } from 'network/shapes/Account';
+import { Allo, parseAllos as _parseAllos } from 'network/shapes/Allo';
+import { parseConditionalText } from 'network/shapes/Conditional';
 import { Inventory } from 'network/shapes/Inventory';
+import { Item } from 'network/shapes/Item';
 import { Listing } from 'network/shapes/Listing';
+import { DetailedEntity } from 'network/shapes/utils';
 import { Cart } from './cart';
 import { Catalog } from './catalog';
 import { Header } from './header';
@@ -20,35 +24,48 @@ import { CartItem } from './types';
 // merchant window with listings. assumes at most 1 merchant per room
 export const MerchantModal: UIComponent = {
   id: 'MerchantModal',
-  requirement: (layers) =>
-    interval(1000).pipe(
-      map(() => {
-        const { network } = layers;
-        const { components, world } = network;
-        const accountEntity = queryAccountFromEmbedded(network);
+  Render: () => {
+    const layers = useLayers();
 
-        return {
-          data: { accountEntity },
-          utils: {
-            getAccount: () =>
-              getAccount(world, components, accountEntity, { live: 2, inventory: 2 }),
-            getNPC: (index: number) => getNPCByIndex(world, components, index, { listings: 60 }),
-            cleanListings: (listings: Listing[], account: Account) =>
-              cleanNPCListings(world, components, listings, account),
-            refreshListings: (npc: NPC) => refreshNPCListings(components, npc),
-            getMusuBalance: (inventories: Inventory[]) =>
-              getInventoryBalance(inventories, MUSU_INDEX),
-          },
-          network,
-        };
-      })
-    ),
-  Render: ({ data, utils, network }) => {
-    const { accountEntity } = data;
-    const { getAccount, getNPC, cleanListings, refreshListings, getMusuBalance } = utils;
-    const { actions, api } = network;
-    const { npcIndex } = useSelected();
-    const { modals } = useVisibility();
+    const {
+      data: { accountEntity },
+      utils: {
+        getAccount,
+        getNPC,
+        cleanListings,
+        refreshListings,
+        getMusuBalance,
+        parseAllos,
+        displayItemRequirements,
+      },
+      network: { actions, api },
+    } = (() => {
+      const { network } = layers;
+      const { components, world } = network;
+      const accountEntity = queryAccountFromEmbedded(network);
+
+      return {
+        data: { accountEntity },
+        utils: {
+          getAccount: () =>
+            _getAccount(world, components, accountEntity, { live: 2, inventory: 2 }),
+          getNPC: (index: number) => getNPCByIndex(world, components, index, { listings: 60 }),
+          cleanListings: (listings: Listing[], account: Account) =>
+            cleanNPCListings(world, components, listings, account),
+          refreshListings: (npc: NPC) => refreshNPCListings(components, npc),
+          getMusuBalance: (inventories: Inventory[]) =>
+            getInventoryBalance(inventories, MUSU_INDEX),
+          parseAllos: (allo: Allo[]): DetailedEntity[] => _parseAllos(world, components, allo),
+          displayItemRequirements: (item: Item) =>
+            item?.requirements?.use
+              ?.map((req) => parseConditionalText(world, components, req))
+              .join('\n') || 'None',
+        },
+        network,
+      };
+    })();
+    const npcIndex = useSelected((s) => s.npcIndex);
+    const merchantModalOpen = useVisibility((s) => s.modals.merchant);
 
     const [account, setAccount] = useState<Account>(NullAccount);
     const [merchant, setMerchant] = useState<NPC>(NullNPC);
@@ -66,7 +83,7 @@ export const MerchantModal: UIComponent = {
 
     // update the listings on each tick
     useEffect(() => {
-      if (!modals.merchant) return;
+      if (!merchantModalOpen) return;
       if (!merchant || npcIndex != merchant.index) return;
       setMusuBalance(getMusuBalance(account.inventories ?? []));
       refreshListings(merchant);
@@ -80,11 +97,11 @@ export const MerchantModal: UIComponent = {
 
     // updates from selected Merchant updates
     useEffect(() => {
-      if (!modals.merchant || npcIndex == merchant.index) return;
+      if (!merchantModalOpen || npcIndex == merchant.index) return;
       const newMerchant = getNPC(npcIndex) ?? NullNPC;
       setMerchant(newMerchant);
       setListings(cleanListings(newMerchant.listings, account));
-    }, [modals.merchant, npcIndex, account]);
+    }, [merchantModalOpen, npcIndex, account]);
 
     // buy from a listing
     const buy = (cart: CartItem[]) => {
@@ -108,7 +125,16 @@ export const MerchantModal: UIComponent = {
       <ModalWrapper id='merchant' canExit overlay>
         <Header merchant={merchant} player={account} balance={musuBalance} />
         <Body>
-          <Catalog account={account} listings={listings} cart={cart} setCart={setCart} />
+          <Catalog
+            account={account}
+            listings={listings}
+            cart={cart}
+            setCart={setCart}
+            utils={{
+              parseAllos,
+              displayRequirements: displayItemRequirements,
+            }}
+          />
           <Cart account={account} cart={cart} setCart={setCart} buy={buy} />
         </Body>
       </ModalWrapper>

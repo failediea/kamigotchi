@@ -1,19 +1,22 @@
-import { EntityIndex } from '@mud-classic/recs';
+import { EntityIndex } from 'engine/recs';
 import styled from 'styled-components';
 
-import { GachaMintConfig } from 'app/cache/config';
 import { ActionButton, Overlay, Pairing, Warning } from 'app/components/library';
 import { Commit } from 'network/shapes/Commit';
-import { GachaMintData } from 'network/shapes/Gacha';
 import { Item } from 'network/shapes/Item';
 import { Kami } from 'network/shapes/Kami';
 
 import { Filter, Sort, TabType, ViewMode } from '../../types';
-import { Mint } from './mint/Mint';
 import { Pool } from './pool/Pool';
 import { Reroll } from './reroll/Reroll';
 
-interface Props {
+//
+export const Controls = ({
+  actions,
+  controls,
+  data,
+  state,
+}: {
   actions: {
     reveal: (commits: Commit[]) => Promise<void>;
   };
@@ -31,14 +34,6 @@ interface Props {
     commits: Commit[];
     payItem: Item;
     saleItem: Item;
-    mint: {
-      config: GachaMintConfig;
-      data: {
-        account: GachaMintData;
-        gacha: GachaMintData;
-      };
-      whitelisted: boolean;
-    };
   };
   state: {
     quantity: number;
@@ -50,11 +45,7 @@ interface Props {
   utils: {
     isWhitelisted: (entity: EntityIndex) => boolean;
   };
-}
-
-//
-export const Controls = (props: Props) => {
-  const { actions, controls, data, state } = props;
+}) => {
   const { reveal } = actions;
   const { mode, setMode, tab } = controls;
   const { commits, payItem, balance } = data;
@@ -74,14 +65,6 @@ export const Controls = (props: Props) => {
     return tab === 'GACHA' || tab === 'REROLL';
   };
 
-  const getBalanceText = () => {
-    let numDecimals = 0;
-    if (tab === 'REROLL' && mode === 'ALT')
-      numDecimals = 3; // onyx
-    else if (tab === 'MINT') numDecimals = 4; // eth
-    return balance.toFixed(numDecimals);
-  };
-
   return (
     <Container>
       {commits.length > 0 && (
@@ -95,14 +78,20 @@ export const Controls = (props: Props) => {
           }}
         />
       )}
-      <Mint controls={controls} data={data} state={state} isVisible={tab === 'MINT'} />
       <Pool controls={controls} data={data} state={state} isVisible={tab === 'GACHA'} />
       <Reroll controls={controls} data={data} state={state} isVisible={tab === 'REROLL'} />
       <Overlay bottom={0.75} left={0.75}>
         {isButtonVisible() && <ActionButton text={getButtonText()} onClick={toggleMode} />}
       </Overlay>
       <Overlay right={0.75} bottom={0.75}>
-        <Pairing icon={payItem.image} text={getBalanceText()} tooltip={[payItem.name]} reverse />
+        {payItem.image && (
+          <Pairing
+            icon={payItem.image}
+            text={balance.toLocaleString()}
+            tooltip={[payItem.name]}
+            reverse
+          />
+        )}
       </Overlay>
     </Container>
   );

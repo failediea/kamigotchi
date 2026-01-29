@@ -1,4 +1,4 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
+import { EntityID, EntityIndex } from 'engine/recs';
 import moment from 'moment';
 import { useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
@@ -12,7 +12,14 @@ import { formatEntityID } from 'engine/utils';
 import { BaseAccount } from 'network/shapes/Account';
 import { ActionSystem } from 'network/systems';
 
-interface Props {
+export const Message = ({
+  previousEqual,
+  utils: { getAccount, getEntityIndex },
+  data: { message },
+  player,
+  actionSystem,
+  api,
+}: {
   previousEqual: boolean;
   utils: {
     getAccount: (entityIndex: EntityIndex) => Account;
@@ -30,17 +37,11 @@ interface Props {
       };
     };
   };
-}
-
-export const Message = (props: Props) => {
-  const { message } = props.data;
-  const { getAccount, getEntityIndex } = props.utils;
-  const { actionSystem, api, previousEqual } = props;
-
-  const { player } = props;
+}) => {
   const [yours, setYours] = useState(false);
-  const { modals, setModals } = useVisibility();
-  const { setAccount } = useSelected();
+  const accountModalOpen = useVisibility((s) => s.modals.account);
+  const setModals = useVisibility((s) => s.setModals);
+  const setAccount = useSelected((s) => s.setAccount);
   const pfpRef = useRef<HTMLDivElement>(null);
 
   /////////////////
@@ -56,7 +57,7 @@ export const Message = (props: Props) => {
 
   const showUser = () => {
     setAccount(getAccountFunc().index);
-    if (!modals.account) setModals({ account: true, party: false, map: false });
+    if (!accountModalOpen) setModals({ account: true, party: false, map: false });
   };
 
   const blockFren = (account: BaseAccount) => {
@@ -113,7 +114,7 @@ export const Message = (props: Props) => {
             {player.id != getAccountFunc().id ? (
               <>
                 <PfpAuthor id='pfp-author' ref={pfpRef}>
-                  <Popover content={optionsMap()} mouseButton={2}>
+                  <Popover content={optionsMap()} mouseButton={'right'}>
                     <Pfp
                       author={false}
                       onClick={() => {
@@ -270,7 +271,7 @@ const Body = styled.div<{ yours: boolean; previousEqual: boolean }>`
     width: 0.7vw;
     background: rgb(238, 238, 238);
     border-top-left-radius: 80%;
-    left: 0;    
+    left: 0;   
     rotate: -90deg;
   }`
       : ` ::before {
@@ -282,7 +283,7 @@ const Body = styled.div<{ yours: boolean; previousEqual: boolean }>`
     width: 0.7vw;
     background: rgb(238, 238, 238);
     border-top-right-radius: 80%;
-    right: 0;  
+    right: 0; 
     rotate: 90deg;
   } `}
 `;

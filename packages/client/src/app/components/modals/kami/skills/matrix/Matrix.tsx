@@ -9,13 +9,16 @@ import { Footer } from './Footer';
 import { Menu } from './Menu';
 import { Node } from './Node';
 
-interface Props {
+export const Matrix = ({
+  kami,
+  setDisplayed,
+  actions,
+  utils,
+}: {
   kami: Kami;
   setDisplayed: (skillIndex: number) => void;
   actions: {
     reset: (kami: Kami) => void;
-    onyxApprove: (price: number) => void;
-    onyxRespec: (kami: Kami) => void;
   };
   utils: {
     getItemBalance: (index: number) => number;
@@ -23,10 +26,7 @@ interface Props {
     getUpgradeError: (index: number) => string[] | undefined;
     getTreePoints: (tree: string) => number;
   };
-}
-
-export const Matrix = (props: Props) => {
-  const { kami, setDisplayed, actions, utils } = props;
+}) => {
   const { getTreePoints, getSkill } = utils;
   const [mode, setMode] = useState('Predator');
   const [tierMins, setTierMins] = useState<number[]>([0, 0, 0, 0, 0, 0, 0]);
@@ -41,7 +41,7 @@ export const Matrix = (props: Props) => {
     setTierMins(kami.config?.general.skills ?? [0, 0, 0, 0, 0, 0, 0]);
   }, [kami.config?.general.skills]);
 
-  ////////////////////
+  /////////////////
   // DISPLAY
 
   return (

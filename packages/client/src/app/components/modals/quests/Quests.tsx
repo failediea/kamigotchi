@@ -1,18 +1,20 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
-import { useEffect, useRef, useState } from 'react';
-import { interval, map } from 'rxjs';
+import { EntityID, EntityIndex } from 'engine/recs';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { getItemByIndex } from 'app/cache/item';
 import { ModalHeader, ModalWrapper } from 'app/components/library';
+import { useLayers } from 'app/root/hooks';
 import { UIComponent } from 'app/root/types';
-import { useVisibility } from 'app/stores';
+import { useNetwork, useVisibility } from 'app/stores';
 import { QuestsIcon } from 'assets/images/icons/menu';
+import { DEAD_ADDRESS } from 'constants/addresses';
 import { getAccount, queryAccountFromEmbedded } from 'network/shapes/Account';
-import { getItemBalance } from 'network/shapes/Item';
+import { getItemBalance as _getItemBalance } from 'network/shapes/Item';
 import {
   Quest,
   filterQuestsByAvailable,
   getBaseQuest,
+  meetsObjectives,
   parseQuestObjectives,
   parseQuestRequirements,
   parseQuestStatus,
@@ -22,75 +24,93 @@ import {
   queryRegistryQuests,
 } from 'network/shapes/Quest';
 import { BaseQuest } from 'network/shapes/Quest/quest';
+import { getIsDisabled } from 'network/shapes/utils/component';
 import { getFromDescription } from 'network/shapes/utils/parse';
+import { useComponentEntities } from 'network/utils/hooks';
 import { List } from './list/List';
 import { Tabs } from './Tabs';
 
 export const QuestModal: UIComponent = {
   id: 'QuestModal',
-  requirement: (layers) =>
-    interval(2000).pipe(
-      map(() => {
-        const { network } = layers;
-        const { world, components } = network;
-        const accountEntity = queryAccountFromEmbedded(network);
-        const account = getAccount(world, components, accountEntity, {
-          kamis: true,
-          inventory: true,
-        });
+  Render: () => {
+    const layers = useLayers();
+    const { burnerAddress, validations } = useNetwork();
+    const isNetworkReady =
+      validations.authenticated && validations.chainMatches && burnerAddress !== DEAD_ADDRESS;
 
-        const registry = queryRegistryQuests(components).map((entity) =>
-          getBaseQuest(world, components, entity)
-        );
-        const completed = queryCompletedQuests(components, account.id).map((entity) =>
-          getBaseQuest(world, components, entity)
-        );
-        const ongoing = queryOngoingQuests(components, account.id).map((entity) =>
-          getBaseQuest(world, components, entity)
-        );
+    const { network, data, utils } = (() => {
+      const { network } = layers;
+      const { world, components } = network;
+      const accountEntity = queryAccountFromEmbedded(network);
+      const account = getAccount(world, components, accountEntity, {
+        kamis: true,
+        inventory: true,
+      });
 
-        return {
-          network,
-          data: {
-            accountEntity,
-            account,
-            quests: {
-              registry,
-              ongoing,
-              completed,
-            },
-          },
-          utils: {
-            describeEntity: (type: string, index: number) =>
-              getFromDescription(world, components, type, index),
-            getBase: (entity: EntityIndex) => getBaseQuest(world, components, entity),
-            getItem: (index: number) => getItemByIndex(world, components, index),
-            getItemBalance: (index: number) => getItemBalance(world, components, account.id, index),
-            filterByAvailable: (
-              registry: BaseQuest[],
-              ongoing: BaseQuest[],
-              completed: BaseQuest[]
-            ) => filterQuestsByAvailable(world, components, account, registry, ongoing, completed),
-            parseObjectives: (quest: Quest) =>
-              parseQuestObjectives(world, components, account, quest),
-            parseRequirements: (quest: Quest) =>
-              parseQuestRequirements(world, components, account, quest),
-            parseStatus: (quest: Quest) => parseQuestStatus(world, components, account, quest),
-            populate: (base: BaseQuest) => populateQuest(world, components, base),
-          },
-        };
-      })
-    ),
+      return {
+        network,
+        data: {
+          accountEntity,
+          account,
+        },
+        utils: {
+          describeEntity: (type: string, index: number) =>
+            getFromDescription(world, components, type, index),
+          getBase: (entity: EntityIndex) => getBaseQuest(world, components, entity),
+          getItem: (index: number) => getItemByIndex(world, components, index),
+          getItemBalance: (index: number) => _getItemBalance(world, components, account.id, index),
+          filterByAvailable: (
+            registry: BaseQuest[],
+            ongoing: BaseQuest[],
+            completed: BaseQuest[]
+          ) => filterQuestsByAvailable(world, components, account, registry, ongoing, completed),
+          parseObjectives: (quest: Quest) =>
+            parseQuestObjectives(world, components, account, quest),
+          parseRequirements: (quest: Quest) =>
+            parseQuestRequirements(world, components, account, quest),
+          parseStatus: (quest: Quest) => parseQuestStatus(world, components, account, quest),
+          populate: (base: BaseQuest) => populateQuest(world, components, base),
+          queryRegistry: () => queryRegistryQuests(components),
+          queryOngoing: () => queryOngoingQuests(components, account.id),
+          queryCompleted: () => queryCompletedQuests(components, account.id),
+        },
+      };
+    })();
 
-  Render: ({ network, data, utils }) => {
-    const { actions, api, notifications } = network;
-    const { ongoing, completed, registry } = data.quests;
-    const { getItem, populate, filterByAvailable } = utils;
-    const { modals } = useVisibility();
+    const { actions, api, components, notifications } = network;
+    const { IsRegistry, OwnsQuestID, IsComplete } = components;
+    const { accountEntity, account } = data;
+    const { getBase, getItem, filterByAvailable, populate } = utils;
+    const { queryRegistry, queryOngoing, queryCompleted } = utils;
+    const questsModalVisible = useVisibility((s) => s.modals.quests);
 
     const isUpdating = useRef(false);
     const [tab, setTab] = useState<TabType>('ONGOING');
     const [available, setAvailable] = useState<Quest[]>([]);
+    const [completable, setCompletable] = useState<Quest[]>([]);
+
+    // Reactively subscribe to ECS changes relevant to quests
+    const registryEntities = useComponentEntities(IsRegistry) || [];
+    const ownsQuestEntities = useComponentEntities(OwnsQuestID) || [];
+    const isCompleteEntities = useComponentEntities(IsComplete) || [];
+
+    // Derive quest lists reactively from ECS streams
+
+    const registry: BaseQuest[] = useMemo(() => {
+      return queryRegistry().map((entity) => getBase(entity));
+    }, [network, registryEntities]);
+
+    const completed: BaseQuest[] = useMemo(() => {
+      return queryCompleted()
+        .map((entity) => getBase(entity))
+        .filter((q) => !getIsDisabled(components, q.registryEntityIndex));
+    }, [network, account.id, ownsQuestEntities, isCompleteEntities]);
+
+    const ongoing: BaseQuest[] = useMemo(() => {
+      return queryOngoing()
+        .map((entity) => getBase(entity))
+        .filter((q) => !getIsDisabled(components, q.registryEntityIndex));
+    }, [network, account.id, ownsQuestEntities, isCompleteEntities]);
 
     /////////////////
     // SUBSCRIPTIONS
@@ -98,22 +118,34 @@ export const QuestModal: UIComponent = {
     // update Available Quests whenever quests change state
     // TODO: figure out a trigger for repeatable quests
     useEffect(() => {
+      if (!isNetworkReady) return;
       if (isUpdating.current) return;
       isUpdating.current = true;
 
       const raw = filterByAvailable(registry, ongoing, completed);
-      const populated = raw.map((q) => populate(q));
+      const populated = raw.map((q) => populate(q)).filter((q) => !q.isDisabled);
 
       setAvailable(populated);
       if (populated.length > available.length) setTab('AVAILABLE');
 
+      const populatedOngoing = ongoing.map((q) => utils.parseObjectives(populate(q)));
+      const completableQuests = populatedOngoing.filter((q) => meetsObjectives(q));
+      setCompletable(completableQuests);
+
       isUpdating.current = false;
-    }, [modals.quests, registry.length, completed.length, ongoing.length]);
+    }, [questsModalVisible, registry, completed, ongoing, isNetworkReady]);
 
     // update the Notifications when the number of available quests changes
     useEffect(() => {
+      if (!isNetworkReady) return;
       updateNotifications();
-    }, [available.length]);
+    }, [available.length, isNetworkReady]);
+
+    // update the Notifications when a quest becomes completable
+    useEffect(() => {
+      if (!isNetworkReady) return;
+      updateCompletableNotifications();
+    }, [completable.length, isNetworkReady]);
 
     /////////////////
     // HELPERS
@@ -135,7 +167,31 @@ export const QuestModal: UIComponent = {
           title: `Available Quests!`,
           description,
           time: Date.now().toString(),
-          modal: 'quests',
+          modal: 'questDialogue',
+          questIndex: available[n - 1].entity,
+        });
+      }
+    };
+
+    const updateCompletableNotifications = () => {
+      const id = 'Quest Ready' as EntityID;
+      const n = completable.length;
+
+      if (notifications.has(id)) {
+        if (n == 0) notifications.remove(id);
+        else {
+          const quest = completable[n - 1];
+          notifications.update(id, { description: `You can complete: ${quest.name}`, questIndex: quest.entity });
+        }
+      } else if (n > 0) {
+        const quest = completable[n - 1];
+        notifications.add({
+          id,
+          title: `Quest Ready!`,
+          description: `You can complete: ${quest.name}`,
+          time: Date.now().toString(),
+          modal: 'questDialogue',
+          questIndex: quest.entity,
         });
       }
     };

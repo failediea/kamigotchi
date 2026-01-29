@@ -4,7 +4,6 @@ import { HarvestIcon, StopIcon } from 'assets/images/icons/actions';
 import { NetworkLayer } from 'network/create';
 import { Account } from 'network/shapes/Account';
 import { Node, passesNodeReqs } from 'network/shapes/Node';
-import { TextTooltip } from '../..';
 
 // if resting
 // - always display
@@ -19,20 +18,21 @@ import { TextTooltip } from '../..';
 // if dead
 // - dont display
 
-interface Props {
-  network: NetworkLayer;
-  account: Account;
-  kami: Kami;
-  node: Node;
-}
-
 // A button for accessing harvest actions
 // Assumptions
 // - target kami is alive (harvesting/resting)
 // - node is accessible through kami harvest if harvesting
-export const HarvestButton = (props: Props) => {
-  const { network, kami, account, node } = props;
-
+export const HarvestButton = ({
+  network,
+  account,
+  kami,
+  node,
+}: {
+  network: NetworkLayer;
+  account: Account;
+  kami: Kami;
+  node: Node;
+}) => {
   let options: IconListButtonOption[] = [];
   let tooltip = getDisabledTooltip(network, account, kami, node);
 
@@ -43,9 +43,13 @@ export const HarvestButton = (props: Props) => {
   }
 
   return (
-    <TextTooltip key='harvest-tooltip' text={[tooltip]}>
-      <IconListButton img={HarvestIcon} options={options} disabled={disabled} />
-    </TextTooltip>
+    <IconListButton
+      key='harvest-tooltip'
+      img={HarvestIcon}
+      options={options}
+      disabled={disabled}
+      tooltip={{ text: [tooltip] }}
+    />
   );
 };
 

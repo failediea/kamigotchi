@@ -1,3 +1,4 @@
+import { objectMinaRed } from 'assets/images/rooms/13_giftshop';
 import { DialogueNode } from '.';
 
 const LoyaltyText = (loyalty: number) => {
@@ -14,32 +15,12 @@ export const clock: DialogueNode = {
 
 export const mina: DialogueNode = {
   index: 132,
-  text: [LoyaltyText, `I need your help. Interested in supporting new product development?`],
+  text: [LoyaltyText, `Welcome to the gift shop.`],
   npc: {
     name: 'Mina',
-    background: `   
-    background-image: radial-gradient(rgb(255 242 255) 20%, transparent 0), 
-                      radial-gradient(rgb(255 242 255) 20%, transparent 0),
-                      linear-gradient(to right, white 40%,rgb(255 242 255)); 
-  
-    background-size: 30px 30px, 
-                     30px 30px,
-                     100% 100%; 
-  
-    background-position: 0 0, 15px 15px;
- `,
+    img: objectMinaRed,
+    color: '#cc88ff',
   },
-  action: {
-    type: 'goal',
-    label: 'Support Mina',
-    input: 5,
-  },
-  args: [
-    {
-      type: 'REPUTATION',
-      index: 2,
-    },
-  ],
 };
 
 const exit: DialogueNode = {

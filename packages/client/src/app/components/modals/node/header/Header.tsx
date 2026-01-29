@@ -1,4 +1,4 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
+import { EntityID, EntityIndex } from 'engine/recs';
 import { useEffect, useState } from 'react';
 import styled from 'styled-components';
 
@@ -18,7 +18,11 @@ import { DetailedEntity, getAffinityImage } from 'network/shapes/utils';
 import { ItemDrops } from './ItemDrops';
 import { ScavengeBar } from './ScavengeBar';
 
-interface Props {
+export const Header = ({
+  data,
+  actions,
+  utils,
+}: {
   data: {
     account: Account;
     node: Node;
@@ -37,17 +41,14 @@ interface Props {
     passesNodeReqs: (kami: Kami) => boolean;
     queryScavInstance: (index: number, holderID: EntityID) => EntityIndex | undefined;
   };
-}
-
-export const Header = (props: Props) => {
-  const { data, utils, actions } = props;
+}) => {
   const { account, node } = data;
   const { addKami } = actions;
   const { getAccountKamis, getRoom, getValue } = utils;
   const { queryScavInstance } = utils;
   const { parseConditionalText, passesNodeReqs } = utils;
 
-  const { modals } = useVisibility();
+  const nodeModalVisible = useVisibility((s) => s.modals.node);
   const [kamis, setKamis] = useState<Kami[]>([]);
   const [room, setRoom] = useState<Room>(NullRoom);
   const [scavenge, setScavenge] = useState<ScavBar>(NullScavenge);
@@ -62,17 +63,17 @@ export const Header = (props: Props) => {
 
   // update the scavenge whenever the node changes
   useEffect(() => {
-    if (!modals.node) return;
+    if (!nodeModalVisible) return;
 
     const scavenge = node.scavenge;
     if (scavenge) setScavenge(scavenge);
     if (node.roomIndex !== room.index) setRoom(getRoom(node.roomIndex));
-  }, [node.index, modals.node]);
+  }, [node.index, nodeModalVisible]);
 
   // keep the account kamis up to date whenever the modal is open
   useEffect(() => {
-    if (modals.node) setKamis(getAccountKamis());
-  }, [modals.node, lastRefresh]);
+    if (nodeModalVisible) setKamis(getAccountKamis());
+  }, [nodeModalVisible, lastRefresh]);
 
   /////////////////
   // INTERPRETATION
@@ -112,22 +113,31 @@ export const Header = (props: Props) => {
   const AddButton = (kamis: Kami[]) => {
     const options = kamis.filter((kami) => canAdd(kami));
     const actionOptions = options.map((kami) => {
-      return { text: `${kami.name}`, onClick: () => addKami(kami) };
+      return { text: `${kami.name}`, image: kami.image, onClick: () => addKami(kami) };
     });
 
     return (
-      <TextTooltip text={[getDisabledReason(kamis)]} grow>
-        <IconListButton
-          key={`harvest-add`}
-          img={HarvestIcon}
-          options={actionOptions}
-          text='Add Kami to Node'
-          disabled={options.length == 0 || account.roomIndex !== node.roomIndex}
-          fullWidth
-        />
-      </TextTooltip>
+      <IconListButton
+        key={`harvest-add`}
+        img={HarvestIcon}
+        options={actionOptions}
+        text='Add Kami to Node'
+        disabled={options.length == 0 || account.roomIndex !== node.roomIndex}
+        fullWidth
+        tooltip={{ text: [getDisabledReason(kamis)], grow: true }}
+      />
     );
   };
+
+  function getAffinityIcons(affs: string[]) {
+    return (
+      <div style={{ display: 'flex', flexFlow: 'row' }}>
+        {affs.map((aff) => (
+          <Icon key={aff} src={getAffinityImage(aff)} />
+        ))}
+      </div>
+    );
+  }
 
   return (
     <Container>
@@ -137,8 +147,8 @@ export const Header = (props: Props) => {
           <Name>{room.name}</Name>
           <Row>
             <Label>Type: </Label>
-            <TextTooltip text={[node.affinity ?? '']}>
-              <Icon src={getAffinityImage(node.affinity)} />
+            <TextTooltip text={[node.affinity.join(', ') ?? '']}>
+              {getAffinityIcons(node.affinity)}
             </TextTooltip>
             <ItemDrops node={node} scavenge={scavenge} utils={utils} />
           </Row>

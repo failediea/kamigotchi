@@ -94,24 +94,6 @@
     },
     {
       "type": "function",
-      "name": "addERC20",
-      "inputs": [
-        {
-          "name": "index",
-          "type": "uint32",
-          "internalType": "uint32"
-        },
-        {
-          "name": "tokenAddress",
-          "type": "address",
-          "internalType": "address"
-        }
-      ],
-      "outputs": [],
-      "stateMutability": "nonpayable"
-    },
-    {
-      "type": "function",
       "name": "addFlag",
       "inputs": [
         {
@@ -214,6 +196,32 @@
     },
     {
       "type": "function",
+      "name": "disable",
+      "inputs": [
+        {
+          "name": "index",
+          "type": "uint32",
+          "internalType": "uint32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "enable",
+      "inputs": [
+        {
+          "name": "index",
+          "type": "uint32",
+          "internalType": "uint32"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
       "name": "execute",
       "inputs": [
         {
@@ -289,6 +297,43 @@
       "inputs": [],
       "outputs": [],
       "stateMutability": "payable"
+    },
+    {
+      "type": "function",
+      "name": "setRarity",
+      "inputs": [
+        {
+          "name": "arguments",
+          "type": "bytes",
+          "internalType": "bytes"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "success",
+          "type": "bool",
+          "internalType": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "setSlot",
+      "inputs": [
+        {
+          "name": "index",
+          "type": "uint32",
+          "internalType": "uint32"
+        },
+        {
+          "name": "slot",
+          "type": "string",
+          "internalType": "string"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
     },
     {
       "type": "function",
@@ -385,7 +430,6 @@
     "addAlloBonus(bytes)": "eb04c569",
     "addAlloDT(bytes)": "59ce910b",
     "addAlloStat(bytes)": "b452abd4",
-    "addERC20(uint32,address)": "0e399f30",
     "addFlag(uint32,string)": "06cc1c38",
     "addRequirement(bytes)": "7e534103",
     "cancelOwnershipHandover()": "54d1f13d",
@@ -393,12 +437,16 @@
     "create(bytes)": "cf5ba53f",
     "createConsumable(bytes)": "e96e3836",
     "deprecate()": "0fcc0c28",
+    "disable(uint32)": "3fbd60f4",
+    "enable(uint32)": "aea6c198",
     "execute(bytes)": "09c5eabe",
     "owner()": "8da5cb5b",
     "ownershipHandoverExpiresAt(address)": "fee81cf4",
     "remove(uint32)": "00d84fd8",
     "renounceOwnership()": "715018a6",
     "requestOwnershipHandover()": "25692962",
+    "setRarity(bytes)": "e5d96e6b",
+    "setSlot(uint32,string)": "5cbf4483",
     "transferOwnership(address)": "f2fde38b"
   }
 }

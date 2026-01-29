@@ -2,24 +2,9 @@ import { useRef, useState } from 'react';
 import styled from 'styled-components';
 
 import { playClick } from 'utils/sounds';
-import { Popover } from '../poppers/Popover';
+import { Popover } from '../poppers';
+import { TextTooltip } from '../tooltips';
 import { IconButton } from './IconButton';
-
-interface Props {
-  img: string;
-  options: Option[];
-
-  text?: string;
-  balance?: number;
-  disabled?: boolean;
-  width?: number;
-  fullWidth?: boolean;
-  radius?: number;
-  scale?: number;
-  scaleOrientation?: 'vw' | 'vh';
-
-  searchable?: boolean;
-}
 
 export interface Option {
   text: string;
@@ -28,11 +13,58 @@ export interface Option {
   disabled?: boolean;
 }
 
-export function IconListButton(props: Props) {
-  const { img, options, text, balance } = props;
-  const { radius, scale, scaleOrientation, searchable } = props;
-  const { disabled, width, fullWidth } = props;
+export function IconListButton({
+  img,
+  options,
+  text,
+  balance,
+  width,
+  fullWidth,
+  radius,
+  scale,
+  scaleOrientation,
+  searchable,
+  icon,
+  filter,
+  shake,
+  tooltip,
+  disabled,
+  cooldownBackground,
+}: {
+  options: Option[];
+  searchable?: boolean;
+  filter?: string;
 
+  // button
+  img?: string;
+  text?: string;
+  icon?: { inset?: { px?: number; x?: number; y?: number } };
+  radius?: number;
+  scale?: number;
+  scaleOrientation?: 'vw' | 'vh';
+  width?: number;
+  fullWidth?: boolean;
+  balance?: number;
+  shake?: boolean;
+  cooldownBackground?: string;
+
+  // tooltip
+  tooltip?: {
+    text: string[] | React.ReactNode[];
+    title?: string;
+    children?: React.ReactNode;
+    grow?: boolean;
+    direction?: 'row' | 'column';
+    delay?: number;
+    maxWidth?: number;
+    size?: number;
+    alignText?: 'left' | 'right' | 'center';
+    color?: string;
+    fullWidth?: boolean;
+  };
+
+  disabled?: boolean;
+}) {
   const toggleRef = useRef<HTMLButtonElement>(null);
   const [anchorEl, setAnchorEl] = useState<HTMLButtonElement | null>(null);
   const [search, setSearch] = useState<string>('');
@@ -72,8 +104,8 @@ export function IconListButton(props: Props) {
           .filter((option) => !searchable || option.text.toLowerCase().includes(search))
           .map((option, i) => (
             <MenuOption key={i} disabled={option.disabled} onClick={() => onSelect(option)}>
-              {option.image && <MenuIcon src={option.image} />}
-              {option.text}
+              {option.image && <OptionIcon src={option.image} />}
+              {option.text && <OptionText>{option.text}</OptionText>}
             </MenuOption>
           ))}
       </MenuWrapper>
@@ -81,49 +113,33 @@ export function IconListButton(props: Props) {
   };
 
   return (
-    <Popover content={OptionsMap()}>
-      <IconButton
-        img={img}
-        text={text}
-        onClick={handleOpen}
-        disabled={disabled}
-        radius={radius ?? 0.45}
-        scale={scale ?? 2.5}
-        scaleOrientation={scaleOrientation ?? 'vw'}
-        width={width}
-        fullWidth={fullWidth}
-        balance={balance}
-        corner={!balance}
-      />
+    <Popover content={OptionsMap()} maxHeight={33} fullWidth={fullWidth} disabled={disabled}>
+      <TextTooltip {...tooltip} text={tooltip?.text ?? ['']}>
+        <IconButton
+          img={img}
+          text={text}
+          onClick={handleOpen}
+          disabled={disabled}
+          radius={radius ?? 0.45}
+          scale={scale ?? 2.5}
+          scaleOrientation={scaleOrientation ?? 'vw'}
+          width={width}
+          fullWidth={fullWidth}
+          balance={balance}
+          corner={!balance}
+          icon={icon}
+          filter={filter}
+          shake={shake}
+          cooldownBackground={cooldownBackground}
+        />
+      </TextTooltip>
     </Popover>
   );
 }
 
-const MenuOption = styled.div<{ disabled?: boolean }>`
-  display: flex;
-  align-items: center;
-  gap: 0.4vw;
-
-  border-radius: 0.4vw;
-  padding: 0.6vw;
-  justify-content: left;
-  font-size: 0.8vw;
-
-  cursor: ${({ disabled }) => (disabled ? 'none' : 'pointer')};
-  pointer-events: ${({ disabled }) => (disabled ? 'none' : 'auto')};
-  background-color: ${({ disabled }) => (disabled ? '#bbb' : '#fff')};
-
-  &:hover {
-    background-color: #ddd;
-  }
-  &:active {
-    background-color: #bbb;
-  }
-`;
-
-const MenuIcon = styled.img`
-  height: 1.4vw;
-  user-drag: none;
+const MenuWrapper = styled.div`
+  position: relative;
+  max-width: 30vw;
 `;
 
 const MenuInput = styled.input`
@@ -143,6 +159,45 @@ const MenuInput = styled.input`
   font-size: 0.75vw;
 `;
 
-const MenuWrapper = styled.div`
+const MenuOption = styled.div<{ disabled?: boolean }>`
   position: relative;
+  background-color: ${({ disabled }) => (disabled ? '#bbb' : '#fff')};
+  border-radius: 0.45vw;
+
+  width: 100%;
+  padding: 0.45vw;
+  gap: 0.6vw;
+
+  display: flex;
+  align-items: center;
+
+  cursor: ${({ disabled }) => (disabled ? 'none' : 'pointer')};
+  pointer-events: ${({ disabled }) => (disabled ? 'none' : 'auto')};
+
+  &:hover {
+    background-color: #7d7;
+    background-color: #ddd;
+    outline: 0.15vw solid #444;
+    z-index: 1;
+  }
+  &:active {
+    background-color: #bbb;
+  }
+`;
+
+const OptionIcon = styled.img`
+  border-radius: 0.3vw;
+  height: 1.8vw;
+  user-drag: none;
+`;
+
+const OptionText = styled.div`
+  height: 100%;
+
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+
+  font-size: 0.9vw;
+  line-height: 1.5vw;
 `;

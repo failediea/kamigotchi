@@ -7,7 +7,7 @@ import {
   removeComponent,
   setComponent,
   updateComponent,
-} from '@mud-classic/recs';
+} from 'engine/recs';
 import { defineNotificationComponent } from './NotificationComponent';
 import { NotificationData } from './types';
 
@@ -33,6 +33,9 @@ export function createNotificationSystem<M = undefined>(world: World) {
       description: toAdd.description,
       time: toAdd.time.toString(),
       modal: toAdd.modal,
+      questIndex: toAdd.questIndex,
+      itemIndices: toAdd.itemIndices,
+      itemAmounts: toAdd.itemAmounts,
     });
 
     return entity;

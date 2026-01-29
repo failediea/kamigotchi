@@ -11,7 +11,6 @@ import { LibTypes } from "solecs/LibTypes.sol";
 
 import { IdHolderComponent, ID as IdHolderCompID } from "components/IdHolderComponent.sol";
 import { IdSourceComponent, ID as IdSourceCompID } from "components/IdSourceComponent.sol";
-import { RateComponent, ID as RateCompID } from "components/RateComponent.sol";
 import { StateComponent, ID as StateCompID } from "components/StateComponent.sol";
 import { TimeLastComponent, ID as TimeLastCompID } from "components/TimeLastComponent.sol";
 import { TimeResetComponent, ID as TimeResetCompID } from "components/TimeResetComponent.sol";
@@ -39,6 +38,7 @@ uint256 constant RATE_PREC = 6;
  */
 library LibHarvest {
   using LibComp for IComponent;
+  using LibString for string;
   using SafeCastLib for int32;
   using SafeCastLib for uint32;
   using SafeCastLib for int256;
@@ -170,7 +170,7 @@ library LibHarvest {
     return (rate * ratio * boost) / precision;
   }
 
-  // Calculate the efficacy of the core harvesting calc (min 0).
+  // Calculate the efficacy of a kami's core harvesting calc (min 0).
   // Efficacy is a Boost on Fertility and precision is set by its (F's) config.
   function calcEfficacy(
     IUintComp comps,
@@ -186,28 +186,48 @@ library LibHarvest {
       special: int256(0)
     });
 
-    int256 efficacy = base.toInt256();
+    // get necessary values
     uint256 nodeID = getNode(comps, id);
-    string memory nodeAff = LibNode.getAffinity(comps, nodeID);
-
+    string memory nodeAffStr = LibNode.getAffinity(comps, nodeID);
     string memory bodyAff = LibKami.getBodyAffinity(comps, kamiID);
-    efficacy += calcEfficacy(comps, bodyAff, nodeAff, bonusShifts, "KAMI_HARV_EFFICACY_BODY");
-
     string memory handAff = LibKami.getHandAffinity(comps, kamiID);
-    efficacy += calcEfficacy(comps, handAff, nodeAff, bonusShifts, "KAMI_HARV_EFFICACY_HAND");
+    string[] memory nodeAffs = nodeAffStr.split("-"); // could be 1 or 2
+    if (nodeAffs.length > 2) revert("too many node affinities");
 
+    // determine most favorable matchup order
+    // NOTE: below logic assumes no XX-NORMAL nodes and impact body > impact hand
+    string memory nodeBodyAff;
+    string memory nodeHandAff;
+    if (nodeAffs.length == 1) {
+      nodeBodyAff = nodeAffStr;
+      nodeHandAff = nodeAffStr;
+    } else if (nodeAffs.length == 2) {
+      bool isReversed = false;
+      if (bodyAff.eq(nodeAffs[1])) isReversed = true;
+      else if (!bodyAff.eq(nodeAffs[0]) && handAff.eq(nodeAffs[0])) isReversed = true;
+      nodeBodyAff = isReversed ? nodeAffs[1] : nodeAffs[0];
+      nodeHandAff = isReversed ? nodeAffs[0] : nodeAffs[1];
+    }
+
+    // calculate the efficacy shifts
+    int256 efficacy = base.toInt256();
+    efficacy += calcEfficacy(comps, bodyAff, nodeBodyAff, bonusShifts, "KAMI_HARV_EFFICACY_BODY");
+    efficacy += calcEfficacy(comps, handAff, nodeHandAff, bonusShifts, "KAMI_HARV_EFFICACY_HAND");
     return (efficacy < 0) ? 0 : uint(efficacy);
   }
 
-  // determine the body efficacy shifts from the config
+  // determine the efficacy shift for a single trait from the config
+  // normal traits get half of matching bonus
   function calcEfficacy(
     IUintComp comps,
-    string memory sourceAff,
-    string memory targetAff,
+    string memory traitAff,
+    string memory nodeAff,
     Shifts memory bonusShifts,
     string memory configKey
   ) internal view returns (int256) {
-    Effectiveness effectiveness = LibAffinity.getHarvestEffectiveness(sourceAff, targetAff);
+    if (traitAff.eq("NORMAL")) return bonusShifts.up / 2;
+
+    Effectiveness effectiveness = LibAffinity.getHarvestEffectiveness(traitAff, nodeAff);
     Shifts memory configShifts = LibAffinity.getShifts(comps, configKey);
     return LibAffinity.calcEfficacyShift(effectiveness, configShifts, bonusShifts);
   }
@@ -252,8 +272,12 @@ library LibHarvest {
     return getCompByID(components, StateCompID).eqString(id, "ACTIVE");
   }
 
+  function isHarvest(IUintComp components, uint256 id) internal view returns (bool) {
+    return LibEntityType.isShape(components, id, "HARVEST");
+  }
+
   function verifyIsHarvest(IUintComp components, uint256 id) internal view {
-    if (!LibEntityType.isShape(components, id, "HARVEST")) revert("not a harvest");
+    if (!isHarvest(components, id)) revert("not a harvest");
   }
 
   /////////////////

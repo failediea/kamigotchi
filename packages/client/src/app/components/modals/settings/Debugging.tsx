@@ -3,15 +3,14 @@ import styled from 'styled-components';
 import { ActionButton } from 'app/components/library';
 import { useAccount, useVisibility } from 'app/stores';
 
-interface Props {
+export const Debugging = ({
+  actions,
+}: {
   actions: {
     echoRoom: () => void;
     echoKamis: () => void;
   };
-}
-
-export const Debugging = (props: Props) => {
-  const { actions } = props;
+}) => {
   const { debug, setDebug } = useAccount();
   const { modals, setModals } = useVisibility();
 
@@ -37,8 +36,8 @@ export const Debugging = (props: Props) => {
       </HeaderRow>
       <Section key='commits'>
         {FieldRow('Commits Modal', 'Open', () => setModals({ reveal: true }))}
-        {FieldRow('Sync kamis', 'sync', actions.echoKamis)}
-        {FieldRow('Sync location', 'sync', actions.echoRoom)}
+        {/* {FieldRow('Sync kamis', 'sync', actions.echoKamis)} */}
+        {/* {FieldRow('Sync location', 'sync', actions.echoRoom)} */}
         {FieldRow('Cache Debugging', debug.cache ? 'turn off' : 'turn on', toggleDebug)}
       </Section>
     </Container>

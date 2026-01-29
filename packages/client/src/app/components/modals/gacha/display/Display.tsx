@@ -1,18 +1,23 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
 import styled from 'styled-components';
 
 import { GachaMintConfig } from 'app/cache/config';
 import { ActionButton, Overlay } from 'app/components/library';
+import { EntityID, EntityIndex } from 'engine/recs';
 import { Account } from 'network/shapes/Account';
 import { Auction } from 'network/shapes/Auction';
 import { GachaMintData } from 'network/shapes/Gacha';
 import { Kami } from 'network/shapes/Kami';
 import { Filter, Sort, TabType, ViewMode } from '../types';
-import { Mint } from './mint/Mint';
 import { Pool } from './pool/Pool';
 import { Reroll } from './reroll/Reroll';
 
-interface Props {
+export const Display = ({
+  caches,
+  controls,
+  data,
+  state,
+  utils,
+}: {
   caches: {
     kamiBlocks: Map<EntityIndex, JSX.Element>;
   };
@@ -30,14 +35,6 @@ interface Props {
       gacha: Auction;
       reroll: Auction;
     };
-    mint: {
-      config: GachaMintConfig;
-      data: {
-        account: GachaMintData;
-        gacha: GachaMintData;
-      };
-      whitelisted: boolean;
-    };
   };
   state: {
     setQuantity: (quantity: number) => void;
@@ -51,12 +48,9 @@ interface Props {
     getMintConfig: () => GachaMintConfig;
     getMintData: (id: EntityID) => GachaMintData;
   };
-}
-
-export const Display = (props: Props) => {
-  const { state, controls, data, caches, utils } = props;
+}) => {
   const { mode, setMode, tab } = controls;
-  const { account, auctions, mint, poolKamis } = data;
+  const { account, auctions, poolKamis } = data;
 
   const toggleMode = () => {
     if (mode === 'DEFAULT') setMode('ALT');
@@ -80,17 +74,6 @@ export const Display = (props: Props) => {
   // determine whether the mode toggle button should be visible
   const isButtonVisible = () => {
     return tab === 'GACHA' || tab === 'REROLL';
-    // if (tab === 'GACHA' && mode === 'DEFAULT') {
-    //   const startTime = auctions.gacha.time.start;
-    //   return startTime > Date.now();
-    // }
-
-    // if (tab === 'REROLL' && mode == 'DEFAULT') {
-    //   const startTime = auctions.reroll.time.start;
-    //   return startTime > Date.now();
-    // }
-
-    // return false;
   };
 
   return (
@@ -101,7 +84,6 @@ export const Display = (props: Props) => {
         data={{
           ...data,
           account,
-          mintConfig: mint.config,
           auction: auctions.gacha,
           entities: poolKamis,
         }}
@@ -116,7 +98,6 @@ export const Display = (props: Props) => {
         utils={utils}
         isVisible={tab === 'REROLL'}
       />
-      <Mint controls={controls} data={data} state={state} isVisible={tab === 'MINT'} />
       <Overlay top={0.9} right={0.6}>
         {isButtonVisible() && <ActionButton text={getButtonText()} onClick={toggleMode} />}
       </Overlay>

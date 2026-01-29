@@ -1,14 +1,17 @@
-import { EntityID, EntityIndex, World } from '@mud-classic/recs';
+import { EntityID, EntityIndex, World } from 'engine/recs';
+import { Address } from 'viem';
 
 import { Components } from 'network/components';
-import { Address } from 'viem';
 import { hasFlag } from '../Flag';
 import { DetailedEntity, getItemImage } from '../utils';
 import {
   getDescription,
   getFor,
+  getIsDisabled,
   getItemIndex,
   getName,
+  getRarity,
+  getScale,
   getTokenAddress,
   getType,
 } from '../utils/component';
@@ -22,12 +25,17 @@ export interface Item extends DetailedEntity {
   entity: EntityIndex;
   index: number;
   type: string;
+  rarity: number;
   for: string;
-  address?: Address;
   requirements: Requirements;
   effects: Effects;
   is: {
+    disabled: boolean;
     tradeable: boolean;
+  };
+  token?: {
+    scale: number;
+    address: Address;
   };
 }
 
@@ -59,15 +67,22 @@ export const getItem = (world: World, comps: Components, entity: EntityIndex): I
     id: world.entities[entity],
     index,
     type: getType(comps, entity),
+    rarity: getRarity(comps, entity),
     for: getFor(comps, entity),
     requirements: getRequirements(world, comps, index),
     effects: getEffects(world, comps, index),
     is: {
+      disabled: getIsDisabled(comps, entity),
       tradeable: !hasFlag(world, comps, entity, 'NOT_TRADABLE'),
     },
   };
 
-  if (item.type === 'ERC20') item.address = getTokenAddress(comps, entity);
+  if (item.type === 'ERC20') {
+    item.token = {
+      address: getTokenAddress(comps, entity),
+      scale: getScale(comps, entity, 0, false),
+    };
+  }
 
   return item;
 };

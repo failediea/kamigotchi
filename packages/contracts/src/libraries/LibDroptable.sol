@@ -5,6 +5,7 @@ import { IWorld } from "solecs/interfaces/IWorld.sol";
 import { IUint256Component as IUintComp } from "solecs/interfaces/IUint256Component.sol";
 import { getAddrByID } from "solecs/utils.sol";
 import { LibString } from "solady/utils/LibString.sol";
+import { LibTypes } from "solecs/LibTypes.sol";
 
 import { BlockRevealComponent as BlockRevComponent, ID as BlockRevealCompID } from "components/BlockRevealComponent.sol";
 import { IdSourceComponent, ID as IdSourceCompID } from "components/IdSourceComponent.sol";
@@ -16,6 +17,8 @@ import { ValueComponent, ID as ValueCompID } from "components/ValueComponent.sol
 import { ValuesComponent, ID as ValuesCompID } from "components/ValuesComponent.sol";
 
 import { LibCommit } from "libraries/LibCommit.sol";
+import { LibData } from "libraries/LibData.sol";
+import { LibEmitter } from "libraries/utils/LibEmitter.sol";
 import { LibInventory } from "libraries/LibInventory.sol";
 import { LibRandom } from "libraries/utils/LibRandom.sol";
 
@@ -42,28 +45,41 @@ library LibDroptable {
 
   /// @notice reveals and distributes items
   /// @dev avoid big array for memory's sake
-  function reveal(IUintComp components, uint256[] memory commitIDs) internal {
-    // sorted in order of stack depth
+  function reveal(IWorld world, IUintComp components, uint256[] memory commitIDs) internal {
+    for (uint256 i; i < commitIDs.length; i++) {
+      if (commitIDs[i] == 0) continue;
+      _revealSingle(world, components, commitIDs[i]);
+    }
+  }
+
+  /// @notice reveals and distributes a single commit
+  /// @dev helper function to avoid stack too deep errors in reveal()
+  function _revealSingle(
+    IWorld world,
+    IUintComp components,
+    uint256 commitID
+  ) internal {
     IdSourceComponent idSourceComp = IdSourceComponent(getAddrByID(components, IdSourceCompID));
     IdHolderComponent holderComp = IdHolderComponent(getAddrByID(components, IdHolderCompID));
+    
+    uint256 dtID = idSourceComp.extract(commitID);
+    uint256 holderID = holderComp.extract(commitID);
+
     BlockRevComponent blockComp = BlockRevComponent(getAddrByID(components, BlockRevealCompID));
     WeightsComponent weightsComp = WeightsComponent(getAddrByID(components, WeightsCompID));
     ValueComponent valComp = ValueComponent(getAddrByID(components, ValueCompID));
+    
+    uint256[] memory amts = _select(blockComp, weightsComp, valComp, dtID, commitID);
+    
     KeysComponent keysComp = KeysComponent(getAddrByID(components, KeysCompID));
+    uint32[] memory indices = keysComp.get(dtID);
+    
+    _distribute(components, indices, amts, holderID);
+    emitRevealEvent(world, commitID, holderID, dtID, indices, amts);
+    
     ValuesComponent logComp = ValuesComponent(getAddrByID(components, ValuesCompID));
     TimeComponent timeComp = TimeComponent(getAddrByID(components, TimeCompID));
-
-    for (uint256 i; i < commitIDs.length; i++) {
-      uint256 commitID = commitIDs[i];
-      if (commitID == 0) continue;
-
-      uint256 dtID = idSourceComp.extract(commitID);
-      uint256 holderID = holderComp.extract(commitID);
-
-      uint256[] memory amts = _select(blockComp, weightsComp, valComp, dtID, commitID);
-      _distribute(components, keysComp, dtID, amts, holderID);
-      log(timeComp, logComp, holderID, dtID, amts);
-    }
+    logLatest(timeComp, logComp, holderID, dtID, amts); // latest result, to show on FE
   }
 
   /// @notice selects a single droptable result
@@ -86,26 +102,28 @@ library LibDroptable {
   /// @notice distributes item(s) to holder (single)
   function _distribute(
     IUintComp components,
-    KeysComponent keysComp,
-    uint256 dtID,
+    uint32[] memory indices,
     uint256[] memory amts,
     uint256 holderID
   ) internal {
-    uint32[] memory indices = keysComp.get(dtID);
-    for (uint256 i; i < indices.length; i++)
-      if (amts[i] > 0) LibInventory.incFor(components, holderID, indices[i], amts[i]);
+    for (uint256 i; i < indices.length; i++) {
+      if (amts[i] > 0) {
+        LibInventory.incFor(components, holderID, indices[i], amts[i]);
+        logTotal(components, holderID, indices[i], amts[i]); // log total items received
+      }
+    }
   }
 
   /// @notice logs the latest reveal result, overwriting previous values
   /// @dev only one exists per account+droptable. a crutch for FE to show latest result
-  function log(
+  function logLatest(
     TimeComponent timeComp,
     ValuesComponent valuesComp,
     uint256 holderID,
     uint256 dtID,
     uint256[] memory amts
   ) internal {
-    uint256 logID = genLogID(holderID, dtID);
+    uint256 logID = genLatestLogID(holderID, dtID);
     timeComp.set(logID, block.timestamp);
     valuesComp.set(logID, amts);
   }
@@ -143,9 +161,60 @@ library LibDroptable {
   }
 
   /////////////////
-  // UTILS
+  // LOGGING
 
-  function genLogID(uint256 holderID, uint256 dtID) internal pure returns (uint256) {
+  function logTotal(IUintComp components, uint256 holderID, uint32 index, uint256 amt) internal {
+    LibData.inc(components, holderID, index, "DROPTABLE_ITEM_TOTAL", amt);
+  }
+
+  function emitRevealEvent(
+    IWorld world,
+    uint256 commitID,
+    uint256 holderID,
+    uint256 dtID,
+    uint32[] memory indices,
+    uint256[] memory amounts
+  ) internal {
+    DroptableRevealEventData memory eventData = DroptableRevealEventData({
+      commitID: commitID,
+      holderID: holderID,
+      dtID: dtID,
+      timestamp: block.timestamp,
+      itemIndices: indices,
+      itemAmounts: amounts
+    });
+
+    LibEmitter.emitEvent(world, "DROPTABLE_REVEAL", _schema(), _encodeDroptableRevealEvent(eventData));
+  }
+
+  struct DroptableRevealEventData {
+    uint256 commitID;
+    uint256 holderID;
+    uint256 dtID;
+    uint256 timestamp;
+    uint32[] itemIndices;
+    uint256[] itemAmounts;
+  }
+
+  function _schema() internal pure returns (uint8[] memory) {
+    uint8[] memory schema = new uint8[](6);
+    schema[0] = uint8(LibTypes.SchemaValue.UINT256);      // commitID
+    schema[1] = uint8(LibTypes.SchemaValue.UINT256);      // holderID
+    schema[2] = uint8(LibTypes.SchemaValue.UINT256);      // dtID
+    schema[3] = uint8(LibTypes.SchemaValue.UINT256);      // timestamp
+    schema[4] = uint8(LibTypes.SchemaValue.UINT32_ARRAY); // itemIndices
+    schema[5] = uint8(LibTypes.SchemaValue.UINT256_ARRAY);// itemAmounts
+    return schema;
+  }
+
+  function _encodeDroptableRevealEvent(DroptableRevealEventData memory data) internal pure returns (bytes memory) {
+    return abi.encode(data.commitID, data.holderID, data.dtID, data.timestamp, data.itemIndices, data.itemAmounts);
+  }
+
+  /////////////////
+  // IDs
+
+  function genLatestLogID(uint256 holderID, uint256 dtID) internal pure returns (uint256) {
     return uint256(keccak256(abi.encodePacked("droptable.item.log", holderID, dtID)));
   }
 }

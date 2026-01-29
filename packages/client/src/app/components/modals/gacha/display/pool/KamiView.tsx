@@ -1,9 +1,9 @@
-import { EntityIndex } from '@mud-classic/recs';
 import { useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 
 import { EmptyText, KamiBlock, TextTooltip } from 'app/components/library';
-import { useSelected, useVisibility } from 'app/stores';
+import { useVisibility } from 'app/stores';
+import { EntityIndex } from 'engine/recs';
 import { Auction } from 'network/shapes/Auction';
 import { KamiStats } from 'network/shapes/Kami';
 import { Kami } from 'network/shapes/Kami/types';
@@ -12,7 +12,14 @@ import { EMPTY_TEXT, LOADING_TEXT } from './constants';
 
 const LOAD_CHUNK_SIZE = 200; // Adjust based on performance needs
 
-interface Props {
+export const KamiView = ({
+  controls,
+  caches,
+  data,
+  state,
+  utils,
+  isVisible,
+}: {
   controls: {
     sorts: Sort[];
     filters: Filter[];
@@ -31,18 +38,14 @@ interface Props {
     getKami: (entity: EntityIndex) => Kami;
   };
   isVisible: boolean;
-}
-
-export const KamiView = (props: Props) => {
-  const { controls, caches, data, state, utils, isVisible } = props;
+}) => {
   const { filters, sorts } = controls;
   const { kamiBlocks } = caches;
   const { entities } = data;
   const { tick } = state;
   const { getKami } = utils;
 
-  const { kamiIndex, setKami } = useSelected();
-  const { modals, setModals } = useVisibility();
+  const gachaModalOpen = useVisibility((s) => s.modals.gacha);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [filtered, setFiltered] = useState<Kami[]>([]);
@@ -52,14 +55,14 @@ export const KamiView = (props: Props) => {
 
   // filter (and implicitly populate) the pool of kamis on initial lod
   useEffect(() => {
-    if (isLoaded || isLoading || !modals.gacha) return;
+    if (isLoaded || isLoading || !gachaModalOpen) return;
     setIsLoading(true);
     loadKamis();
-  }, [modals.gacha]);
+  }, [gachaModalOpen]);
 
   // when the entities or filters change, update the list of filtered kamis
   useEffect(() => {
-    const isOpen = modals.gacha && isVisible;
+    const isOpen = gachaModalOpen && isVisible;
     if (isOpen) filterKamis();
   }, [filters, entities.length]);
 
@@ -70,7 +73,7 @@ export const KamiView = (props: Props) => {
       container.addEventListener('scroll', handleScroll);
       return () => container.removeEventListener('scroll', handleScroll);
     }
-  }, [filtered.length, limit, modals.gacha]);
+  }, [filtered.length, limit, gachaModalOpen]);
 
   //////////////////
   // INTERACTION

@@ -6,21 +6,30 @@ import { clickFx, hoverFx } from 'app/styles/effects';
 import { MenuIcons } from 'assets/images/icons/menu';
 import { PricingIcons } from 'assets/images/icons/pricing';
 import { Account } from 'network/shapes/Account';
+import { Allo } from 'network/shapes/Allo';
+import { Item } from 'network/shapes/Item';
 import { Listing } from 'network/shapes/Listing';
-import { getItemImage } from 'network/shapes/utils';
+import { DetailedEntity, getItemImage } from 'network/shapes/utils';
 import { playClick } from 'utils/sounds';
 import { CartItem } from '../types';
 
-export interface Props {
+// TODO: support multiple buys
+export const CatalogRow = ({
+  account,
+  cart,
+  listing,
+  toggle,
+  utils,
+}: {
   account: Account;
   cart: CartItem[];
   listing: Listing;
   toggle: () => void;
-}
-
-// TODO: support multiple buys
-export const CatalogRow = (props: Props) => {
-  const { account, cart, listing, toggle } = props;
+  utils: {
+    parseAllos: (allo: Allo[]) => DetailedEntity[];
+    displayRequirements: (item: Item) => string;
+  };
+}) => {
   const { item, payItem, buy } = listing;
 
   const handleClick = () => {
@@ -59,9 +68,18 @@ export const CatalogRow = (props: Props) => {
   };
 
   const getItemTooltip = () => {
-    const tooltip: string[] = [];
+    const tooltip: (string | JSX.Element)[] = [];
     if (item.description) tooltip.push(item.description);
-    if (item.effects) tooltip.push(`Requirements: ${item.effects.use}`);
+
+    const requirementsText = utils.displayRequirements(item);
+    tooltip.push(`Requirements: ${requirementsText}`);
+
+    const effectsList =
+      item.effects?.use?.length > 0
+        ? utils.parseAllos(item.effects.use).map((entry) => entry?.description ?? '').join('\n')
+        : 'None';
+    tooltip.push(`Effects: ${effectsList}`);
+
     return tooltip;
   };
 
@@ -116,12 +134,10 @@ export const CatalogRow = (props: Props) => {
   );
 };
 
-interface ContainerProps {
+const Container = styled.div<{
   isInCart: boolean;
   effectScale: number;
-}
-
-const Container = styled.div<ContainerProps>`
+}>`
   position: relative;
   border: 0.15vw solid black;
   border-radius: 0.4vw;

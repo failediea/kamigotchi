@@ -1,25 +1,30 @@
-import { EntityID, EntityIndex } from '@mud-classic/recs';
-import { Dispatch, useState } from 'react';
+import { Dispatch, useEffect, useState } from 'react';
+import styled from 'styled-components';
 
 import { calcTradeTax } from 'app/cache/trade';
-import { IconButton, Overlay, Pairing, Text } from 'app/components/library';
+import { Pairing, Text } from 'app/components/library';
 import { ItemImages } from 'assets/images/items';
-import { ETH_INDEX, ONYX_INDEX } from 'constants/items';
+import { ETH_INDEX } from 'constants/items';
+import { EntityID, EntityIndex } from 'engine/recs';
 import { Account, Inventory } from 'network/shapes';
 import { Item } from 'network/shapes/Item';
 import { ActionComponent } from 'network/systems';
 import { waitForActionCompletion } from 'network/utils';
-import styled from 'styled-components';
 import { playClick } from 'utils/sounds';
 import { TRADE_ROOM_INDEX } from '../../constants';
 import { ConfirmationData } from '../../library';
-import { MultiCreate } from './MultiCreate';
 import { SingleCreate } from './SingleCreate';
 
 type Mode = 'Single' | 'Multi';
-const DisabledItems = [ONYX_INDEX, ETH_INDEX];
+const DisabledItems = [ETH_INDEX];
 
-interface Props {
+export const Create = ({
+  actions,
+  controls,
+  data,
+  types,
+  utils,
+}: {
   actions: {
     createTrade: (
       wantItems: Item[],
@@ -45,10 +50,7 @@ interface Props {
   utils: {
     entityToIndex: (id: EntityID) => EntityIndex;
   };
-}
-
-export const Create = (props: Props) => {
-  const { actions, controls, data, types, utils } = props;
+}) => {
   const { createTrade } = actions;
   const { setIsConfirming, setConfirmData } = controls;
   const { account } = data;
@@ -56,15 +58,23 @@ export const Create = (props: Props) => {
   const { entityToIndex } = utils;
 
   const [mode, setMode] = useState<Mode>('Single');
+  const [thousandsSeparator, setThousandsSeparator] = useState<string>(',');
 
-  // toggle between multi and single Create modes
+  // Detect locale-specific number formatting
+  useEffect(() => {
+    setThousandsSeparator((4.56).toLocaleString().includes(',') ? '.' : ',');
+  }, []);
+
+  /////////////////
+  // INTERACTION
+
+  // toggle between Single and Multi mode
   const toggleMode = () => {
     if (mode === 'Multi') setMode('Single');
     else setMode('Multi');
   };
 
-  // organize the form data for trade offer creation
-  // TODO: detect successful trade creation and reset form
+  // create a Trade
   const handleTrade = async (want: Item[], wantAmt: number[], have: Item[], haveAmt: number[]) => {
     try {
       const tradeActionID = createTrade(want, wantAmt, have, haveAmt);
@@ -75,7 +85,7 @@ export const Create = (props: Props) => {
     }
   };
 
-  // handle prompting for confirmation with trade creation
+  // trigger the confirmation prompt to create a Trade
   const handleCreatePrompt = (want: Item[], wantAmt: number[], have: Item[], haveAmt: number[]) => {
     const confirmAction = () => handleTrade(want, wantAmt, have, haveAmt);
     setConfirmData({
@@ -83,15 +93,14 @@ export const Create = (props: Props) => {
       content: getCreateConfirmation(want, wantAmt, have, haveAmt),
       onConfirm: confirmAction,
     });
-    setIsConfirming(true); // TODO: this is a hack to get the confirmation to show
+    setIsConfirming(true);
     playClick();
   };
 
   /////////////////
   // DISPLAY
 
-  // create the trade confirmation window content
-  // TODO: adjust Buy amounts for tax and display breakdown in tooltip
+  // generate the DOM for the confirmation prompt
   const getCreateConfirmation = (
     want: Item[],
     wantAmt: number[],
@@ -183,51 +192,25 @@ export const Create = (props: Props) => {
 
   return (
     <Container>
-      <Overlay top={0} fullWidth>
-        <Title>Create Offer</Title>
-      </Overlay>
-      <MultiCreate
-        actions={{ ...actions, handleCreatePrompt }}
-        controls={{ ...controls }}
-        data={{ ...data, items: data.items.filter((item) => !DisabledItems.includes(item.index)) }}
-        isVisible={mode === 'Multi'}
-      />
       <SingleCreate
         actions={{ ...actions, handleCreatePrompt }}
         controls={{ ...controls }}
-        data={{ ...data, items: data.items.filter((item) => !DisabledItems.includes(item.index)) }}
-        isVisible={mode === 'Single'}
+        data={{
+          ...data,
+          items: data.items.filter((item) => !DisabledItems.includes(item.index)),
+          thousandsSeparator,
+        }}
       />
-      <Overlay bottom={0.75} left={0.75}>
-        <IconButton text={`<${mode}>`} onClick={toggleMode} />
-      </Overlay>
     </Container>
   );
 };
 
 const Container = styled.div`
   position: relative;
-  border-right: 0.15vw solid black;
 
-  width: 40%;
   height: 100%;
 
   user-select: none;
-`;
-
-const Title = styled.div`
-  position: sticky;
-  background-color: rgb(221, 221, 221);
-  opacity: 0.9;
-
-  width: 100%;
-  top: 0;
-  z-index: 1;
-  padding: 1.8vw;
-
-  color: black;
-  font-size: 1.2vw;
-  text-align: left;
 `;
 
 const Paragraph = styled.div`

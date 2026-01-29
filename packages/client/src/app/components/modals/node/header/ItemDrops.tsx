@@ -7,16 +7,17 @@ import { Node } from 'network/shapes/Node';
 import { ScavBar } from 'network/shapes/Scavenge';
 import { DetailedEntity } from 'network/shapes/utils';
 
-interface Props {
+export const ItemDrops = ({
+  node,
+  scavenge,
+  utils,
+}: {
   node: Node;
   scavenge: ScavBar;
   utils: {
     parseAllos: (scavAllo: Allo[]) => DetailedEntity[];
   };
-}
-
-export const ItemDrops = (props: Props) => {
-  const { node, scavenge, utils } = props;
+}) => {
   const { parseAllos } = utils;
   const [drops, setDrops] = useState<DetailedEntity[]>([]);
   const nodeDrops = node.drops;
@@ -30,7 +31,7 @@ export const ItemDrops = (props: Props) => {
     <Container>
       <Label>Drops: </Label>
       <TextTooltip text={[nodeDrops[0]?.name ?? '']}>
-        <Icon key={'node-' + nodeDrops[0]?.name} src={nodeDrops[0]?.image ?? ''} />
+        <Icon key={'node-' + nodeDrops[0]?.name} src={nodeDrops[0]?.image ?? null} />
       </TextTooltip>
 
       <TextTooltip text={drops.map((entry) => `${entry.name} [${entry.description}]`)}>

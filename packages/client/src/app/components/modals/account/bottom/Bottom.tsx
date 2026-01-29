@@ -1,4 +1,4 @@
-import { EntityIndex } from '@mud-classic/recs';
+import { EntityIndex } from 'engine/recs';
 import styled from 'styled-components';
 
 import { Account as PlayerAccount } from 'app/stores';
@@ -6,12 +6,18 @@ import { Account, BaseAccount } from 'network/shapes/Account';
 import { Friends } from 'network/shapes/Account/friends';
 import { Friendship } from 'network/shapes/Friendship';
 import { Kami } from 'network/shapes/Kami';
+import { Address } from 'viem';
 import { PartyBottom } from './PartyBottom';
 import { SocialBottom } from './SocialBottom/SocialBottom';
 import { SubTabs } from './SocialBottom/SubTabs';
 import { StatsBottom } from './StatsBottom';
 
-interface Props {
+export const Bottom = ({
+  actions,
+  data,
+  utils,
+  view: { tab, subTab, setSubTab, isSelf },
+}: {
   actions: {
     acceptFren: (friendship: Friendship) => void;
     blockFren: (account: BaseAccount) => void;
@@ -22,6 +28,7 @@ interface Props {
     account: Account;
     accounts: Account[];
     isSelf: boolean;
+    kamiNFTAddress: Address;
     player: PlayerAccount;
     vip: {
       epoch: number; // current VIP epoch
@@ -31,6 +38,8 @@ interface Props {
   utils: {
     getAccountKamis: (accEntity: EntityIndex) => Kami[];
     getFriends: (accEntity: EntityIndex) => Friends;
+    queryKamiByIndex: (index: number) => EntityIndex | undefined;
+    getKami: (entity: EntityIndex) => Kami;
   };
   view: {
     isSelf: boolean;
@@ -38,12 +47,8 @@ interface Props {
     subTab: string;
     tab: string;
   };
-}
-
-export const Bottom = (props: Props) => {
-  const { data, view, utils, actions } = props;
+}) => {
   const { acceptFren, blockFren, cancelFren, requestFren } = actions;
-  const { tab, subTab, setSubTab, isSelf } = view;
   const { account } = data;
 
   /////////////////
@@ -65,7 +70,7 @@ export const Bottom = (props: Props) => {
         <StatsBottom key='statsbottom' data={data} />
       </Tab>
       <Tab isVisible={tab === 'party'}>
-        <PartyBottom key='partybottom' data={{ account }} utils={utils} />
+        <PartyBottom key='partybottom' data={data} utils={utils} />
       </Tab>
     </>
   );

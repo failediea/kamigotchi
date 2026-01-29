@@ -1,4 +1,4 @@
-import { EntityID, World } from '@mud-classic/recs';
+import { EntityID, World } from 'engine/recs';
 
 import { Components } from 'network/components';
 import { Allo, getAllosOf } from '../Allo';
@@ -9,11 +9,13 @@ export interface Effects {
   // burn: Allo[];
   // craft: Allo[];
   use: Allo[];
+  equip: Allo[];
 }
 
 export const getEffects = (world: World, comps: Components, index: number): Effects => {
   return {
     use: getActionAllos(world, comps, index, 'USE'),
+    equip: getActionAllos(world, comps, index, 'EQUIP'),
   };
 };
 

@@ -1,75 +1,123 @@
-import { EntityIndex, getComponentEntities, getComponentValue } from '@mud-classic/recs';
-import { map, merge } from 'rxjs';
+import { EntityIndex, getComponentValue } from 'engine/recs';
 import styled, { keyframes } from 'styled-components';
 
+import { useLayers } from 'app/root/hooks';
 import { UIComponent } from 'app/root/types';
-import { Modals, useVisibility } from 'app/stores';
+import { Modals, useSelected, useVisibility } from 'app/stores';
+import { getItemRarities } from 'constants/itemRarities';
+import { getItemByIndex } from 'network/shapes/Item';
+import { useComponentEntities } from 'network/utils/hooks';
 
 export const NotificationFixture: UIComponent = {
   id: 'NotificationFixture',
-  requirement: (layers) => {
+  Render: () => {
+    const layers = useLayers();
+
+    const { notifications } = (() => {
       const {
         network: { notifications },
       } = layers;
-
-      return merge(notifications.Notification.update$).pipe(
-        map(() => {
-          const list = Array.from(getComponentEntities(notifications.Notification));
-          return {
-            notifications: notifications,
-            list: list,
-          };
-        })
-      );
-  },
-  Render: ({ notifications, list }) => {
-      const { fixtures, modals, setModals } = useVisibility();
-
-      /////////////////
-      // INTERACTION
-
-      const handleClick = (targetModal: string | undefined, entity: EntityIndex) => {
-        if (targetModal === undefined) return;
-
-        const target = targetModal as keyof Modals;
-        setModals({ [target]: true });
-        dismiss(entity);
+      return {
+        notifications: notifications,
       };
+    })();
 
-      const dismiss = (entity: EntityIndex) => {
-        notifications.remove(entity);
-      };
+    // Reactive list of notification entities via hook
+    const list = useComponentEntities(notifications.Notification);
+    const notificationsVisible = useVisibility((s) => s.fixtures.notifications);
+    const setModals = useVisibility((s) => s.setModals);
 
-      /////////////////
-      // VISUALIZATION
+    /////////////////
+    // INTERACTION
 
-      const SingleNotif = (entity: EntityIndex) => {
-        const notification = getComponentValue(notifications.Notification, entity);
-        if (!notification) return null;
+    const handleClick = (
+      targetModal: string | undefined,
+      entity: EntityIndex,
+      questIndex?: EntityIndex
+    ) => {
+      if (targetModal === undefined) return;
+      // now when clicking on quest notifications
+      // that questDialogue will open
+      if (targetModal === 'questDialogue' && questIndex) {
+        useSelected.setState({ questIndex: questIndex });
+      }
+      const target = targetModal as keyof Modals;
+      setModals({ [target]: true });
+      dismiss(entity);
+    };
+
+    const dismiss = (entity: EntityIndex) => {
+      notifications.remove(entity);
+    };
+
+    /////////////////
+    // VISUALIZATION
+
+    const SingleNotif = (entity: EntityIndex) => {
+      const notification = getComponentValue(notifications.Notification, entity);
+      if (!notification) return null;
+
+      const {
+        network: { world, components },
+      } = layers;
+
+      const renderDescription = () => {
+        const itemIndices = notification.itemIndices as number[] | undefined;
+        const itemAmounts = notification.itemAmounts as string[] | undefined;
+
+        if (!itemIndices || !itemAmounts) {
+          return <Description>{notification.description}</Description>;
+        }
 
         return (
-          <Card key={entity.toString()}>
-            <ExitButton onClick={() => dismiss(entity)}>X</ExitButton>
-            <div onClick={() => handleClick(notification.modal as string | undefined, entity)}>
-              <Title>{notification.title}</Title>
-              <Description>{notification.description}</Description>
-            </div>
-          </Card>
+          <Description>
+            Received:{' '}
+            {itemIndices.map((itemIndex, i) => {
+              const item = getItemByIndex(world, components, itemIndex);
+              const rarity = getItemRarities(item.rarity ?? 0);
+              const amount = itemAmounts[i];
+
+              return (
+                <span key={i}>
+                  {i > 0 && ', '}x{amount} <ItemText $color={rarity.color}>{item.name}</ItemText>
+                </span>
+              );
+            })}
+          </Description>
         );
       };
 
-      const isVisible = () => {
-        return fixtures.notifications && list.length > 0;
-      };
-
-      /////////////////
-      // RENDER
-
       return (
-        <Wrapper style={{ display: isVisible() ? 'block' : 'none' }}>
-          <Contents>{list.map((id: EntityIndex) => SingleNotif(id))}</Contents>
-        </Wrapper>
+        <Card key={entity.toString()}>
+          <ExitButton onClick={() => dismiss(entity)}>X</ExitButton>
+          <div
+            onClick={() =>
+              handleClick(
+                notification.modal as string | undefined,
+                entity,
+                notification.questIndex as EntityIndex | undefined
+              )
+            }
+          >
+            <Title>{notification.title}</Title>
+            {renderDescription()}
+          </div>
+        </Card>
       );
+    };
+
+    const isVisible = () => {
+      return notificationsVisible && list.length > 0;
+    };
+
+    /////////////////
+    // RENDER
+
+    return (
+      <Wrapper style={{ display: isVisible() ? 'block' : 'none' }}>
+        <Contents>{list.map((id: EntityIndex) => SingleNotif(id))}</Contents>
+      </Wrapper>
+    );
   },
 };
 
@@ -134,6 +182,10 @@ const Description = styled.div`
   padding: 0.4vh 0.5vw;
 
   max-width: 100%;
+`;
+
+const ItemText = styled.span<{ $color: string }>`
+  color: ${(props) => props.$color};
 `;
 
 const ExitButton = styled.button`

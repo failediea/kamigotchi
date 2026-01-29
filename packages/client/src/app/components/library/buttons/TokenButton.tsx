@@ -1,6 +1,6 @@
-import { EntityID } from '@mud-classic/recs';
 import { uuid } from '@mud-classic/utils';
-import { utils } from 'ethers';
+import { EntityID } from 'engine/recs';
+import { ethers } from 'ethers';
 import { useEffect, useState } from 'react';
 import { getAddress } from 'viem';
 
@@ -10,17 +10,18 @@ import { Item } from 'network/shapes/Item';
 import { getCompAddr } from 'network/shapes/utils';
 import { ActionButton } from './ActionButton';
 
-interface Props {
+// ActionButton wrapper for token approval/spend flows
+// Overrides onClick with approval flow if approval needed
+export const TokenButton = ({
+  network: { actions, world, components },
+  token,
+  amount,
+  ...props
+}: {
   network: NetworkLayer;
   token: Item; // use token item registry
   amount: number;
-}
-
-// ActionButton wrapper for token approval/spend flows
-// Overrides onClick with approval flow if approval needed
-export const TokenButton = (props: Props) => {
-  const { amount, network, token } = props;
-  const { actions, world, components } = network;
+}) => {
   const { balances } = useTokens();
   const { selectedAddress, apis } = useNetwork();
 
@@ -29,11 +30,11 @@ export const TokenButton = (props: Props) => {
 
   useEffect(() => {
     const allowAddress = getCompAddr(world, components, 'component.token.allowance');
-    setSpender(utils.hexZeroPad(allowAddress, 20));
-  }, [network]);
+    setSpender(ethers.zeroPadValue(allowAddress, 20));
+  }, [world, components]);
 
   useEffect(() => {
-    const needsApproval = amount > (balances.get(token.address || '')?.allowance || 0);
+    const needsApproval = amount > (balances.get(token.token?.address || '')?.allowance || 0);
     setApproved(!needsApproval);
   }, [balances]);
 
@@ -43,7 +44,7 @@ export const TokenButton = (props: Props) => {
   const approveTx = async () => {
     const api = apis.get(selectedAddress);
     if (!api) return console.error(`API not established for ${selectedAddress}`);
-    const checksumAddr = getAddress(token.address!);
+    const checksumAddr = getAddress(token.token?.address!);
     const checksumSpender = getAddress(spender);
 
     const actionID = uuid() as EntityID;

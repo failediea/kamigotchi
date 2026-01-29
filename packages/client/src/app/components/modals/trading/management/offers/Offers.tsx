@@ -10,7 +10,14 @@ import { TabType } from '../../types';
 import { ExecutedOffer } from './ExecutedOffer';
 import { PendingOffer } from './PendingOffer';
 
-interface Props {
+// displays the player's open and executed trade offers
+// TODO: display the 'Executable' offers (where the player is the Taker) as well
+export const Offers = ({
+  actions,
+  controls,
+  data,
+  utils,
+}: {
   actions: {
     completeTrade: (trade: Trade) => void;
     cancelTrade: (trade: Trade) => void;
@@ -29,29 +36,24 @@ interface Props {
   utils: {
     getItemByIndex: (index: number) => Item;
   };
-}
-
-// displays the player's open and executed trade offers
-// TODO: display the 'Executable' offers (where the player is the Taker) as well
-export const Offers = (props: Props) => {
-  const { actions, controls, data, utils } = props;
+}) => {
   const { tab } = controls;
   const { account, trades } = data;
-  const { modals } = useVisibility();
+  const tradingModalVisible = useVisibility((s) => s.modals.trading);
 
   const [openTrades, setOpenTrades] = useState<Trade[]>([]);
   const [executedTrades, setExecutedTrades] = useState<Trade[]>([]);
 
   // keep the list of open and executed trades updated'
   useEffect(() => {
-    if (!modals.trading || tab !== `Management`) return;
+    if (!tradingModalVisible || tab !== `Management`) return;
     const openTrades = trades.filter((trade) => trade.state === 'PENDING');
     const executedTrades = trades.filter(
       (trade) => trade.state === 'EXECUTED' && trade.maker?.entity === account.entity
     );
     setOpenTrades(openTrades);
     setExecutedTrades(executedTrades);
-  }, [trades, modals.trading, tab]);
+  }, [trades, tradingModalVisible, tab]);
 
   /////////////////
   // DISPLAY

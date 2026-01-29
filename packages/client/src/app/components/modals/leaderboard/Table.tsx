@@ -1,4 +1,4 @@
-import { EntityID } from '@mud-classic/recs';
+import { EntityID } from 'engine/recs';
 import styled from 'styled-components';
 
 import { useSelected, useVisibility } from 'app/stores';
@@ -6,20 +6,22 @@ import { Account } from 'network/shapes/Account';
 import { Score } from 'network/shapes/Score';
 import { playClick } from 'utils/sounds';
 
-interface Props {
+// the table rendering of the leaderboard modal
+export const Table = ({
+  scores,
+  prefix,
+  utils,
+}: {
   scores: Score[];
   prefix: string;
   utils: {
     getAccountByID: (id: EntityID) => Account;
   };
-}
-
-// the table rendering of the leaderboard modal
-export const Table = (props: Props) => {
-  const { scores, prefix, utils } = props;
+}) => {
   const { getAccountByID } = utils;
-  const { modals, setModals } = useVisibility();
-  const { setAccount } = useSelected();
+  const accountModalOpen = useVisibility((s) => s.modals.account);
+  const setModals = useVisibility((s) => s.setModals);
+  const setAccount = useSelected((s) => s.setAccount);
 
   /////////////////
   // INTERACTION
@@ -27,7 +29,7 @@ export const Table = (props: Props) => {
   // toggle the account modal settings depending on its current state
   const handleClick = (account: Account) => {
     setAccount(account.index);
-    if (!modals.account) setModals({ account: true });
+    if (!accountModalOpen) setModals({ account: true });
     playClick();
   };
 

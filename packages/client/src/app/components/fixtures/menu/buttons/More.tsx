@@ -1,14 +1,20 @@
 import { usePrivy } from '@privy-io/react-auth';
 import { useEffect, useState } from 'react';
 
-import { IconListButton, TextTooltip } from 'app/components/library';
+import { IconListButton } from 'app/components/library';
 import { useVisibility } from 'app/stores';
 import { LogoutIcon } from 'assets/images/icons/actions';
 import { HelpIcon, MoreIcon, ResetIcon, SettingsIcon } from 'assets/images/icons/menu';
+import { TokenIcons } from 'assets/images/tokens';
+import { useBridgeOpener } from 'network/utils/hooks';
 
 export const MoreMenuButton = () => {
   const { ready, authenticated, logout } = usePrivy();
-  const { modals, setModals } = useVisibility();
+  const setModals = useVisibility((s) => s.setModals);
+  const settingsVisible = useVisibility((s) => s.modals.settings);
+  const helpVisible = useVisibility((s) => s.modals.help);
+  const openBridge = useBridgeOpener();
+
   const [disabled, setDisabled] = useState(true);
 
   useEffect(() => {
@@ -61,7 +67,7 @@ export const MoreMenuButton = () => {
   };
 
   const toggleSettings = () => {
-    if (modals.settings) setModals({ settings: false });
+    if (settingsVisible) setModals({ settings: false });
     else {
       setModals({
         chat: false,
@@ -75,7 +81,7 @@ export const MoreMenuButton = () => {
   };
 
   const toggleHelp = () => {
-    if (modals.help) setModals({ help: false });
+    if (helpVisible) setModals({ help: false });
     else {
       setModals({
         chat: false,
@@ -89,19 +95,19 @@ export const MoreMenuButton = () => {
   };
 
   return (
-    <TextTooltip text={['More']}>
-      <IconListButton
-        img={MoreIcon}
-        options={[
-          { text: 'Settings', disabled, image: SettingsIcon, onClick: toggleSettings },
-          { text: 'Help', image: HelpIcon, onClick: toggleHelp },
-          { text: 'Reset State', image: ResetIcon, onClick: handleResetState },
-          { text: 'Logout', disabled, image: LogoutIcon, onClick: handleLogout },
-        ]}
-        scale={4.5}
-        scaleOrientation='vh'
-        radius={0.9}
-      />
-    </TextTooltip>
+    <IconListButton
+      img={MoreIcon}
+      options={[
+        { text: 'Bridge', image: TokenIcons.init, onClick: openBridge },
+        { text: 'Settings', disabled, image: SettingsIcon, onClick: toggleSettings },
+        { text: 'Help', image: HelpIcon, onClick: toggleHelp },
+        { text: 'Logout', disabled, image: LogoutIcon, onClick: handleLogout },
+        { text: 'Reset State', image: ResetIcon, onClick: handleResetState },
+      ]}
+      scale={4.5}
+      scaleOrientation='vh'
+      radius={0.9}
+      tooltip={{ text: ['More'] }}
+    />
   );
 };

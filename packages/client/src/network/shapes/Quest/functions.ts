@@ -1,4 +1,4 @@
-import { EntityIndex, World } from '@mud-classic/recs';
+import { EntityIndex, World, getComponentValue } from 'engine/recs';
 
 import { Components } from 'network/';
 import { Account } from '../Account';
@@ -12,7 +12,7 @@ import { BaseQuest, Quest, populate } from './quest';
 /////////////////
 // CHECKERS
 
-// check whethter a Repeatable Quest is Available to be repeated now
+// check whether a Repeatable Quest is Available to be repeated now
 const canRepeat = (completed: Quest) => {
   if (!completed.repeatable) return false;
   const now = Date.now() / 1000;
@@ -29,6 +29,23 @@ export const hasCompleted = (
 ): boolean => {
   const instance = queryInstance(world, questIndex, holder);
   return instance !== undefined && getIsComplete(components, instance);
+};
+
+export const hasCompletedDelay = (
+  world: World,
+  components: Components,
+  questIndex: number,
+  holder: EntityIndex,
+  delay: number
+): boolean => {
+  const { LastTime } = components;
+
+  const instance = queryInstance(world, questIndex, holder);
+  if (instance === undefined) return false; // prior quest not accepted
+  if (!getIsComplete(components, instance)) return false; // prior quest not completed
+
+  const endTime = Number(getComponentValue(LastTime, instance)?.value ?? 0);
+  return Date.now() / 1000 > endTime + Number(delay);
 };
 
 // find a Quest in a list of other Quests by its index
@@ -128,6 +145,33 @@ export const filterByReward = (quests: Quest[], faction?: number) => {
 export const filterOngoing = (quests: Quest[]) => {
   if (quests.length === 0) return [];
   return filterByNotObjective(quests, 1);
+};
+
+// find quest next in chain
+export const findNextInChain = (
+  world: World,
+  components: Components,
+  account: Account,
+  currentQuestIndex: number,
+  registry: BaseQuest[]
+): BaseQuest | undefined => {
+  const dependentQuests = registry.filter((q) => {
+    const fullQuest = populate(world, components, q);
+    if (fullQuest.isDisabled) return false;
+    const dependsOnCurrent = fullQuest.requirements.some(
+      (req) => req.target.type === 'QUEST' && req.target.index === currentQuestIndex
+    );
+    if (!dependsOnCurrent) return false;
+    if (hasCompleted(world, components, q.index, account.entity)) return false;
+
+    // checks all requirements are met
+    // (not just the current quest)
+    parseRequirements(world, components, account, fullQuest);
+    return meetsRequirements(fullQuest);
+  });
+
+  const sorted = dependentQuests.sort((a, b) => a.index - b.index);
+  return sorted[0];
 };
 
 /////////////////

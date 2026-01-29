@@ -11,18 +11,14 @@ import { rooms } from 'constants/rooms';
 import { RoomAsset } from 'constants/rooms/types';
 import { getCurrPhase } from 'utils/time';
 
-interface Props {
-  index: number;
-}
-
 const RoomsBgm: Map<string, Howl> = new Map<string, Howl>();
 const defaultBgm = { key: 'cave', path: cave };
 
 // painting of the room alongside any clickable objects
-export const Room = (props: Props) => {
-  const { index } = props;
-  const { modals, setModals } = useVisibility();
-  const { setNode } = useSelected();
+export const Room = ({ index }: { index: number }) => {
+  const tradingModalOpen = useVisibility((s) => s.modals.trading);
+  const setModals = useVisibility((s) => s.setModals);
+  const setNode = useSelected((s) => s.setNode);
   const [room, setRoom] = useState(rooms[0]);
   const [bgm, setBgm] = useState<Howl>();
   const [settings] = useLocalStorage('settings', { volume: { fx: 0.5, bgm: 0.5 } });
@@ -57,7 +53,7 @@ export const Room = (props: Props) => {
     closeModals();
   }, [index]);
 
-  /* TODO: when the time comes to have multiple tracks per room, 
+  /* TODO: when the time comes to have multiple tracks per room,
   remember to turn each room music object into an array of objects,
   also substitute existing useeffect by something like this .
   useEffect(() => {
@@ -143,7 +139,7 @@ export const Room = (props: Props) => {
         x2={x2}
         y2={y2}
         onClick={() => {
-          setModals({ trading: !modals.trading });
+          setModals({ trading: !tradingModalOpen });
         }}
       />
     );

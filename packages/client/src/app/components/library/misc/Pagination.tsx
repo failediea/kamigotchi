@@ -1,22 +1,28 @@
 import styled from 'styled-components';
 
-interface PaginationProps {
+const alphabet = [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ#'];
+
+export const Pagination = ({
+  setSearch,
+  selectedLetter,
+  onSelect,
+  isVisible,
+}: {
+  setSearch: React.Dispatch<React.SetStateAction<string>>;
   selectedLetter: string;
   onSelect: React.Dispatch<React.SetStateAction<string>>;
   isVisible: boolean;
-}
-
-const alphabet = [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ#'];
-
-export const Pagination = (props: PaginationProps) => {
-  const { selectedLetter, onSelect, isVisible } = props;
+}) => {
   return (
     <LetterIndex isVisible={isVisible}>
       {alphabet.map((letter) => (
         <Letter
           key={letter}
           isSelected={letter === selectedLetter}
-          onClick={() => onSelect(letter)}
+          onClick={() => {
+            setSearch('');
+            onSelect(letter);
+          }}
         >
           {letter}
         </Letter>

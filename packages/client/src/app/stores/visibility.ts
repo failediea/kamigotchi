@@ -45,23 +45,27 @@ export interface Modals {
   crafting: boolean;
   dialogue: boolean;
   emaBoard: boolean;
+  animationStudio: boolean;
   gacha: boolean;
   goal: boolean;
   help: boolean;
   inventory: boolean;
   kami: boolean;
   leaderboard: boolean;
+  lootBox: boolean;
+  templeOfTheWheel: boolean;
   map: boolean;
   merchant: boolean;
   node: boolean;
+  questDialogue: boolean;
   operatorFund: boolean;
   party: boolean;
+  presale: boolean;
   quests: boolean;
   reveal: boolean;
   settings: boolean;
-  presale: boolean;
+  tokenPortal: boolean;
   trading: boolean;
-  lootBox: boolean;
 }
 
 export const toggleModals = (isOn: boolean): Modals => ({
@@ -72,23 +76,27 @@ export const toggleModals = (isOn: boolean): Modals => ({
   crafting: isOn,
   dialogue: isOn,
   emaBoard: isOn,
+  animationStudio: isOn,
   gacha: isOn,
   goal: isOn,
   help: isOn,
   inventory: isOn,
   kami: isOn,
   leaderboard: isOn,
+  lootBox: isOn,
+  templeOfTheWheel: isOn,
   map: isOn,
+  questDialogue: isOn,
   merchant: isOn,
   node: isOn,
   operatorFund: isOn,
   party: isOn,
+  presale: isOn,
   quests: isOn,
   reveal: isOn,
   settings: isOn,
-  presale: isOn,
+  tokenPortal: isOn,
   trading: isOn,
-  lootBox: isOn,
 });
 
 ////////////////
@@ -118,25 +126,29 @@ export const useVisibility = create<State & Actions>((set) => {
       bridgeERC721: false,
       chat: false,
       crafting: false,
+      questDialogue: false,
       dialogue: false,
       emaBoard: false,
+      animationStudio: false,
       gacha: false,
       goal: false,
       help: false,
       inventory: false,
       kami: false,
       leaderboard: false,
+      lootBox: false,
+      templeOfTheWheel: false,
       map: false,
       merchant: false,
       node: false,
       operatorFund: false,
       party: false,
+      presale: false,
       quests: false,
       reveal: false,
       settings: false,
-      presale: false,
+      tokenPortal: false,
       trading: false,
-      lootBox: false,
     },
     validators: {
       accountRegistrar: false,

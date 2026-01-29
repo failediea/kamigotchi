@@ -1,14 +1,18 @@
 import styled from 'styled-components';
 
-import { EntityIndex } from '@mud-classic/recs';
 import { ActionButton } from 'app/components/library';
 import { useVisibility } from 'app/stores';
+import { EntityIndex } from 'engine/recs';
 import { ScavBar } from 'network/shapes/Scavenge';
 import { useEffect, useState } from 'react';
 
 const SYNC_TIME = 1500;
 
-interface Props {
+export const ScavengeBar = ({
+  scavenge,
+  actions,
+  utils,
+}: {
   scavenge: ScavBar;
   actions: {
     claim: (scavenge: ScavBar) => void;
@@ -17,12 +21,9 @@ interface Props {
     getPoints: (entity: EntityIndex) => number;
     queryScavInstance: () => EntityIndex | undefined;
   };
-}
-
-export const ScavengeBar = (props: Props) => {
-  const { scavenge, actions, utils } = props;
+}) => {
   const { getPoints, queryScavInstance } = utils;
-  const { modals } = useVisibility();
+  const nodeModalVisible = useVisibility((s) => s.modals.node);
 
   const [lastSync, setLastSync] = useState(Date.now());
   const [points, setPoints] = useState(0);
@@ -41,9 +42,9 @@ export const ScavengeBar = (props: Props) => {
 
   // periodically update the number of rolls and points if modal is open
   useEffect(() => {
-    if (!modals.node || !scavenge) return;
+    if (!nodeModalVisible || !scavenge) return;
     update();
-  }, [lastSync, scavenge.index]);
+  }, [lastSync, scavenge.index, nodeModalVisible]);
 
   const update = () => {
     const instanceEntity = queryScavInstance();

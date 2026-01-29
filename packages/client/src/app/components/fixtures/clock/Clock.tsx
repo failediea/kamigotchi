@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
-import { interval, map } from 'rxjs';
 import styled from 'styled-components';
 
-import { Account, calcCurrentStamina, getAccount } from 'app/cache/account';
+import { Account, calcCurrentStamina as _calcCurrentStamina, getAccount } from 'app/cache/account';
 import { TextTooltip } from 'app/components/library';
 import { getColor } from 'app/components/library/measures/Battery';
 import { UIComponent } from 'app/root/types';
@@ -11,32 +10,37 @@ import { ClockIcons } from 'assets/images/icons/clock';
 import { queryAccountFromEmbedded } from 'network/shapes/Account';
 import { calcPercent } from 'utils/numbers';
 import { getCurrPhase, getKamiTime, getPhaseName } from 'utils/time';
+import { useLayers } from 'app/root/hooks';
 
 export const ClockFixture: UIComponent = {
   id: 'ClockFixture',
-  requirement: (layers) => {
-      return interval(1000).pipe(
-        map(() => {
-          const { network } = layers;
-          const { world, components } = network;
-          const accountEntity = queryAccountFromEmbedded(network);
-          const accountOptions = { config: 3600, live: 2 };
+  Render: () => {
+      const layers = useLayers();
 
-          return {
-            data: {
-              account: getAccount(world, components, accountEntity, accountOptions),
-            },
-            utils: {
-              calcCurrentStamina: (account: Account) => calcCurrentStamina(account),
-            },
-          };
-        })
-      );
-  },
-  Render: ({ data, utils }) => {
-      const { account } = data;
-      const { calcCurrentStamina } = utils;
-      const { fixtures } = useVisibility();
+      const {
+        data: {
+          account,
+        },
+        utils: {
+          calcCurrentStamina,
+        },
+      } = (() => {
+        const { network } = layers;
+        const { world, components } = network;
+        const accountEntity = queryAccountFromEmbedded(network);
+        const accountOptions = { config: 3600, live: 2 };
+
+        return {
+          data: {
+            account: getAccount(world, components, accountEntity, accountOptions),
+          },
+          utils: {
+            calcCurrentStamina: (account: Account) => _calcCurrentStamina(account),
+          },
+        };
+      })();
+
+      const menuVisible = useVisibility((s) => s.fixtures.menu);
       const [staminaCurr, setStaminaCurr] = useState(0);
       const [rotateClock, setRotateClock] = useState(0);
       const [rotateBand, setRotateBand] = useState(0);
@@ -100,7 +104,7 @@ export const ClockFixture: UIComponent = {
       //Render
       return (
         <TextTooltip text={getClockTooltip()}>
-          <Container style={{ display: fixtures.menu ? 'flex' : 'none' }}>
+          <Container style={{ display: menuVisible ? 'flex' : 'none' }}>
             <Circle rotation={rotateClock}>
               <CircleContent>
                 <TicksPosition>{Ticks()}</TicksPosition>
@@ -130,7 +134,7 @@ export const ClockFixture: UIComponent = {
             <Time
               rotation={rotateClock}
               viewBox='0 0 30 6'
-              style={{ display: fixtures.menu ? 'flex' : 'none' }}
+              style={{ display: menuVisible ? 'flex' : 'none' }}
             >
               <path id='MyPath' fill='none' d='M 2.5 3.5 Q 13 -3.5 27 3.5' pathLength='2' />
               <text fill='white' fontSize='3' dominantBaseline='hanging' textAnchor='middle'>

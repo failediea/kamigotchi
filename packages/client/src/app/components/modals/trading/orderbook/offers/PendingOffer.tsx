@@ -11,7 +11,14 @@ import { playClick } from 'utils/sounds';
 import { TRADE_ROOM_INDEX } from '../../constants';
 import { ConfirmationData, OfferCard } from '../../library';
 
-interface Props {
+// Represents other Buy/Sell Orders that are in PENDING state
+// Currently only supports simple (single item) trades against MUSU
+export const PendingOffer = ({
+  actions,
+  controls,
+  data,
+  utils,
+}: {
   actions: {
     executeTrade: (trade: Trade) => void;
   };
@@ -28,12 +35,7 @@ interface Props {
   utils: {
     getItemByIndex: (index: number) => Item;
   };
-}
-
-// represents other Buy/Sell Orders that are in PENDING state
-// NOTE: only supports simple (single item) trades against musu atm
-export const PendingOffer = (props: Props) => {
-  const { actions, controls, data } = props;
+}) => {
   const { executeTrade } = actions;
   const { isConfirming, setIsConfirming, setConfirmData } = controls;
   const { account, trade, type } = data;
@@ -55,8 +57,8 @@ export const PendingOffer = (props: Props) => {
   /////////////////
   // INTERPRETATION
 
-  // check whether the player can fill the specified order
-  // NOTE: this doesnt account for multiples of the same item in a single order
+  // Check whether the player can fill the specified order
+  // Note: doesn't account for multiples of the same item in a single order
   const canFillOrder = (): boolean => {
     const order = trade.buyOrder;
     if (!order) return false;
@@ -71,7 +73,6 @@ export const PendingOffer = (props: Props) => {
     return true;
   };
 
-  // get the tooltip of the action button
   const getActionTooltip = () => {
     if (!canFillOrder()) {
       return ['Too poore', 'get more items to fulfill this Trade Offer'];
@@ -82,7 +83,6 @@ export const PendingOffer = (props: Props) => {
   /////////////////
   // DISPLAY
 
-  // create the trade confirmation window content for Executing an order
   const getExecuteConfirmation = () => {
     const buyItems = trade.buyOrder?.items ?? [];
     const buyAmts = trade.buyOrder?.amounts ?? [];

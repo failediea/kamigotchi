@@ -3,22 +3,23 @@ import styled from 'styled-components';
 import { useVisibility } from 'app/stores';
 import { playClick } from 'utils/sounds';
 
-interface Props {
+// ExitButton is a rendering of an exit button, which closes the modal it's on
+export const ExitButton = ({
+  divName,
+  position,
+  isValidator,
+}: {
   divName: string;
   position?: string;
   isValidator?: boolean;
-}
-
-// ExitButton is a rendering o fan exit button, which closes the modal it's on
-export const ExitButton = (props: Props) => {
-  const { setModals, setValidators } = useVisibility();
+}) => {
+  const setModals = useVisibility((s) => s.setModals);
+  const setValidators = useVisibility((s) => s.setValidators);
 
   // closes the modal this exit button is on
   const handleClose = () => {
     playClick();
-    props.isValidator
-      ? setValidators({ [props.divName]: false })
-      : setModals({ [props.divName]: false });
+    isValidator ? setValidators({ [divName]: false }) : setModals({ [divName]: false });
   };
 
   return <Button onClick={handleClose}>X</Button>;
@@ -31,7 +32,6 @@ const Button = styled.button`
 
   color: black;
   padding: 0.3vw 0.4vw;
-  z-index: 1;
 
   font-size: 0.9vw;
   cursor: pointer;
@@ -43,4 +43,5 @@ const Button = styled.button`
   &:active {
     background-color: #c4c4c4;
   }
+  z-index: 1;
 `;

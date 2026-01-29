@@ -18,14 +18,15 @@ type Data = {
   price: number;
 };
 
-interface Props {
+export const Chart = ({
+  name,
+  auction,
+  onClick,
+}: {
   name: string;
   auction: Auction;
   onClick?: () => void;
-}
-
-export const Chart = (props: Props) => {
-  const { name, auction, onClick } = props;
+}) => {
   const chartRef = useRef<ChartJS>();
 
   const [buys, setBuys] = useState<AuctionBuy[]>([]);
@@ -138,7 +139,7 @@ export const Chart = (props: Props) => {
     let sum = 0;
     for (let i = 0; i < buys.length; i++) {
       const buy = buys[i];
-      if(buy.Timestamp < startTs) continue;
+      if (buy.Timestamp < startTs) continue;
       while (times[j] < buy.Timestamp) balances[j++] = sum;
       sum += buy.Amount;
       sales[j] += buy.Amount;
@@ -155,9 +156,7 @@ export const Chart = (props: Props) => {
       time = times[i];
       if (time < auction.time.start) time = auction.time.start;
       const balance = balances[i];
-      let price = calcAuctionPrice(auction, time, balance, 1);
-      if (auction.paymentItem?.address) price /= 1000;
-      prices[i] = price;
+      prices[i] = calcAuctionPrice(auction, time, balance, 1);
     }
     return prices;
   };

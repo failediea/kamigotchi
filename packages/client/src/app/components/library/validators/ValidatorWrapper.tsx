@@ -3,7 +3,18 @@ import React, { useEffect } from 'react';
 import styled, { keyframes } from 'styled-components';
 import { ExitButton } from '../modals/ExitButton';
 
-interface Props {
+// ValidatorWrapper is an animated wrapper around all validators.
+// It includes and exit button with a click sound as well as Content formatting.
+export const ValidatorWrapper = ({
+  id,
+  canExit,
+  divName,
+  title,
+  children,
+  subtitle,
+  errorPrimary,
+  errorSecondary,
+}: {
   id: string;
   canExit?: boolean;
   divName: keyof Validators;
@@ -12,25 +23,19 @@ interface Props {
   subtitle?: string;
   errorPrimary?: string;
   errorSecondary?: string;
-}
-
-// ValidatorWrapper is an animated wrapper around all validators.
-// It includes and exit button with a click sound as well as Content formatting.
-export const ValidatorWrapper = (props: Props) => {
-  const { validators } = useVisibility();
-  const { id, divName, title, subtitle, children, errorPrimary, errorSecondary, canExit } = props;
+}) => {
+  const isVisible = useVisibility((s) => s.validators[divName]);
 
   // update modal visibility according to store settings
   useEffect(() => {
     const element = document.getElementById(id);
     if (element) {
-      const isVisible = validators[divName];
       element.style.display = isVisible ? 'block' : 'none';
     }
-  }, [validators[divName]]);
+  }, [isVisible]);
 
   return (
-    <Wrapper id={id} isOpen={validators[divName]}>
+    <Wrapper id={id} isOpen={isVisible}>
       {canExit && (
         <ButtonRow>
           <ExitButton divName={id} isValidator />

@@ -3,12 +3,11 @@ pragma solidity >=0.8.28;
 
 import { System } from "solecs/System.sol";
 import { IWorld } from "solecs/interfaces/IWorld.sol";
-import { getAddrByID } from "solecs/utils.sol";
 
 import { LibAccount } from "libraries/LibAccount.sol";
 import { LibBonus } from "libraries/LibBonus.sol";
 import { LibExperience } from "libraries/LibExperience.sol";
-import { LibInventory, MUSU_INDEX } from "libraries/LibInventory.sol";
+import { MUSU_INDEX } from "libraries/LibInventory.sol";
 import { LibNode } from "libraries/LibNode.sol";
 import { LibKami } from "libraries/LibKami.sol";
 import { LibHarvest } from "libraries/LibHarvest.sol";
@@ -41,36 +40,28 @@ contract HarvestStopSystem is System {
     // roomIndex check
     LibKami.verifyRoom(components, kamiID, accID);
 
-    // process collection and harvest stop
-    uint256 output = LibHarvest.claim(components, id, accID);
-    LibHarvest.stop(components, id, kamiID);
-    LibKami.setState(components, kamiID, "RESTING");
-    LibExperience.inc(components, kamiID, output);
-    LibKami.setLastActionTs(components, kamiID, block.timestamp);
-
-    // scavenge
-    uint256 nodeID = LibHarvest.getNode(components, id);
-    uint32 nodeIndex = LibNode.getIndex(components, nodeID);
-    LibNode.scavenge(components, nodeIndex, output, accID); // implicit existence check
-
-    // reset action bonuses
-    LibBonus.resetUponHarvestStop(components, kamiID);
-
-    // standard logging and tracking
-    LibScore.incFor(components, accID, MUSU_INDEX, "COLLECT", output);
-    LibHarvest.logHarvestTimes(components, accID, nodeIndex, id); // log time only on stop
-    LibHarvest.logAmounts(
-      components,
-      accID,
-      nodeIndex,
-      LibNode.getAffinity(components, nodeID),
-      MUSU_INDEX,
-      output
-    );
-    LibHarvest.emitLog(world, "HARVEST_STOP", accID, kamiID, nodeIndex, output);
+    // collect and stop harvest
     LibAccount.updateLastTs(components, accID);
+    return abi.encode(_collectAndStop(id, accID, kamiID));
+  }
 
-    return abi.encode(output);
+  /// @dev executes, but does not revert on failure
+  function executeAllowFailure(bytes memory arguments) public returns (bytes memory) {
+    uint256 id = abi.decode(arguments, (uint256));
+    uint256 accID = LibAccount.getByOperator(components, msg.sender);
+    uint256 kamiID = LibHarvest.getKami(components, id);
+
+    if (!LibHarvest.isHarvest(components, id)) return abi.encode(0);
+    if (!LibKami.checkAccount(components, kamiID, accID)) return abi.encode(0);
+    if (!LibKami.isState(components, kamiID, "HARVESTING")) return abi.encode(0);
+    if (LibKami.onCooldown(components, kamiID)) return abi.encode(0);
+
+    LibKami.sync(components, kamiID);
+    if (!LibKami.isHealthy(components, kamiID)) return abi.encode(0);
+    if (!LibKami.checkRoom(components, kamiID, accID)) return abi.encode(0);
+
+    LibAccount.updateLastTs(components, accID);
+    return abi.encode(_collectAndStop(id, accID, kamiID));
   }
 
   function executeTyped(uint256 id) public returns (bytes memory) {
@@ -82,5 +73,52 @@ contract HarvestStopSystem is System {
     bytes[] memory results = new bytes[](ids.length);
     for (uint256 i; i < ids.length; i++) results[i] = execute(abi.encode(ids[i]));
     return results;
+  }
+
+  /// @dev executes, but does not revert on failure. returns 0 for array entry instead
+  function executeBatchedAllowFailure(uint256[] memory ids) public returns (bytes[] memory) {
+    bytes[] memory results = new bytes[](ids.length);
+    for (uint256 i; i < ids.length; i++) results[i] = executeAllowFailure(abi.encode(ids[i]));
+    return results;
+  }
+
+  ////////////////
+  // INTERNALS
+
+  function _collectAndStop(
+    uint256 harvestID,
+    uint256 accID,
+    uint256 kamiID
+  ) internal returns (uint256) {
+    // process collection and harvest stop
+    uint256 output = LibHarvest.claim(components, harvestID, accID);
+    LibHarvest.stop(components, harvestID, kamiID);
+    LibKami.setState(components, kamiID, "RESTING");
+    LibExperience.inc(components, kamiID, output);
+    LibKami.resetCooldown(components, kamiID);
+
+    // scavenge
+    uint256 nodeID = LibHarvest.getNode(components, harvestID);
+    uint32 nodeIndex = LibNode.getIndex(components, nodeID);
+    LibNode.scavenge(components, nodeIndex, output, accID); // implicit existence check
+
+    // reset action bonuses
+    LibBonus.resetUponHarvestStop(components, kamiID);
+
+    // standard logging and tracking
+    LibScore.incFor(components, accID, MUSU_INDEX, "COLLECT", output);
+    LibHarvest.logHarvestTimes(components, accID, nodeIndex, harvestID); // log time only on stop
+    LibHarvest.logAmounts(
+      components,
+      accID,
+      nodeIndex,
+      LibNode.getAffinity(components, nodeID),
+      MUSU_INDEX,
+      output
+    );
+    LibHarvest.emitLog(world, "HARVEST_STOP", accID, kamiID, nodeIndex, output);
+    LibAccount.updateLastTs(components, accID);
+
+    return output;
   }
 }

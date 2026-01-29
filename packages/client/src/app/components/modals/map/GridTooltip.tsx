@@ -4,29 +4,25 @@ import { KamiIcon, OperatorIcon } from 'assets/images/icons/menu';
 import { Room } from 'network/shapes/Room';
 import { getAffinityImage } from 'network/shapes/utils';
 
-interface Props {
+export const GridTooltip = ({
+  room,
+  rolls,
+  yourKamiIconsMap,
+  getNode,
+  parseAllos,
+  playerEntitiesLength,
+  kamiEntitiesLength,
+  friendsCount,
+}: {
   room: Room;
   rolls: Map<number, number>;
-  kamiIconsMap: Map<number, string[]>;
+  yourKamiIconsMap: Map<number, string[]>;
   getNode: (index: number) => any;
   parseAllos: (scavAllo: any[]) => any[];
   playerEntitiesLength: number;
   kamiEntitiesLength: number;
   friendsCount: number;
-}
-
-export const GridTooltip = (props: Props) => {
-  const {
-    room,
-    rolls,
-    kamiIconsMap,
-    getNode,
-    parseAllos,
-    playerEntitiesLength,
-    kamiEntitiesLength,
-    friendsCount,
-  } = props;
-
+}) => {
   if (!room.index) return null;
 
   const node = getNode(room.index);
@@ -34,14 +30,17 @@ export const GridTooltip = (props: Props) => {
   const rewards = parseAllos(node.scavenge?.rewards ?? []);
   const rollsCount = rolls.get(room.index) ?? 0;
 
-  const icons = kamiIconsMap.get(room.index) ?? [];
+  const icons = yourKamiIconsMap.get(room.index) ?? [];
   const owned = icons.length;
 
   return (
     <>
       <TopSection>
         <TextRow>
-          Type: <Icon src={getAffinityImage(node.affinity)} />
+          Type:{' '}
+          {node.affinity.map((aff: string) => (
+            <Icon key={aff} src={getAffinityImage(aff)} />
+          ))}
         </TextRow>
         {drops[0] && (
           <TextRow>

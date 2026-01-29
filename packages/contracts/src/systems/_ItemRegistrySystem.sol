@@ -7,7 +7,10 @@ import { IWorld } from "solecs/interfaces/IWorld.sol";
 import { AuthRoles } from "libraries/utils/AuthRoles.sol";
 import { LibAllo } from "libraries/LibAllo.sol";
 import { Condition } from "libraries/LibConditional.sol";
+import { LibEquipment } from "libraries/LibEquipment.sol";
 import { LibItem } from "libraries/LibItem.sol";
+import { TokenAddressComponent, ID as TokenAddressCompID } from "components/TokenAddressComponent.sol";
+import { getAddrByID } from "solecs/utils.sol";
 
 uint256 constant ID = uint256(keccak256("system.item.registry"));
 
@@ -20,11 +23,12 @@ contract _ItemRegistrySystem is System, AuthRoles {
       string memory type_,
       string memory name,
       string memory description,
-      string memory media
-    ) = abi.decode(arguments, (uint32, string, string, string, string));
+      string memory media,
+      uint32 rarity
+    ) = abi.decode(arguments, (uint32, string, string, string, string, uint32));
     require(LibItem.getByIndex(components, index) == 0, "item reg: index used");
 
-    uint256 id = LibItem.createItem(components, index, type_, name, description, media);
+    uint256 id = LibItem.createItem(components, index, type_, name, description, media, rarity);
     return id;
   }
 
@@ -35,11 +39,12 @@ contract _ItemRegistrySystem is System, AuthRoles {
       string memory name,
       string memory description,
       string memory type_,
-      string memory media
-    ) = abi.decode(arguments, (uint32, string, string, string, string, string));
+      string memory media,
+      uint32 rarity
+    ) = abi.decode(arguments, (uint32, string, string, string, string, string, uint32));
     require(LibItem.getByIndex(components, index) == 0, "item reg: index used");
 
-    uint256 id = LibItem.createItem(components, index, type_, name, description, media);
+    uint256 id = LibItem.createItem(components, index, type_, name, description, media, rarity);
     LibItem.setFor(components, id, for_);
     return id;
   }
@@ -71,9 +76,12 @@ contract _ItemRegistrySystem is System, AuthRoles {
     LibItem.addFlag(components, index, flag);
   }
 
-  function addERC20(uint32 index, address tokenAddress) public onlyAdmin(components) {
+  /// @notice Set the equipment slot for an item
+  /// @param index Item registry index
+  /// @param slot Equipment slot (e.g., "Kami_Pet_Slot")
+  function setSlot(uint32 index, string memory slot) public onlyAdmin(components) {
     require(LibItem.getByIndex(components, index) != 0, "ItemReg: item does not exist");
-    LibItem.addERC20(components, index, tokenAddress);
+    LibEquipment.setItemSlot(components, index, slot);
   }
 
   function addAlloBasic(bytes memory arguments) public onlyAdmin(components) returns (uint256) {
@@ -149,6 +157,31 @@ contract _ItemRegistrySystem is System, AuthRoles {
     require(registryID != 0, "ItemReg: item does not exist");
 
     LibItem.remove(components, index);
+  }
+
+  function disable(uint32 index) public onlyAdmin(components) {
+    uint256 registryID = LibItem.getByIndex(components, index);
+    require(registryID != 0, "ItemReg: item does not exist");
+    LibItem.disable(components, index);
+  }
+
+  function enable(uint32 index) public onlyAdmin(components) {
+    uint256 registryID = LibItem.getByIndex(components, index);
+    require(registryID != 0, "ItemReg: item does not exist");
+    LibItem.enable(components, index);
+  }
+
+  /// @notice Update the rarity of an existing item. Silently skips if item doesn't exist or has a token address.
+  /// @param arguments ABI encoded (uint32 index, uint32 rarity)
+  /// @return success True if item exists and was updated, false otherwise
+  function setRarity(bytes memory arguments) public onlyAdmin(components) returns (bool success) {
+    (uint32 index, uint32 rarity) = abi.decode(arguments, (uint32, uint32));
+    uint256 registryID = LibItem.getByIndex(components, index);
+    if (registryID == 0) return false; // Skip non-existent items gracefully
+    // Skip items with token addresses (e.g., MUSU, VIPP) - these are protected
+    if (TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).has(registryID)) return false;
+    LibItem.setRarity(components, registryID, rarity);
+    return true;
   }
 
   function execute(bytes memory arguments) public onlyAdmin(components) returns (bytes memory) {

@@ -4,7 +4,17 @@ import { TextTooltip } from 'app/components/library';
 import { DetailedEntity } from 'network/shapes/utils';
 import { playClick } from 'utils/sounds';
 
-interface Props {
+export const ItemIconHorizontal = ({
+  item,
+  size,
+  hoverText,
+  balance,
+  glow,
+  onClick,
+  disabled,
+  suffix,
+  styleOverride,
+}: {
   item: DetailedEntity;
   size: 'small' | 'large' | 'fixed';
   hoverText?: boolean | string[];
@@ -12,15 +22,12 @@ interface Props {
   glow?: string;
   onClick?: Function;
   disabled?: boolean;
+  suffix?: string;
   styleOverride?: {
     box?: any;
     icon?: any;
   };
-}
-
-export const ItemIconHorizontal = (props: Props) => {
-  const { item, size, hoverText, balance, glow, onClick, disabled, styleOverride } = props;
-
+}) => {
   // layer on a sound effect
   const handleClick = async () => {
     if (onClick) {
@@ -47,8 +54,7 @@ export const ItemIconHorizontal = (props: Props) => {
     return styles;
   };
 
-  // text = x{balance} {item.name}
-  const text = `${balance ? `x${balance}` : ''} ${item.name}`;
+  const text = `${balance ? `x${balance}` : ''} ${item.name}` + (suffix ? ` ${suffix}` : '');
 
   const base = () => {
     return (

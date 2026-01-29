@@ -14,7 +14,6 @@ import { IndexKamiComponent, ID as IndexKamiCompID } from "components/IndexKamiC
 import { IndexRoomComponent, ID as IndexRoomCompID } from "components/IndexRoomComponent.sol";
 import { NameComponent, ID as NameCompID } from "components/NameComponent.sol";
 import { StateComponent, ID as StateCompID } from "components/StateComponent.sol";
-import { TimeLastActionComponent, ID as TimeLastActCompID } from "components/TimeLastActionComponent.sol";
 import { TimeLastComponent, ID as TimeLastCompID } from "components/TimeLastComponent.sol";
 
 import { LibComp } from "libraries/utils/LibComp.sol";
@@ -133,15 +132,16 @@ library LibKami {
   // CALCULATIONS
 
   // Calculate resting recovery rate (HP/s) of a Kami. (1e9 precision)
+  // Metabolism = (H + d) * k * boost
   function calcMetabolism(IUintComp components, uint256 id) internal view returns (uint256) {
     uint32[8] memory config = LibConfig.getArray(components, "KAMI_REST_METABOLISM");
     uint256 boostBonus = LibBonus.getFor(components, "REST_METABOLISM_BOOST", id).toUint256();
     uint256 base = LibStat.getTotal(components, "HARMONY", id).toUint256();
-    uint256 ratio = config[2]; // metabolism core
+    uint256 nudge = config[0]; // d
+    uint256 ratio = config[2]; // k
     uint256 boost = config[6] + boostBonus;
     uint256 precision = 10 ** (METABOLISM_PREC - (config[3] + config[7]));
-    uint256 metabolism = (precision * base * ratio * boost) / 3600;
-    return (metabolism);
+    return (precision * (base + nudge) * ratio * boost) / 3600;
   }
 
   // Calculate resting recovery (HP) of a Kami. This assume Kami is resting. Round down.
@@ -172,86 +172,30 @@ library LibKami {
   /////////////////
   // CHECKERS
 
-  /// @notice revert if  a kami is not owned by an account
   /// @dev implicit isKami check - only kamis are mapped to IDOwnsKamiComponent
-  function verifyAccount(IUintComp components, uint256 id, uint256 accID) public view {
-    if (IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).get(id) != accID)
-      revert("kami not urs");
-  }
-
-  function verifyAccount(IUintComp components, uint256[] memory ids, uint256 accID) public view {
-    uint256[] memory accs = IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).get(ids);
-    for (uint256 i; i < ids.length; i++) if (accs[i] != accID) revert("kami not urs");
-  }
-
-  function verifyCooldown(IUintComp components, uint256 id) public view {
-    if (LibCooldown.isActive(components, id)) revert("kami on cooldown");
-  }
-
-  function verifyCooldown(IUintComp components, uint256[] memory ids) public view {
-    if (LibCooldown.isActive(components, ids)) revert("kami on cooldown");
-  }
-
-  function verifyHealthy(IUintComp components, uint256 id) public view {
-    if (!isHealthy(components, id)) revert("kami starving..");
-  }
-
-  function verifyHealthy(IUintComp components, uint256[] memory ids) public view {
-    if (!isHealthy(components, ids)) revert("kami starving..");
-  }
-
-  function verifyRoom(IUintComp components, uint256 kamiID, uint256 accID) public view {
-    return _verifyRoom(components, getState(components, kamiID), kamiID, accID);
-  }
-
-  function verifyRoom(IUintComp components, uint256[] memory kamiIDs, uint256 accID) public view {
-    string[] memory states = StateComponent(getAddrByID(components, StateCompID)).get(kamiIDs);
-    for (uint256 i; i < kamiIDs.length; i++) _verifyRoom(components, states[i], kamiIDs[i], accID);
-  }
-
-  /// @notice revert if kami is not in same room as account
-  function _verifyRoom(
-    IUintComp components,
-    string memory state,
-    uint256 kamiID,
-    uint256 accID
-  ) public view {
-    bool sameRoom;
-    if (state.eq("HARVESTING")) {
-      uint256 nodeID = LibHarvest.getNode(components, getHarvest(components, kamiID));
-      IndexRoomComponent roomComp = IndexRoomComponent(getAddrByID(components, IndexRoomCompID));
-      sameRoom = roomComp.safeGet(nodeID) == roomComp.safeGet(accID);
-    } else if (state.eq("721_EXTERNAL")) {
-      sameRoom = false; // outside
-    } else sameRoom = true;
-
-    if (!sameRoom) revert("kami too far");
-  }
-
-  function verifyRoom(IUintComp components, uint256 kamiID) public view {
-    return verifyRoom(components, kamiID, getAccount(components, kamiID));
-  }
-
-  function verifyState(IUintComp components, uint256 id, string memory state) public view {
-    if (!getCompByID(components, StateCompID).eqString(id, state))
-      revert(LibString.concat("kami not ", state));
-  }
-
-  function verifyState(
-    IUintComp components,
-    uint256[] memory ids,
-    string memory state
-  ) public view {
-    if (!getCompByID(components, StateCompID).eqString(ids, state))
-      revert(LibString.concat("kami not ", state));
-  }
-
-  function isState(
+  function checkAccount(
     IUintComp components,
     uint256 id,
-    string memory state
+    uint256 accID
   ) internal view returns (bool) {
-    return getCompByID(components, StateCompID).eqString(id, state);
+    return IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).get(id) == accID;
+  }
+
+  /// @notice check if a kami is in the same room as an account
+  function checkRoom(IUintComp components, uint256 id, uint256 accID) internal view returns (bool) {
+    // could optimize this, but left alone for modularity
+    return getRoom(components, id) == LibAccount.getRoom(components, accID);
+  }
+
+  function checkRoom(
+    IUintComp components,
+    uint256[] memory ids,
+    uint256 accID
+  ) internal view returns (bool) {
+    for (uint256 i; i < ids.length; i++) {
+      if (getRoom(components, ids[i]) != LibAccount.getRoom(components, accID)) return false;
+    }
+    return true;
   }
 
   // Check whether the current health of a kami is greater than 0. Assume health synced this block.
@@ -272,20 +216,91 @@ library LibKami {
     return !getCompByID(components, StateCompID).eqString(id, "721_EXTERNAL");
   }
 
+  function isState(
+    IUintComp components,
+    uint256 id,
+    string memory state
+  ) internal view returns (bool) {
+    return getCompByID(components, StateCompID).eqString(id, state);
+  }
+
+  function isState(
+    IUintComp components,
+    uint256[] memory ids,
+    string memory state
+  ) internal view returns (bool) {
+    return getCompByID(components, StateCompID).eqString(ids, state);
+  }
+
+  function onCooldown(IUintComp components, uint256 id) internal view returns (bool) {
+    return LibCooldown.isActive(components, id);
+  }
+
+  /// @notice revert if  a kami is not owned by an account
+  /// @dev implicit isKami check - only kamis are mapped to IDOwnsKamiComponent
+  function verifyAccount(IUintComp components, uint256 id, uint256 accID) public view {
+    if (!checkAccount(components, id, accID)) revert("kami not urs");
+  }
+
+  function verifyAccount(IUintComp components, uint256[] memory ids, uint256 accID) public view {
+    uint256[] memory accs = IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).get(ids);
+    for (uint256 i; i < ids.length; i++) if (accs[i] != accID) revert("kami not urs");
+  }
+
+  function verifyCooldown(IUintComp components, uint256 id) public view {
+    if (LibCooldown.isActive(components, id)) revert("kami on cooldown");
+  }
+
+  function verifyCooldown(IUintComp components, uint256[] memory ids) public view {
+    if (LibCooldown.isActive(components, ids)) revert("kami on cooldown");
+  }
+
+  /// @dev only needed if kami's Account is not checked
+  function verifyIsKami(IUintComp components, uint256 id) public view {
+    if (!LibEntityType.isShape(components, id, "KAMI")) revert("not a kami");
+  }
+
+  function verifyHealthy(IUintComp components, uint256 id) public view {
+    if (!isHealthy(components, id)) revert("kami starving..");
+  }
+
+  function verifyHealthy(IUintComp components, uint256[] memory ids) public view {
+    if (!isHealthy(components, ids)) revert("kami starving..");
+  }
+
+  function verifyRoom(IUintComp components, uint256 kamiID, uint256 accID) public view {
+    if (!checkRoom(components, kamiID, accID)) revert("kami too far");
+  }
+
+  function verifyRoom(IUintComp components, uint256[] memory kamiIDs, uint256 accID) public view {
+    if (!checkRoom(components, kamiIDs, accID)) revert("kami too far");
+  }
+
+  function verifyRoom(IUintComp components, uint256 kamiID) public view {
+    return verifyRoom(components, kamiID, getAccount(components, kamiID));
+  }
+
+  function verifyState(IUintComp components, uint256 id, string memory state) public view {
+    if (!isState(components, id, state)) revert(LibString.concat("kami not ", state));
+  }
+
+  function verifyState(
+    IUintComp components,
+    uint256[] memory ids,
+    string memory state
+  ) public view {
+    if (!isState(components, ids, state)) revert(LibString.concat("kami not ", state));
+  }
+
   /////////////////
   // SETTERS
 
+  function resetCooldown(IUintComp components, uint256 id) internal {
+    LibCooldown.set(components, id);
+  }
+
   function setOwner(IUintComp components, uint256 id, uint256 accID) internal {
     IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).set(id, accID);
-  }
-
-  // Update the TimeLastAction of a kami. to inform cooldown constraints on Standard Actions
-  function setLastActionTs(IUintComp components, uint256 id, uint256 ts) internal {
-    TimeLastActionComponent(getAddrByID(components, TimeLastActCompID)).set(id, ts);
-  }
-
-  function setLastActionTs(IUintComp components, uint256[] memory ids, uint256 ts) internal {
-    getCompByID(components, TimeLastActCompID).setAll(ids, ts);
   }
 
   // Update the TimeLast of a kami. used as anchor point for updating Health
@@ -324,11 +339,6 @@ library LibKami {
   // get the entity ID of the kami account
   function getAccount(IUintComp components, uint256 id) internal view returns (uint256) {
     return IDOwnsKamiComponent(getAddrByID(components, IDOwnsKamiCompID)).safeGet(id);
-  }
-
-  // get the last time a kami commited a Standard Action
-  function getLastActionTs(IUintComp components, uint256 id) internal view returns (uint256) {
-    return TimeLastActionComponent(getAddrByID(components, TimeLastActCompID)).safeGet(id);
   }
 
   // get the last time a kami commited a syncing Action

@@ -1,11 +1,14 @@
-import { BigNumberish } from 'ethers';
-
 import { toUint32FixedArrayLiteral } from '../../scripts/systemCaller';
 import { auctionAPI } from './auctions';
 import { goalsAPI } from './goals';
+import { itemsAPI } from './items';
 import { listingAPI } from './listings';
 import { nodesAPI } from './nodes';
+import { portalAPI } from './portal';
 import { questsAPI } from './quests';
+import { roomAPI } from './rooms';
+import { sacrificeAPI } from './sacrifice';
+import { tradeAPI } from './trades';
 import { generateCallData } from './utils';
 
 export type AdminAPI = Awaited<ReturnType<typeof createAdminAPI>>;
@@ -15,7 +18,13 @@ export function createAdminAPI(compiledCalls: string[]) {
   // AUTH
 
   async function addRole(addr: string, role: string) {
-    const callData = generateCallData('system.auth.registry', [addr, role], 'addRole');
+    const callData = generateCallData(
+      'system.auth.registry',
+      [addr, role],
+      'addRole',
+      undefined,
+      '800000'
+    );
     compiledCalls.push(callData);
   }
 
@@ -27,7 +36,7 @@ export function createAdminAPI(compiledCalls: string[]) {
   /////////////////
   //  CONFIG
 
-  async function setConfig(field: string, value: BigNumberish) {
+  async function setConfig(field: string, value: number) {
     const callData = generateCallData(
       'system.config.registry',
       [field, value],
@@ -39,12 +48,24 @@ export function createAdminAPI(compiledCalls: string[]) {
   }
 
   async function setConfigAddress(field: string, value: string) {
-    const callData = generateCallData('system.config.registry', [field, value], 'setValueAddress');
+    const callData = generateCallData(
+      'system.config.registry',
+      [field, value],
+      'setValueAddress',
+      undefined,
+      '800000'
+    );
     compiledCalls.push(callData);
   }
 
   async function setConfigBool(field: string, value: boolean) {
-    const callData = generateCallData('system.config.registry', [field, value], 'setValueBool');
+    const callData = generateCallData(
+      'system.config.registry',
+      [field, value],
+      'setValueBool',
+      undefined,
+      '800000'
+    );
     compiledCalls.push(callData);
   }
 
@@ -55,14 +76,22 @@ export function createAdminAPI(compiledCalls: string[]) {
     const callData = generateCallData(
       'system.config.registry',
       [field, toUint32FixedArrayLiteral(arr)],
-      'setValueArray'
+      'setValueArray',
+      undefined,
+      '800000'
     );
     compiledCalls.push(callData);
   }
 
   // values must be ≤ 32char
   async function setConfigString(field: string, value: string) {
-    const callData = generateCallData('system.config.registry', [field, value], 'setValueString');
+    const callData = generateCallData(
+      'system.config.registry',
+      [field, value],
+      'setValueString',
+      undefined,
+      '800000'
+    );
     compiledCalls.push(callData);
   }
 
@@ -83,9 +112,6 @@ export function createAdminAPI(compiledCalls: string[]) {
     const callData = generateCallData('system.faction.registry', [index], 'remove');
     compiledCalls.push(callData);
   }
-
-  /////////////////
-  //  GOALS
 
   /////////////////
   //  NPCs
@@ -118,7 +144,7 @@ export function createAdminAPI(compiledCalls: string[]) {
     compiledCalls.push(callData);
   }
 
-  async function batchMint(amount: number, gasLimit?: BigNumberish) {
+  async function batchMint(amount: number, gasLimit?: string) {
     const callData = generateCallData(
       'system.Kami721.BatchMint',
       [amount],
@@ -178,51 +204,6 @@ export function createAdminAPI(compiledCalls: string[]) {
   }
 
   /////////////////
-  //  ROOMS
-
-  // @dev creates a room with name, roomIndex and exits. cannot overwrite room at roomIndex
-  async function createRoom(
-    x: number,
-    y: number,
-    z: number,
-    roomIndex: number,
-    name: string,
-    description: string,
-    exits: number[]
-  ) {
-    const callData = generateCallData(
-      'system.room.registry',
-      [x, y, z, roomIndex, name, description, exits.length == 0 ? [] : exits],
-      'create',
-      ['int32', 'int32', 'int32', 'uint32', 'string', 'string', 'uint32[]']
-    );
-    compiledCalls.push(callData);
-  }
-
-  async function createRoomGate(
-    roomIndex: number,
-    sourceIndex: number,
-    conditionIndex: number,
-    conditionValue: BigNumberish,
-    type: string,
-    logicType: string,
-    for_: string
-  ) {
-    const callData = generateCallData(
-      'system.room.registry',
-      [roomIndex, sourceIndex, conditionIndex, conditionValue, type, logicType, for_],
-      'addGate',
-      ['uint32', 'uint32', 'uint32', 'uint256', 'string', 'string', 'string']
-    );
-    compiledCalls.push(callData);
-  }
-
-  async function deleteRoom(roomIndex: number) {
-    const callData = generateCallData('system.room.registry', [roomIndex], 'remove');
-    compiledCalls.push(callData);
-  }
-
-  /////////////////
   // SKILLS
 
   async function createSkill(
@@ -278,148 +259,7 @@ export function createAdminAPI(compiledCalls: string[]) {
   }
 
   /////////////////
-  //  ITEMS
-
-  async function registerBaseItem(
-    index: number,
-    for_: string,
-    name: string,
-    description: string,
-    media: string
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, for_, name, description, media],
-      'create',
-      ['uint32', 'string', 'string', 'string', 'string']
-    );
-    compiledCalls.push(callData);
-  }
-
-  // @dev add a misc item in registry entry
-  async function registerConsumable(
-    index: number,
-    for_: string,
-    name: string,
-    description: string,
-    type_: string,
-    media: string
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, for_, name, description, type_, media],
-      'createConsumable',
-      ['uint32', 'string', 'string', 'string', 'string', 'string']
-    );
-    compiledCalls.push(callData);
-  }
-
-  //// ITEM FLAGS
-
-  async function addItemFlag(index: number, flag: string) {
-    const callData = generateCallData('system.item.registry', [index, flag], 'addFlag');
-    compiledCalls.push(callData);
-  }
-
-  async function addItemERC20(index: number, address: string) {
-    const callData = generateCallData('system.item.registry', [index, address], 'addERC20');
-    compiledCalls.push(callData);
-  }
-
-  //// ITEM REQUIREMENTS
-
-  async function addItemRequirement(
-    index: number,
-    usecase: string,
-    type_: string,
-    logicType: string,
-    index_: number,
-    value: BigNumberish,
-    for_: string
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, usecase, type_, logicType, index_, value, for_],
-      'addRequirement',
-      ['uint32', 'string', 'string', 'string', 'uint32', 'uint256', 'string']
-    );
-    compiledCalls.push(callData);
-  }
-
-  //// ITEM ALLOS
-
-  async function addItemBasic(
-    index: number,
-    usecase: string,
-    type: string,
-    index_: number,
-    value: number
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, usecase, type, index_, value],
-      'addAlloBasic',
-      ['uint32', 'string', 'string', 'uint32', 'uint256']
-    );
-    compiledCalls.push(callData);
-  }
-
-  async function addItemBonus(
-    index: number,
-    usecase: string,
-    bonusType: string,
-    endType: string,
-    duration: number,
-    value: number
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, usecase, bonusType, endType, duration, value],
-      'addAlloBonus',
-      ['uint32', 'string', 'string', 'string', 'uint256', 'int256']
-    );
-    compiledCalls.push(callData);
-  }
-
-  async function addItemDT(
-    index: number,
-    usecase: string,
-    keys: number[],
-    weights: number[],
-    value: number
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, usecase, keys, weights, value],
-      'addAlloDT',
-      ['uint32', 'string', 'uint32[]', 'uint256[]', 'uint256']
-    );
-    compiledCalls.push(callData);
-  }
-
-  async function addItemStat(
-    index: number,
-    usecase: string,
-    statType: string,
-    base: number,
-    shift: number,
-    boost: number,
-    sync: number
-  ) {
-    const callData = generateCallData(
-      'system.item.registry',
-      [index, usecase, statType, base, shift, boost, sync],
-      'addAlloStat',
-      ['uint32', 'string', 'string', 'int32', 'int32', 'int32', 'int32']
-    );
-    compiledCalls.push(callData);
-  }
-
-  // @dev deletes an item registry
-  async function deleteItem(index: number) {
-    const callData = generateCallData('system.item.registry', [index], 'remove');
-    compiledCalls.push(callData);
-  }
+  //  TRAITS
 
   // @dev adds a trait in registry
   async function registerTrait(
@@ -512,13 +352,13 @@ export function createAdminAPI(compiledCalls: string[]) {
   ////////////////
   // SETUP
 
-  function dropKillRewards(owners: string[], amts: number[]) {
+  function setFlag(ids: number[], flagType: string) {
     const callData = generateCallData(
-      'system.setup.snapshot.t2',
-      [owners, amts],
-      'dropKillRewards',
-      ['address[]', 'uint256[]'],
-      '12000000'
+      'system.admin.set.flag',
+      [ids, flagType, true],
+      undefined,
+      undefined,
+      '4000000' // very roughly estimated 10 batch size
     );
     compiledCalls.push(callData);
   }
@@ -603,6 +443,12 @@ export function createAdminAPI(compiledCalls: string[]) {
     },
     goal: goalsAPI(generateCallData, compiledCalls),
     listing: listingAPI(generateCallData, compiledCalls),
+    mint: {
+      batchMinter: {
+        init: initBatchMinter,
+        mint: batchMint,
+      },
+    },
     node: nodesAPI(generateCallData, compiledCalls),
     npc: {
       create: createNPC,
@@ -611,31 +457,9 @@ export function createAdminAPI(compiledCalls: string[]) {
         name: setNPCName,
       },
     },
-    mint: {
-      batchMinter: {
-        init: initBatchMinter,
-        mint: batchMint,
-      },
-    },
+    portal: portalAPI(generateCallData, compiledCalls),
     registry: {
-      item: {
-        create: {
-          base: registerBaseItem,
-          consumable: registerConsumable,
-        },
-        add: {
-          erc20: addItemERC20,
-          flag: addItemFlag,
-          requirement: addItemRequirement,
-          allo: {
-            basic: addItemBasic,
-            bonus: addItemBonus,
-            droptable: addItemDT,
-            stat: addItemStat,
-          },
-        },
-        delete: deleteItem,
-      },
+      item: itemsAPI(generateCallData, compiledCalls),
       trait: {
         create: registerTrait,
         delete: deleteTrait,
@@ -663,11 +487,9 @@ export function createAdminAPI(compiledCalls: string[]) {
         },
       },
     },
-    room: {
-      create: createRoom,
-      createGate: createRoomGate,
-      delete: deleteRoom,
-    },
+    room: roomAPI(generateCallData, compiledCalls),
+    sacrifice: sacrificeAPI(generateCallData, compiledCalls),
+    trade: tradeAPI(generateCallData, compiledCalls),
     setup: {
       local: {
         initAccounts: initAccounts,
@@ -681,7 +503,7 @@ export function createAdminAPI(compiledCalls: string[]) {
         },
       },
       live: {
-        obols: dropKillRewards,
+        flags: setFlag,
         // passports: distributePassports,
         // whitelists: distributeGachaWhitelists,
       },

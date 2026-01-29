@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 
+import { EmptyText } from 'app/components/library';
 import { useVisibility } from 'app/stores';
 import { Quest, sortCompletedQuests } from 'network/shapes/Quest';
 import { BaseQuest } from 'network/shapes/Quest/quest';
@@ -7,8 +8,15 @@ import { DetailedEntity } from 'network/shapes/utils';
 import { QuestCard } from './QuestCard';
 
 const STALE_TIME = 5000;
+const emptyText = ['Nothing to see here.', 'Complete some quests first?'];
 
-interface Props {
+export const CompletedQuests = ({
+  quests,
+  actions,
+  utils,
+  imageCache,
+  isVisible,
+}: {
   quests: BaseQuest[];
   actions: QuestModalActions;
   utils: {
@@ -18,12 +26,9 @@ interface Props {
   };
   imageCache: Map<string, JSX.Element>;
   isVisible: boolean;
-}
-
-export const CompletedQuests = (props: Props) => {
-  const { quests, actions, utils, imageCache, isVisible } = props;
+}) => {
   const { describeEntity, populate, getItemBalance } = utils;
-  const { modals } = useVisibility();
+  const questsModalVisible = useVisibility((s) => s.modals.quests);
   const [cleaned, setCleaned] = useState<Quest[]>([]);
   const [lastUpdate, setLastUpdate] = useState(0);
 
@@ -35,8 +40,8 @@ export const CompletedQuests = (props: Props) => {
   // update when this tab is opened or data changes if stale
   useEffect(() => {
     const isStale = Date.now() - lastUpdate > STALE_TIME;
-    if (modals.quests && isVisible && isStale) update();
-  }, [modals.quests, isVisible]);
+    if (questsModalVisible && isVisible && isStale) update();
+  }, [questsModalVisible, isVisible]);
 
   const update = async () => {
     const fullQuests = quests.map((q) => populate(q));
@@ -47,6 +52,7 @@ export const CompletedQuests = (props: Props) => {
 
   return (
     <div style={{ display: isVisible ? 'block' : 'none' }}>
+      {quests.length === 0 && <EmptyText text={emptyText} />}
       {cleaned.map((q: Quest) => (
         <QuestCard
           key={q.id}

@@ -1,19 +1,29 @@
 import styled from 'styled-components';
 
 import { Account } from 'network/shapes/Account';
+import { Allo } from 'network/shapes/Allo';
+import { Item } from 'network/shapes/Item';
 import { Listing } from 'network/shapes/Listing';
+import { DetailedEntity } from 'network/shapes/utils';
 import { CartItem } from '../types';
 import { CatalogRow } from './CatalogRow';
 
-export interface Props {
+export const Catalog = ({
+  account,
+  listings,
+  cart,
+  setCart,
+  utils,
+}: {
   account: Account;
   listings: Listing[];
   cart: CartItem[];
   setCart: (cart: CartItem[]) => void;
-}
-
-export const Catalog = (props: Props) => {
-  const { account, listings, cart, setCart } = props;
+  utils: {
+    parseAllos: (allo: Allo[]) => DetailedEntity[];
+    displayRequirements: (item: Item) => string;
+  };
+}) => {
 
   const toggleListing = (itemIndex: number) => {
     const newCart = [...cart];
@@ -36,6 +46,7 @@ export const Catalog = (props: Props) => {
             listing={l}
             cart={cart}
             toggle={() => toggleListing(l.item.index)}
+            utils={utils}
           />
         ))}
       </Items>

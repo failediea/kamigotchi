@@ -3,7 +3,11 @@ import styled from 'styled-components';
 import { EmptyText } from 'app/components/library';
 import { Item } from 'network/shapes/Item';
 
-interface Props {
+export const PricePanel = ({
+  data,
+  state,
+  isVisible,
+}: {
   isVisible: boolean;
   data: {
     balance: number;
@@ -15,20 +19,21 @@ interface Props {
     quantity: number;
     tick: number;
   };
-}
-
-export const PricePanel = (props: Props) => {
-  const { data, state, isVisible } = props;
+}) => {
   const { payItem, saleItem } = data;
   const { price, quantity, tick } = state;
 
   const getText = () => {
     if (saleItem.index === 10 && tick / 1000 < 1747400400) {
-      return [`Target 32000 ${payItem.name}`, `for 1 ${saleItem.name}`];
+      return [`Target ${price} ${payItem.name}`, `for 1 ${saleItem.name}`];
+    }
+
+    if (saleItem.index === 11 && tick / 1000 < 1760486400) {
+      return [`Target ${price} ${payItem.name}s`, `for 1 ${saleItem.name}`];
     }
 
     return [
-      `Total ${price} ${payItem.name}`,
+      `Total ${price.toLocaleString()} ${payItem.name}`,
       `for ${quantity} ${saleItem.name}${quantity == 1 ? '' : 's'}`,
     ];
   };

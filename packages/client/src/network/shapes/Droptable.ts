@@ -1,6 +1,5 @@
-import { EntityID, EntityIndex, World, getComponentValue } from '@mud-classic/recs';
+import { EntityID, EntityIndex, World, getComponentValue } from 'engine/recs';
 
-import { getRarities } from 'constants/rarities';
 import { formatEntityID } from 'engine/utils';
 import { Components } from 'network/';
 import { Commit, getHolderCommits } from './Commit';
@@ -53,9 +52,14 @@ export const getDTLogByHash = (
   world: World,
   components: Components,
   holderID: EntityID,
-  dtID: EntityID
+  dtID: EntityID,
+  logPrefix: string = 'droptable.item.log'
 ): DTLog => {
-  const entity = getLogEntityIndex(world, holderID, dtID);
+  const entity = getEntityByHash(
+    world,
+    [logPrefix, holderID, dtID],
+    ['string', 'uint256', 'uint256']
+  );
   if (!entity) return NullDTLog;
 
   const { Values } = components;
@@ -76,10 +80,12 @@ export const getDTDetails = (
   droptable: Droptable
 ): DetailedEntity[] => {
   const details: DetailedEntity[] = [];
+  const processed = droptable.weights.map((w) => (w === 0 ? 0 : 1 << (w - 1)));
+  const total = processed.reduce((a, b) => a + b, 0) || 1;
   for (let i = 0; i < droptable.keys.length; i++)
     details.push({
       ...getItemDetailsByIndex(world, components, droptable.keys[i]),
-      description: getRarities(droptable.weights[i]).title,
+      description: `${((processed[i] / total) * 100).toFixed(1)}%`,
     });
   return details;
 };
@@ -118,18 +124,19 @@ export const queryDTCommits = (
   });
 };
 
-//////////////////
-// IDs
+export const querySacrificeCommits = (
+  world: World,
+  components: Components,
+  holderID: EntityID
+): DTCommit[] => {
+  const { SourceID } = components;
 
-const getLogEntityIndex = (
-  world: any,
-  holderID: EntityID | undefined,
-  dtID: EntityID | undefined
-): EntityIndex | undefined => {
-  if (!holderID) return;
-  return getEntityByHash(
-    world,
-    ['droptable.item.log', holderID, dtID],
-    ['string', 'uint256', 'uint256']
-  );
+  const commits = getHolderCommits(world, components, 'KAMI_SACRIFICE_COMMIT', holderID);
+  return commits.map((commit) => {
+    return {
+      ...commit,
+      anchorID: formatEntityID((getComponentValue(SourceID, commit.entity)?.value || 0).toString()),
+      rolls: 1,
+    };
+  });
 };

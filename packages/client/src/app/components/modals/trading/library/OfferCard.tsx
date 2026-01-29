@@ -8,7 +8,14 @@ import { Trade, TradeOrder } from 'network/shapes/Trade';
 import { playClick } from 'utils/sounds';
 import { getTypeColor } from '../helpers';
 
-interface Props {
+// Represents the player's Buy/Sell Orders that are in EXECUTED state
+// Currently only supports simple (single item) trades against MUSU
+export const OfferCard = ({
+  button,
+  data: { account, trade, type },
+  utils,
+  reverse,
+}: {
   button: {
     onClick: (trade: Trade) => void;
     text: string;
@@ -24,15 +31,7 @@ interface Props {
     getStateTooltip: () => string[];
   };
   reverse?: boolean;
-}
-
-// represents the player's Buy/Sell Orders that are in EXECUTED state
-// NOTE: only supports simple (single item) trades against musu atm
-// TODO: add support for Trades you're the Taker for (disable action)
-export const OfferCard = (props: Props) => {
-  const { button, data, utils, reverse } = props;
-  const { account, trade, type } = data;
-
+}) => {
   const [want, setWant] = useState<Item[]>([]);
   const [have, setHave] = useState<Item[]>([]);
   const [wantAmt, setWantAmt] = useState<number[]>([]);
@@ -73,21 +72,18 @@ export const OfferCard = (props: Props) => {
   /////////////////
   // INTERPRETATION
 
-  // span is the max of the number of items specified on either side
   const getSpan = () => {
     const buySpan = trade.buyOrder?.items.length ?? 0;
     const sellSpan = trade.sellOrder?.items.length ?? 0;
     return Math.min(Math.max(buySpan, sellSpan), 2);
   };
 
-  // determine the name to display for an Account
   const getNameDisplay = (trader?: Account): string => {
     if (!trader || !trader.name) return '???';
     if (trader.entity === account.entity) return 'You';
     return trader.name;
   };
 
-  // tooltip for list of order items/amts
   const getOrderTooltip = (order?: TradeOrder): string[] => {
     const tooltip = [];
     if (!order) return [];
@@ -120,8 +116,8 @@ export const OfferCard = (props: Props) => {
         </TextTooltip>
       </Side>
 
-      <TextTooltip title='status' text={utils?.getStateTooltip() || []} alignText='left'>
-        <Controls>
+      <Controls>
+        <TextTooltip title='status' text={utils?.getStateTooltip() || []} alignText='left'>
           {trade.state === 'CANCELLED' && <CancelOverlay>Cancelled</CancelOverlay>}
           <TagContainer>
             <Overlay top={0.21} left={0.21}>
@@ -132,13 +128,13 @@ export const OfferCard = (props: Props) => {
             </Overlay>
             <TypeTag color={getTypeColor(type)}>{type}</TypeTag>
           </TagContainer>
-          <TextTooltip text={button.tooltip} fullWidth>
-            <Button onClick={handleClick} disabled={button.disabled}>
-              {button.text}
-            </Button>
-          </TextTooltip>
-        </Controls>
-      </TextTooltip>
+        </TextTooltip>
+        <TextTooltip text={button.tooltip} fullWidth>
+          <Button onClick={handleClick} disabled={button.disabled}>
+            {button.text}
+          </Button>
+        </TextTooltip>
+      </Controls>
 
       <Side span={getSpan()} borderLeft>
         <TextTooltip
@@ -238,13 +234,14 @@ const Button = styled.button`
   }
   &:disabled {
     background-color: #bbb;
-    cursor: default;
+    cursor: help;
   }
 `;
 
 const TagContainer = styled.div`
   position: relative;
-  width: 100%;
+  width: 15vw;
+  height: 4vw;
   flex-grow: 1;
 
   display: flex;

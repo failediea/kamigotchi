@@ -7,7 +7,7 @@ import { IUint256Component as IUintComp } from "solecs/interfaces/IUint256Compon
 import { IWorld } from "solecs/interfaces/IWorld.sol";
 import { IComponent } from "solecs/interfaces/IComponent.sol";
 import { getAddrByID, getCompByID } from "solecs/utils.sol";
-import { Stat } from "solecs/components/types/Stat.sol";
+import { LibTypes } from "solecs/LibTypes.sol";
 
 import { DescriptionComponent, ID as DescriptionCompID } from "components/DescriptionComponent.sol";
 import { ExperienceComponent, ID as ExpCompID } from "components/ExperienceComponent.sol";
@@ -16,10 +16,14 @@ import { IndexRoomComponent, ID as IndexRoomCompID } from "components/IndexRoomC
 import { IsRegistryComponent, ID as IsRegCompID } from "components/IsRegistryComponent.sol";
 import { MediaURIComponent, ID as MediaURICompID } from "components/MediaURIComponent.sol";
 import { NameComponent, ID as NameCompID } from "components/NameComponent.sol";
+import { RarityComponent, ID as RarityCompID } from "components/RarityComponent.sol";
+import { ScaleComponent, ID as ScaleCompID } from "components/ScaleComponent.sol";
 import { TokenAddressComponent, ID as TokenAddressCompID } from "components/TokenAddressComponent.sol";
 import { TypeComponent, ID as TypeCompID } from "components/TypeComponent.sol";
 
 import { LibComp } from "libraries/utils/LibComp.sol";
+import { LibDisabled } from "libraries/utils/LibDisabled.sol";
+import { LibEmitter } from "libraries/utils/LibEmitter.sol";
 import { LibEntityType } from "libraries/utils/LibEntityType.sol";
 import { LibFor } from "libraries/utils/LibFor.sol";
 import { LibReference } from "libraries/utils/LibReference.sol";
@@ -29,8 +33,9 @@ import { Condition, LibConditional } from "libraries/LibConditional.sol";
 import { LibData } from "libraries/LibData.sol";
 import { LibDroptable } from "libraries/LibDroptable.sol";
 import { LibFlag } from "libraries/LibFlag.sol";
+import { LibHarvest } from "libraries/LibHarvest.sol";
+import { LibNode } from "libraries/LibNode.sol";
 import { LibStat } from "libraries/LibStat.sol";
-import { LibScore } from "libraries/LibScore.sol";
 
 /** @notice
  * Items are shapes that can be held by inventories. They are fungible.
@@ -77,7 +82,8 @@ library LibItem {
     string memory type_,
     string memory name,
     string memory description,
-    string memory mediaURI
+    string memory mediaURI,
+    uint32 rarity
   ) internal returns (uint256 id) {
     id = genID(index);
     LibEntityType.set(components, id, "ITEM");
@@ -88,6 +94,7 @@ library LibItem {
     NameComponent(getAddrByID(components, NameCompID)).set(id, name);
     DescriptionComponent(getAddrByID(components, DescriptionCompID)).set(id, description);
     MediaURIComponent(getAddrByID(components, MediaURICompID)).set(id, mediaURI);
+    RarityComponent(getAddrByID(components, RarityCompID)).set(id, rarity);
 
     addFlag(components, index, type_); // additionally store type as flag, for reverse query
   }
@@ -104,12 +111,29 @@ library LibItem {
     return LibReference.create(components, useCase, genRefAnchor(index));
   }
 
-  /// @notice adds an optional token address to represent an ERC20 token
-  function addERC20(IUintComp components, uint32 index, address tokenAddress) internal {
-    TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).set(
-      genID(index),
-      tokenAddress
-    );
+  /// @notice update the rarity of an existing item registry entry
+  /// @param components The components registry
+  /// @param registryID The item's registry entity ID (from genID or getByIndex)
+  /// @param rarity The new rarity value
+  function setRarity(IUintComp components, uint256 registryID, uint32 rarity) internal {
+    RarityComponent(getAddrByID(components, RarityCompID)).set(registryID, rarity);
+  }
+
+  /// @notice set optional ERC20 fields (token address + conversion scale) to a registry instance
+  /// @dev actual address/scale is determined by TokenPortal. this is for FE legibility
+  /// @dev do not call anywhere outside of TokenPortal
+  function setERC20(IUintComp components, uint32 index, address tokenAddr, int32 scale) internal {
+    uint256 id = genID(index);
+    TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).set(id, tokenAddr);
+    ScaleComponent(getAddrByID(components, ScaleCompID)).set(id, scale);
+  }
+
+  /// @notice unset options ERC20 token fields address from a registry instance
+  /// @dev do not call anywhere outside of TokenPortal
+  function unsetERC20(IUintComp components, uint32 index) internal {
+    uint256 id = genID(index);
+    TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).remove(id);
+    ScaleComponent(getAddrByID(components, ScaleCompID)).remove(id);
   }
 
   function addRequirement(
@@ -127,26 +151,39 @@ library LibItem {
     LibFlag.setFull(components, genID(index), "ITEM", flag);
   }
 
+  function enable(IUintComp components, uint32 index) internal {
+    LibDisabled.set(components, genID(index), false);
+  }
+
+  function disable(IUintComp components, uint32 index) internal {
+    LibDisabled.set(components, genID(index), true);
+  }
+
   /// @notice delete a Registry entry for an item.
   function remove(IUintComp components, uint32 index) public {
     uint256 id = genID(index);
+    if (TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).has(id)) {
+      revert("LibItem: cannot remove item with token address");
+    }
+
     LibEntityType.remove(components, id);
-    IndexItemComponent(getAddrByID(components, IndexItemCompID)).remove(id);
     IsRegistryComponent(getAddrByID(components, IsRegCompID)).remove(id);
+    IndexItemComponent(getAddrByID(components, IndexItemCompID)).remove(id);
 
     NameComponent(getAddrByID(components, NameCompID)).remove(id);
     DescriptionComponent(getAddrByID(components, DescriptionCompID)).remove(id);
     TypeComponent(getAddrByID(components, TypeCompID)).remove(id);
     MediaURIComponent(getAddrByID(components, MediaURICompID)).remove(id);
+    RarityComponent(getAddrByID(components, RarityCompID)).remove(id);
 
     LibStat.removeAll(components, id);
     ExperienceComponent(getAddrByID(components, ExpCompID)).remove(id);
 
-    LibDroptable.remove(components, id);
     LibFor.remove(components, id);
     IndexRoomComponent(getAddrByID(components, IndexRoomCompID)).remove(id);
-    TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).remove(id);
 
+    // remove all sub-entities attached to the item
+    LibDroptable.remove(components, id);
     LibFlag.removeFull(components, LibFlag.queryFor(components, id));
     LibConditional.remove(components, getAllRequirements(components, index));
     LibAllo.remove(components, getAllAllos(components, index));
@@ -239,9 +276,23 @@ library LibItem {
     return LibFlag.checkAny(components, ids, flag, state);
   }
 
-  /// @dev to prevent potential overflows, somehow
-  function verifyMaxPerUse(IUintComp components, uint256 amt) public view {
-    if (amt > 100) revert("max 100 item use at once");
+  /// @notice check that all items passed in are burnable
+  function verifyBurnable(IUintComp components, uint32[] memory indices) public view {
+    uint256[] memory ids = new uint256[](indices.length);
+    for (uint256 i; i < indices.length; i++) ids[i] = genID(indices[i]);
+    if (!LibFlag.checkAll(components, ids, "ITEM_UNBURNABLE", false)) revert("item not burnable");
+  }
+
+  function verifyEnabled(IUintComp components, uint32 index) public view {
+    uint256 id = genID(index);
+    if (LibDisabled.get(components, id)) revert("item is disabled");
+  }
+
+  /// @notice check if an item is meant for use by a specific shape (e.g. KAMI or ACCOUNT)
+  function verifyForShape(IUintComp components, uint32 index, string memory shape) public view {
+    if (!LibFor.get(components, genID(index)).eq(shape)) {
+      revert(LibString.concat("not for ", shape));
+    }
   }
 
   /// @dev requirements looks at conditions outside of the item itself, e.g. kami/account
@@ -252,15 +303,24 @@ library LibItem {
     uint256 targetID
   ) public view {
     if (!LibConditional.check(components, getReqsFor(components, index, usecase), targetID))
-      revert("Item: Reqs not met");
+      revert("Item: requirements not met");
+  }
+
+  /// @notice ensure an item does/doesn't have a token attached
+  function verifyToken(IUintComp components, uint32 index, bool want) public view {
+    uint256 id = genID(index);
+    bool has = TokenAddressComponent(getAddrByID(components, TokenAddressCompID)).has(id);
+    if (want && !has) revert("LibItem: item has no token");
+    if (!want && has) revert("LibItem: item has a token");
   }
 
   /// @notice check if entity is an item of specific type
   function verifyType(IUintComp components, uint32 index, string memory type_) public view {
     uint256 id = genID(index);
     if (!LibEntityType.isShape(components, id, "ITEM")) revert("thats not an item");
-    if (!getCompByID(components, TypeCompID).eqString(id, type_))
+    if (!getCompByID(components, TypeCompID).eqString(id, type_)) {
       revert(LibString.concat("thats not item type ", type_));
+    }
   }
 
   function verifyType(
@@ -271,19 +331,9 @@ library LibItem {
     uint256[] memory ids = new uint256[](indices.length);
     for (uint256 i; i < indices.length; i++) ids[i] = genID(indices[i]);
     if (!LibEntityType.isShape(components, ids, "ITEM")) revert("thats not an item");
-    if (!getCompByID(components, TypeCompID).eqString(ids, type_))
+    if (!getCompByID(components, TypeCompID).eqString(ids, type_)) {
       revert(LibString.concat("thats not item type ", type_));
-  }
-
-  function verifyBurnable(IUintComp components, uint32[] memory indices) public view {
-    uint256[] memory ids = new uint256[](indices.length);
-    for (uint256 i; i < indices.length; i++) ids[i] = genID(indices[i]);
-    if (!LibFlag.checkAll(components, ids, "ITEM_UNBURNABLE", false)) revert("item not burnable");
-  }
-
-  function verifyForShape(IUintComp components, uint32 index, string memory shape) public view {
-    if (!LibFor.get(components, genID(index)).eq(shape))
-      revert(LibString.concat("not for ", shape));
+    }
   }
 
   /////////////////
@@ -295,6 +345,10 @@ library LibItem {
 
   function getName(IUintComp components, uint32 index) internal view returns (string memory) {
     return NameComponent(getAddrByID(components, NameCompID)).get(genID(index));
+  }
+
+  function getScale(IUintComp components, uint32 index) internal view returns (int32) {
+    return ScaleComponent(getAddrByID(components, ScaleCompID)).safeGet(genID(index));
   }
 
   function getTokenAddr(IUintComp components, uint32 index) internal view returns (address) {
@@ -414,5 +468,52 @@ library LibItem {
     LibData.inc(components, accID, indices, "ITEM_USE", amt);
     // log ACCOUNT_ITEM_USE or KAMI_ITEM_USE
     LibData.inc(components, accID, 0, targetShape.concat("_ITEM_USE"), amt);
+  }
+
+  ////////////////
+  // EVENTS
+
+  function emitCastEvent(
+    IWorld world,
+    IUintComp comps,
+    uint256 accID,
+    uint256 targetID,
+    uint32 itemIndex
+  ) internal {
+    CastEventData memory eventData;
+    eventData.accID = accID;
+    eventData.timestamp = block.timestamp;
+    eventData.targetID = targetID;
+    eventData.itemIndex = itemIndex;
+
+    // derive node index
+    uint256 harvestID = LibHarvest.getForKami(comps, targetID);
+    uint256 nodeID = LibHarvest.getNode(comps, harvestID);
+    eventData.nodeIndex = LibNode.getIndex(comps, nodeID);
+
+    bytes memory encoded = _encodeCastEvent(eventData);
+    LibEmitter.emitEvent(world, "KAMI_CAST", _castEventSchema(), encoded);
+  }
+
+  struct CastEventData {
+    uint256 accID;
+    uint256 timestamp;
+    uint256 targetID;
+    uint32 itemIndex;
+    uint32 nodeIndex;
+  }
+
+  function _encodeCastEvent(CastEventData memory data) internal view returns (bytes memory) {
+    return abi.encode(data.accID, data.timestamp, data.targetID, data.itemIndex, data.nodeIndex);
+  }
+
+  function _castEventSchema() internal pure returns (uint8[] memory) {
+    uint8[] memory schema = new uint8[](5);
+    schema[0] = uint8(LibTypes.SchemaValue.UINT256);
+    schema[1] = uint8(LibTypes.SchemaValue.UINT256);
+    schema[2] = uint8(LibTypes.SchemaValue.UINT256);
+    schema[3] = uint8(LibTypes.SchemaValue.UINT32);
+    schema[4] = uint8(LibTypes.SchemaValue.UINT32);
+    return schema;
   }
 }

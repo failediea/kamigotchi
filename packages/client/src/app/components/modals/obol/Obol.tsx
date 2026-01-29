@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { interval, map } from 'rxjs';
 import styled from 'styled-components';
 
 import { ModalWrapper, Overlay } from 'app/components/library';
+import { useLayers } from 'app/root/hooks';
 import { UIComponent } from 'app/root/types';
 import { useVisibility } from 'app/stores';
 import { hoverFx } from 'app/styles/effects';
@@ -10,7 +10,7 @@ import { ItemImages } from 'assets/images/items';
 import { OBOL_INDEX } from 'constants/items';
 import { queryAccountFromEmbedded } from 'network/shapes/Account';
 import { getItemBalance } from 'network/shapes/Item';
-import { checkActionState } from 'network/utils';
+import { didActionSucceed } from 'network/utils';
 
 const obolsPerEgg = 5;
 const arrowButtons = [
@@ -22,39 +22,41 @@ const arrowButtons = [
 
 export const ObolModal: UIComponent = {
   id: 'ObolModal',
-  requirement: (layers) => {
-    return interval(1000).pipe(
-      map(() => {
-        const { network } = layers;
-        const { world, components } = network;
-        const accountEntity = queryAccountFromEmbedded(network);
-        const account = world.entities[accountEntity];
+  Render: () => {
+    const layers = useLayers();
 
-        return {
-          network,
-          utils: {
-            getObolsBalance: () => getItemBalance(world, components, account, OBOL_INDEX),
-          },
-        };
-      })
-    );
-  },
-  Render: ({ network, utils }) => {
+    const {
+      network,
+      utils: { getObolsBalance },
+    } = (() => {
+      const { network } = layers;
+      const { world, components } = network;
+      const accountEntity = queryAccountFromEmbedded(network);
+      const account = world.entities[accountEntity];
+
+      return {
+        network,
+        utils: {
+          getObolsBalance: () => getItemBalance(world, components, account, OBOL_INDEX),
+        },
+      };
+    })();
+
     const { actions, api } = network;
-    const { getObolsBalance } = utils;
 
-    const { modals, setModals } = useVisibility();
+    const lootBoxModalVisible = useVisibility((s) => s.modals.lootBox);
+    const setModals = useVisibility((s) => s.setModals);
     const [eggsQuantity, setEggsQuantity] = useState(1);
     const [isDisabled, setIsDisabled] = useState(false);
 
     /////////////////
     useEffect(() => {
-      if (!modals.lootBox) return;
+      if (!lootBoxModalVisible) return;
       // reset eggsQuantity on modal close
       setEggsQuantity(1);
       // close crafting modal
       setModals({ crafting: false });
-    }, [modals.lootBox]);
+    }, [lootBoxModalVisible, setModals]);
 
     /////////////////
     // HELPERS
@@ -78,7 +80,7 @@ export const ObolModal: UIComponent = {
           return api.player.account.item.craft(index, amount);
         },
       });
-      const completed = await checkActionState(actions.Action, transaction);
+      const completed = await didActionSucceed(actions.Action, transaction);
       if (completed) {
         setEggsQuantity(1);
       }

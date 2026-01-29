@@ -83,11 +83,9 @@ export const calcHealTime = (kami: Kami): number => {
 
 // calculate the cooldown remaining on kami standard actions
 export const calcCooldown = (kami: Kami): number => {
-  const requirement = calcCooldownRequirement(kami);
   const now = Date.now() / 1000;
-  const lastActionTs = kami.time?.cooldown ?? now;
-  const delta = now - lastActionTs;
-  const remainingTime = requirement - delta;
+  const cdEndTime = kami.time?.cooldown ?? now;
+  const remainingTime = cdEndTime - now;
   return Math.max(0, remainingTime);
 };
 
@@ -136,15 +134,17 @@ export const calcHealthRate = (kami: Kami): number => {
 };
 
 // calculate the rate of health regen while resting
+// Metabolism = (H + d) * k * boost
 const calcRestingHealthRate = (kami: Kami): number => {
   const config = kami.config?.rest.metabolism;
   if (!config) return 0;
 
-  const ratio = config.ratio.value;
+  const nudge = config.nudge.value; // d
+  const ratio = config.ratio.value; // k
   const boostBonus = kami.bonuses?.rest.metabolism.boost ?? 0;
   const boost = config.boost.value + boostBonus;
   const harmony = kami.stats?.harmony.total ?? 0;
-  return (harmony * ratio * boost) / 3600;
+  return ((harmony + nudge) * ratio * boost) / 3600;
 };
 
 // assume harvest rate has been updated if it is active

@@ -1,20 +1,38 @@
 import React, { useEffect, useState } from 'react';
-import styled, { keyframes } from 'styled-components';
+import styled, { css, keyframes } from 'styled-components';
 
 import { Modals, useVisibility } from 'app/stores';
 import { ExitButton } from './ExitButton';
 
-interface Props {
-  id: keyof Modals;
-  children: React.ReactNode;
-  header?: React.ReactNode;
-  footer?: React.ReactNode;
+// ModalWrapper is an animated wrapper around all modals.
+// It includes and exit button with a click sound as well as Content formatting.
+export const ModalWrapper = ({
+  canExit,
+  children,
+  footer,
+  header,
+  id,
+  noInternalBorder,
+  noPadding,
+  onClose,
+  overlay,
+  positionOverride,
+  scrollBarColor,
+  backgroundColor,
+  shuffle = false,
+  truncate,
+  noScroll,
+}: {
   canExit?: boolean;
-  overlay?: boolean;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+  header?: React.ReactNode;
+  id: keyof Modals;
   noInternalBorder?: boolean;
   noPadding?: boolean;
-  truncate?: boolean;
-  scrollBarColor?: string;
+  onClose?: () => void;
+  overlay?: boolean;
+  backgroundColor?: string;
   positionOverride?: {
     colStart: number;
     colEnd: number;
@@ -22,15 +40,26 @@ interface Props {
     rowEnd: number;
     position: 'fixed' | 'absolute';
   };
-}
-
-// ModalWrapper is an animated wrapper around all modals.
-// It includes and exit button with a click sound as well as Content formatting.
-export const ModalWrapper = (props: Props) => {
-  const { id, children, header, footer, positionOverride } = props;
-  const { canExit, noInternalBorder, noPadding, overlay, truncate, scrollBarColor } = props;
-  const { modals } = useVisibility();
+  scrollBarColor?: string;
+  shuffle?: boolean;
+  truncate?: boolean;
+  noScroll?: boolean;
+}) => {
+  const isVisible = useVisibility((s) => s.modals[id]);
   const [gridStyle, setGridStyle] = useState<React.CSSProperties>({});
+  const [shouldDisplay, setShouldDisplay] = useState(false);
+
+  // execute cleaning func when modal closes
+  useEffect(() => {
+    if (isVisible) {
+      setShouldDisplay(true);
+    } else {
+      if (onClose) {
+        onClose();
+      }
+      setShouldDisplay(false);
+    }
+  }, [isVisible]);
 
   useEffect(() => {
     if (positionOverride) {
@@ -50,15 +79,26 @@ export const ModalWrapper = (props: Props) => {
   }, [positionOverride]);
 
   return (
-    <Wrapper id={id} isOpen={modals[id]} overlay={!!overlay} style={gridStyle}>
-      <Content isOpen={modals[id]} truncate={truncate}>
+    <Wrapper id={id} isOpen={shouldDisplay} overlay={!!overlay} style={gridStyle} shuffle={shuffle}>
+      <Content
+        backgroundColor={backgroundColor}
+        isOpen={isVisible}
+        truncate={truncate}
+        data-resizable={id === 'trading'}
+      >
+        {header && <Header noBorder={noInternalBorder}>{header}</Header>}
         {canExit && (
           <ButtonRow>
             <ExitButton divName={id} />
           </ButtonRow>
         )}
-        {header && <Header noBorder={noInternalBorder}>{header}</Header>}
-        <Children scrollBarColor={scrollBarColor} noPadding={noPadding}>
+        <Children
+          scrollBarColor={scrollBarColor}
+          noScroll={noScroll}
+          noPadding={noPadding}
+          // data-scroll-container='true'
+          // data-modal-id={id}
+        >
           {children}
         </Children>
         {footer && <Footer noBorder={noInternalBorder}>{footer}</Footer>}
@@ -67,30 +107,48 @@ export const ModalWrapper = (props: Props) => {
   );
 };
 
-interface WrapperProps {
-  isOpen: boolean;
-  overlay: boolean;
-}
+const Shuffle = keyframes`
+  0% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-200%);
+  }
+  100% {
+    transform: translateY(0);
+  }
+`;
 
 // Wrapper is an invisible animated wrapper around all modals sans any frills.
-const Wrapper = styled.div<WrapperProps>`
+const Wrapper = styled.div<{
+  isOpen: boolean;
+  overlay: boolean;
+  shuffle: boolean;
+}>`
   display: ${({ isOpen }) => (isOpen ? 'block' : 'none')};
-  animation: ${({ isOpen }) => (isOpen ? fadeIn : fadeOut)} 0.5s ease-in-out;
   position: ${({ overlay }) => (overlay ? 'relative' : 'static')};
-  z-index: ${({ overlay }) => (overlay ? 2 : 0)};
-
+  z-index: ${({ overlay }) => (overlay ? 3 : 0)};
+  ${({ isOpen, shuffle }) => css`
+    animation: ${isOpen
+        ? css`
+            ${fadeIn} 0.5s ease-in-out
+          `
+        : css`
+            ${fadeOut} 0.5s ease-in-out
+          `}
+      ${shuffle && css`, ${Shuffle} 0.4s ease-in-out`};
+  `}
   margin: 0.2vw;
   align-items: center;
   justify-content: center;
   height: 100%;
 `;
 
-interface ContentProps {
+const Content = styled.div<{
   isOpen: boolean;
   truncate?: boolean;
-}
-
-const Content = styled.div<ContentProps>`
+  backgroundColor?: string;
+}>`
   position: relative;
   background-color: white;
   border: solid black 0.15vw;
@@ -103,6 +161,18 @@ const Content = styled.div<ContentProps>`
   display: flex;
   flex-flow: column nowrap;
   overflow: hidden;
+  &[data-resizable='true'] {
+    resize: both;
+    overflow: auto;
+    box-sizing: border-box;
+    /* Keep within the viewport */
+    max-width: calc(100vw - 1vw);
+    max-height: calc(100vh - 1vh);
+    /* Sensible minimums to avoid text overlap */
+    min-width: 48vw;
+    min-height: 42vh;
+  }
+  background-color: ${({ backgroundColor }) => backgroundColor || 'white'};
 `;
 
 const ButtonRow = styled.div`
@@ -120,6 +190,7 @@ const Header = styled.div<{ noBorder?: boolean }>`
   border-radius: 1.05vw 1.05vw 0 0;
   display: flex;
   flex-flow: column nowrap;
+  border-color: grey;
 `;
 
 const Footer = styled.div<{ noBorder?: boolean }>`
@@ -132,9 +203,10 @@ const Footer = styled.div<{ noBorder?: boolean }>`
 const Children = styled.div<{
   noPadding?: boolean;
   scrollBarColor?: string;
+  noScroll?: boolean;
 }>`
   position: relative;
-  overflow-y: auto;
+  overflow: ${({ noScroll }) => (noScroll ? 'hidden' : 'auto')};
   max-height: 100%;
   height: 100%;
   ${({ scrollBarColor }) => scrollBarColor && `scrollbar-color:${scrollBarColor};`}

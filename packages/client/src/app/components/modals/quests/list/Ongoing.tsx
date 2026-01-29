@@ -9,7 +9,13 @@ import { QuestCard } from './QuestCard';
 const STALE_TIME = 1500;
 const REFRESH_TIME = 3333;
 
-interface Props {
+export const OngoingQuests = ({
+  quests,
+  utils,
+  actions,
+  imageCache,
+  isVisible,
+}: {
   quests: BaseQuest[];
   actions: QuestModalActions;
   utils: {
@@ -22,12 +28,9 @@ interface Props {
   };
   imageCache: Map<string, JSX.Element>;
   isVisible: boolean;
-}
-
-export const OngoingQuests = (props: Props) => {
-  const { quests, utils, actions, imageCache, isVisible } = props;
+}) => {
   const { populate, parseObjectives } = utils;
-  const { modals } = useVisibility();
+  const questsModalVisible = useVisibility((s) => s.modals.quests);
   const [cleaned, setCleaned] = useState<Quest[]>([]);
   const [lastRefresh, setLastRefresh] = useState(Date.now());
   const [lastUpdate, setLastUpdate] = useState(0);
@@ -46,13 +49,13 @@ export const OngoingQuests = (props: Props) => {
   // update when this tab is opened or data changes if stale
   useEffect(() => {
     const isStale = Date.now() - lastUpdate > STALE_TIME;
-    if (modals.quests && isVisible && isStale) update();
-  }, [modals.quests, isVisible]);
+    if (questsModalVisible && isVisible && isStale) update();
+  }, [questsModalVisible, isVisible]);
 
   // update data every cycle when this list is visible
   useEffect(() => {
-    if (modals.quests && isVisible) update();
-  }, [lastRefresh]);
+    if (questsModalVisible && isVisible) update();
+  }, [lastRefresh, questsModalVisible, isVisible]);
 
   const update = async () => {
     const fullQuests = quests.map((q) => populate(q));

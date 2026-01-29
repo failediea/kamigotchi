@@ -3,7 +3,11 @@ import { CraftIcon } from 'assets/images/icons/actions';
 import { Recipe } from 'network/shapes/Recipe';
 import { playMessage } from 'utils/sounds';
 
-interface Props {
+export const CraftButton = ({
+  data,
+  actions,
+  utils,
+}: {
   data: {
     quantity: number; // quantity to craft
     recipe: Recipe; // the recipe to craft
@@ -13,17 +17,14 @@ interface Props {
     craft: (amount: number) => void;
   };
   utils: {
-    meetsRequirements: (recipe: Recipe) => boolean;
-    displayRequirements: (recipe: Recipe) => string;
+    meetsRequirementsRecipe: (recipe: Recipe) => boolean;
+    displayRecipeRequirements: (recipe: Recipe) => string;
     getItemBalance: (index: number) => number;
   };
-}
-
-export const CraftButton = (props: Props) => {
-  const { actions, data, utils } = props;
+}) => {
   const { craft } = actions;
   const { quantity, recipe, stamina } = data;
-  const { meetsRequirements, displayRequirements, getItemBalance } = utils;
+  const { meetsRequirementsRecipe, displayRecipeRequirements, getItemBalance } = utils;
 
   const handleCraft = () => {
     playMessage();
@@ -34,13 +35,14 @@ export const CraftButton = (props: Props) => {
   // VALIDATION
 
   const isDisabled = () => {
-    return !meetsRequirements(recipe) || !meetsInputs() || !meetsStamina();
+    return !meetsRequirementsRecipe(recipe) || !meetsInputs() || !meetsStamina();
   };
 
   // determine disabled tooltip from validations
   const getDisabledTooltip = () => {
     let tooltip = '';
-    if (!meetsRequirements(recipe)) tooltip = 'Requires: \n' + displayRequirements(recipe);
+    if (!meetsRequirementsRecipe(recipe))
+      tooltip = 'Requires: \n' + displayRecipeRequirements(recipe);
     else if (!meetsInputs()) tooltip = 'Not enough items';
     else if (!meetsStamina()) tooltip = 'Not enough stamina';
     return `Craft (${quantity})`;

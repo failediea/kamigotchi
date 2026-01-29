@@ -3,17 +3,17 @@ import styled from 'styled-components';
 import { AccountCard, ActionListButton, EmptyText } from 'app/components/library';
 import { Friendship } from 'network/shapes/Friendship';
 
-interface Props {
+export const Outbound = ({
+  isVisible,
+  requests,
+  actions,
+}: {
   isVisible: boolean;
   requests: Friendship[];
   actions: {
     cancelFren: (friendship: Friendship) => void;
   };
-}
-
-export const Outbound = (props: Props) => {
-  const { requests, actions, isVisible } = props;
-
+}) => {
   const Actions = (friendship: Friendship) => {
     return (
       <ActionListButton
@@ -33,7 +33,7 @@ export const Outbound = (props: Props) => {
           <AccountCard
             key={friendship.target.index}
             account={friendship.target}
-            description={[friendship.account.bio ?? 'outbound friend request']}
+            description={[friendship.target.bio || 'outbound friend request']}
             actions={Actions(friendship)}
           />
         ))

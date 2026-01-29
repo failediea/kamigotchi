@@ -27,9 +27,16 @@ contract HarvestStartSystem is System {
       (uint256, uint32, uint256, uint256)
     );
     uint256 accID = LibAccount.getByOperator(components, msg.sender);
-
     uint256 nodeID = LibNode.getByIndex(components, nodeIndex);
     if (nodeID == 0) revert("node does not exist");
+
+    // (ach) temporary blocker for temple of the wheel
+    if (nodeIndex == 19) {
+      require(
+        LibAccount.getIndex(components, accID) == 833,
+        "you aren't even supposed to be here.."
+      );
+    }
 
     // standard checks (ownership, cooldown, state)
     LibKami.verifyAccount(components, kamiID, accID);
@@ -51,7 +58,7 @@ contract HarvestStartSystem is System {
     // start the harvest, create if none exists
     uint256 id = LibHarvest.startFor(components, nodeID, kamiID, taxerID, taxAmt);
     LibKami.setState(components, kamiID, "HARVESTING");
-    LibKami.setLastActionTs(components, kamiID, block.timestamp);
+    LibKami.resetCooldown(components, kamiID);
 
     // standard logging and tracking
     LibAccount.updateLastTs(components, accID);

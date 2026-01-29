@@ -4,14 +4,15 @@ import { useNetwork } from 'app/stores';
 import { loadingScreens } from 'assets/images/loading';
 import { ProgressBar } from '../library';
 
-interface Props {
+export const BootScreen = ({
+  status,
+  progress,
+  isHidden,
+}: {
   status: string;
   progress?: number; // as percent
   isHidden?: boolean;
-}
-
-export const BootScreen = (props: Props) => {
-  const { status, progress, isHidden } = props;
+}) => {
   const { randNum } = useNetwork();
   const bannerKeys = Object.keys(loadingScreens);
   const bannerValues = Object.values(loadingScreens);
@@ -54,7 +55,7 @@ const Container = styled.div<{ isHidden: boolean }>`
   justify-items: center;
   transition: all 2s ease;
   pointer-events: all;
-  z-index: 10;
+  z-index: 2;
   overflow: hidden;
   user-select: none;
 `;

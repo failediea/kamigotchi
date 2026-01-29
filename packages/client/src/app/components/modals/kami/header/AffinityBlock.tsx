@@ -6,13 +6,7 @@ import { AffinityColors } from 'constants/affinities';
 import { Kami } from 'network/shapes/Kami';
 import { playClick } from 'utils/sounds';
 
-interface Props {
-  kami: Kami;
-  traitKey: 'body' | 'hand';
-}
-
-export const AffinityBlock = (props: Props) => {
-  const { kami, traitKey } = props;
+export const AffinityBlock = ({ kami, traitKey }: { kami: Kami; traitKey: 'body' | 'hand' }) => {
   const traits = kami.traits!;
 
   const icon = TraitIcons[traitKey as keyof typeof TraitIcons];
@@ -53,15 +47,22 @@ const Container = styled.div<{ color?: string }>`
 
 // TODO: move to library
 const Icon = styled.img<{ size: number }>`
-  height: ${(props) => props.size}vw;
-  width: ${(props) => props.size}vw;
+  height: ${({ size }) => size}vw;
+  width: ${({ size }) => size}vw;
   filter: drop-shadow(0 0 0.2vw #bbb);
   user-drag: none;
 `;
 
 // TODO: generalize with library Text
 const Text = styled.div<{ size: number }>`
-  font-size: ${(props) => props.size}vw;
-  text-shadow: ${(props) => `0 0 ${props.size * 0.4}vw white`};
+  font-size: ${({ size }) => size}vw;
+  text-shadow: ${({ size }) => `0 0 ${size * 0.4}vw white`};
   pointer-events: none;
+  /* mystery bug fix?*/
+  position: unset;
+  border: unset;
+  border-radius: unset;
+  height: unset;
+  width: unset;
+  background-color: unset;
 `;

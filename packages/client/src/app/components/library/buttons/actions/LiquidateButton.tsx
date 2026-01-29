@@ -3,17 +3,22 @@ import { calcLiqRecoil, calcLiqSpoils } from 'app/cache/kami/calcs';
 import { IconListButton } from 'app/components/library';
 import { LiquidateIcon } from 'assets/images/icons/actions';
 import { Kami } from 'network/shapes/Kami';
-import { TextTooltip } from '../..';
 
 // button for liquidating a harvest
 // TODO: clean this up
-export const LiquidateButton = (target: Kami, allies: Kami[], triggerAction: Function) => {
+export const LiquidateButton = (
+  target: Kami,
+  allies: Kami[],
+  triggerAction: Function,
+  width?: number
+) => {
   const options = allies.filter((ally) => canLiquidate(ally, target));
   const actionOptions = options.map((myKami) => {
     const spoils = calcLiqSpoils(myKami, target);
     const recoil = calcLiqRecoil(myKami, target);
 
     return {
+      image: myKami.image,
       text: `${myKami.name} (+${spoils}MUSU; -${recoil}HP)`,
       onClick: () => triggerAction(myKami, target),
     };
@@ -21,14 +26,17 @@ export const LiquidateButton = (target: Kami, allies: Kami[], triggerAction: Fun
 
   let tooltipText = getLiquidateTooltip(target, allies);
   return (
-    <TextTooltip key='liquidate-tooltip' text={[tooltipText]}>
-      <IconListButton
-        key='liquidate-button'
-        img={LiquidateIcon}
-        options={actionOptions}
-        disabled={actionOptions.length == 0}
-      />
-    </TextTooltip>
+    <IconListButton
+      key='liquidate-button'
+      img={LiquidateIcon}
+      options={actionOptions}
+      disabled={actionOptions.length == 0}
+      tooltip={{ text: [tooltipText] }}
+      width={width}
+      icon={{ inset: { x: 2 } }}
+      filter={actionOptions.length !== 0 ? 'saturate(1500%) hue-rotate(233deg)' : ''}
+      shake={actionOptions.length !== 0}
+    />
   );
 };
 
@@ -56,10 +64,14 @@ const getLiquidateTooltip = (target: Kami, allies: Kami[]): string => {
     const thresholds = available.map((ally) => calcLiqThreshold(ally, target));
     const [threshold, index] = thresholds.reduce(
       (a, b, i) => (a[0] < b ? [b, i] : a),
-      [Number.MIN_VALUE, -1]
+      [-Infinity, -1]
     );
     const champion = available[index];
-    reason = `${champion?.name} can liquidate below ${Math.round(threshold)} Health`;
+    if (threshold <= 0) {
+      reason = `${target.name} is too strong for any active kami to liquidate`;
+    } else {
+      reason = `${champion?.name} can liquidate below ${Math.round(threshold)} Health`;
+    }
   }
 
   if (reason === '') reason = 'Liquidate this Kami';

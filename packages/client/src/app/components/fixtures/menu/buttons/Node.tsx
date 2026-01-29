@@ -2,13 +2,9 @@ import { Modals, useSelected } from 'app/stores';
 import { HarvestIcon } from 'assets/images/icons/actions';
 import { MenuButton } from './MenuButton';
 
-interface Props {
-  disabled?: boolean;
-}
-
-export const NodeMenuButton = (props: Props) => {
-  const { disabled } = props;
-  const { roomIndex, setNode } = useSelected(); // roomIndex == nodeIndex
+export const NodeMenuButton = ({ disabled }: { disabled?: boolean }) => {
+  const roomIndex = useSelected((s) => s.roomIndex); // roomIndex == nodeIndex
+  const setNode = useSelected((s) => s.setNode);
 
   const modalsToHide: Partial<Modals> = {
     goal: false,
@@ -20,13 +16,13 @@ export const NodeMenuButton = (props: Props) => {
     gacha: false,
     emaBoard: false,
     presale: false,
-
+    tokenPortal: false,
     trading: false,
   };
 
   return (
     <MenuButton
-      id='party_button'
+      id='node_button'
       image={HarvestIcon}
       tooltip={disabled ? 'There is no node here.' : 'Harvest'}
       targetModal='node'

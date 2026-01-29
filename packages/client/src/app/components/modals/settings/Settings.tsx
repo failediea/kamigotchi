@@ -1,7 +1,7 @@
-import { interval, map } from 'rxjs';
 import styled from 'styled-components';
 
 import { ModalHeader, ModalWrapper } from 'app/components/library';
+import { useLayers } from 'app/root/hooks';
 import { UIComponent } from 'app/root/types';
 import { SettingsIcon } from 'assets/images/icons/menu';
 import { Account } from './Account';
@@ -10,17 +10,10 @@ import { Volume } from './Volume';
 
 export const SettingsModal: UIComponent = {
   id: 'SettingsModal',
-  requirement: (layers) =>
-    interval(5000).pipe(
-      map(() => {
-        const { network } = layers;
+  Render: () => {
+    const layers = useLayers();
 
-        return {
-          network,
-        };
-      })
-    ),
-  Render: ({ network }) => {
+    const { network } = layers;
     const { actions, api } = network;
 
     /////////////////
@@ -53,6 +46,7 @@ export const SettingsModal: UIComponent = {
         id='settings'
         header={<ModalHeader title='Settings' icon={SettingsIcon} />}
         canExit
+        overlay
         truncate
       >
         <Volume />

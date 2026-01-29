@@ -5,27 +5,36 @@ import { Goal, Tier } from 'network/shapes/Goals';
 import { DetailedEntity } from 'network/shapes/utils';
 import { ItemIconHorizontal } from './ItemIconHorizontal';
 
-interface Props {
+export const Details = ({
+  goal,
+  getFromDescription,
+}: {
   goal: Goal;
   getFromDescription: (type: string, index: number) => DetailedEntity;
-}
+}) => {
+  /////////////////
+  // PARSING
 
-export const Details = (props: Props) => {
-  const { goal, getFromDescription } = props;
+  const helpText = (tier: Tier) => {
+    if (tier.cutoff > 0) {
+      return `Have a contribution score of at least ${tier.cutoff}`;
+    } else {
+      if (tier.name === 'Proportional') {
+        return 'Get this per unit contributed';
+      }
+      return 'Everyone gets this';
+    }
+  };
 
   ////////////////
   // SMALL DISPLAYS
 
   const TierBox = (tier: Tier) => {
-    const helpText =
-      tier.cutoff > 0
-        ? `Have a contribution score of at least ${tier.cutoff}`
-        : 'Everyone gets this';
     return (
       <Box key={tier.name} style={{ padding: '0 0.4vw' }}>
         <Row>
           <SmallTitleText>{tier.name}</SmallTitleText>
-          <HelpChip tooltip={[helpText]} />
+          <HelpChip tooltip={{ text: [helpText(tier)] }} />
         </Row>
 
         <Row>
@@ -35,6 +44,7 @@ export const Details = (props: Props) => {
               item={getFromDescription(reward.type, reward.index ?? 0)}
               size='small'
               balance={reward.value ?? 0}
+              suffix={tier.name === 'Proportional' ? ` per contribution` : undefined}
               styleOverride={{ box: { borderColor: '#444', marginBottom: '0' } }}
             />
           ))}
@@ -48,8 +58,8 @@ export const Details = (props: Props) => {
 
   const DescriptionBox = (
     <Box style={{ marginTop: '0' }}>
-      <TitleText>{props.goal.name}</TitleText>
-      <DescriptionText>{props.goal.description}</DescriptionText>
+      <TitleText>{goal.name}</TitleText>
+      <DescriptionText>{goal.description}</DescriptionText>
     </Box>
   );
 

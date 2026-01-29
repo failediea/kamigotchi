@@ -1,4 +1,4 @@
-import { Provider } from '@ethersproject/providers';
+import { getRevertReason } from 'engine/queue/utils';
 import {
   EntityID,
   EntityIndex,
@@ -8,8 +8,11 @@ import {
   removeComponent,
   setComponent,
   updateComponent,
-} from '@mud-classic/recs';
+} from 'engine/recs';
+import { Provider } from 'ethers';
 import { Observable } from 'rxjs';
+import { log } from 'utils/logger';
+import { playError } from 'utils/sounds';
 import { v4 as uuid } from 'uuid';
 import { defineActionComponent } from './ActionComponent';
 import { ActionState } from './constants';
@@ -85,13 +88,12 @@ export function createActionSystem<M = undefined>(
       updateAction({ state: ActionState.WaitingForTxEvents }); // pending
 
       if (tx) {
-        if (!request.skipConfirmation) await tx.wait();
-        updateAction({ txHash: tx.hash });
+        updateAction({ txHash: (tx as any).hash });
       }
 
       updateAction({ state: ActionState.Complete });
     } catch (e) {
-      handleError(e, request);
+      await handleError(e, request);
     }
   }
 
@@ -133,19 +135,38 @@ export function createActionSystem<M = undefined>(
     requests.delete(index); // Remove the request from the ActionSystem
   }
 
-  // Set the action's state to ActionState.Failed and pass through the error
-  // message as metadata. The rest of the error is logged as a warning and can
-  // be bubbled up, but does not appear to be useful for clientside reporting.
-  function handleError(error: any, action: ActionRequest) {
-    // console.warn('handleError()', '\naction: ', action, '\nerror: ', error);
+  // Set the action's state to ActionState.Failed and fetch revert reason via debug_traceTransaction.
+  // The revert reason is stored in metadata for display in the UI tooltip.
+  async function handleError(error: any, action: ActionRequest) {
     if (!action.index) return;
 
-    let metadata = error;
-    if (metadata.reason) metadata = metadata.reason;
-    if (metadata.error) metadata = metadata.error;
-    else if (metadata.data) metadata = metadata.data;
-    if (metadata.message) metadata = metadata.message;
+    const txHash = error?.receipt?.transactionHash || error?.transactionHash || error?.hash;
+    let metadata: string | undefined;
+
+    // Fetch revert reason and persist it in metadata
+    if (txHash) {
+      try {
+        metadata = await getRevertReason(txHash, provider);
+        if (metadata) {
+          log.warn('[ActionSystem] TX FAILED', { txHash, revertReason: metadata });
+        }
+      } catch {
+        // Fall through to default extraction
+      }
+    }
+
+    // Fallback: extract from error object
+    if (!metadata) {
+      let errData = error;
+      if (errData.reason) errData = errData.reason;
+      if (errData.error) errData = errData.error;
+      else if (errData.data) errData = errData.data;
+      if (errData.message) errData = errData.message;
+      metadata = typeof errData === 'string' ? errData : error.message || 'Transaction failed';
+    }
+
     updateComponent(Action, action.index, { state: ActionState.Failed, metadata });
+    playError();
   }
 
   return {

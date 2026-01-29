@@ -1,4 +1,4 @@
-import { EntityID } from '@mud-classic/recs';
+import { EntityID } from 'engine/recs';
 import styled from 'styled-components';
 
 import { Text } from 'app/components/library';
@@ -7,17 +7,17 @@ import { Kill } from 'clients/kamiden';
 import { Kami } from 'network/shapes';
 import { playClick } from 'utils/sounds';
 
-interface Props {
+export const AdversaryColumn = ({
+  kills,
+  utils,
+}: {
   kills: Kill[];
   utils: {
     getKamiByID: (id: EntityID) => Kami;
   };
-}
-
-export const AdversaryColumn = (props: Props) => {
-  const { kills, utils } = props;
+}) => {
   const { getKamiByID } = utils;
-  const { setKami } = useSelected();
+  const setKami = useSelected((s) => s.setKami);
 
   const selectKami = (index: number) => {
     setKami(index);

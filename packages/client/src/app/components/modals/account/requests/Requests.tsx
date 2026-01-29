@@ -9,7 +9,12 @@ import { Inbound } from './Inbound';
 import { Outbound } from './Outbound';
 import { Searched } from './Searched';
 
-interface Props {
+export const Requests = ({
+  account,
+  accounts,
+  requests,
+  actions,
+}: {
   account: Account;
   accounts: BaseAccount[];
   requests: {
@@ -22,10 +27,7 @@ interface Props {
     cancelFren: (friendship: Friendship) => void;
     requestFren: (account: BaseAccount) => void;
   };
-}
-
-export const Requests = (props: Props) => {
-  const { account, requests, actions, accounts } = props;
+}) => {
   const [mode, setMode] = useState('inbound');
   const [search, setSearch] = useState('');
   const [knownAccIndices, setKnownAccIndices] = useState([] as number[]);
@@ -51,7 +53,6 @@ export const Requests = (props: Props) => {
   }, [accounts, knownAccIndices]);
 
   const filteredSearch = useMemo(() => {
-    if (search.length < 2) return [];
     return filteredAccounts.filter(
       (account) => account.name.toLowerCase().includes(search.toLowerCase())
       // decided to comment this line because we are indexing by name and it feels confusing
@@ -60,7 +61,7 @@ export const Requests = (props: Props) => {
   }, [filteredAccounts, search]);
 
   const filteredByLetter = useMemo(() => {
-    if (search.length >= 2) return filteredSearch;
+    if (search) return filteredSearch;
     return filteredAccounts.filter((account) => {
       const firstChar = account.name?.[0]?.toUpperCase() ?? '';
       if (selectedLetter === '#') return !/^[A-Z]$/.test(firstChar);
@@ -76,14 +77,10 @@ export const Requests = (props: Props) => {
     setSearch(event.target.value);
   };
 
-  const ModeButton = (props: { mode: string; label: string }) => {
+  const ModeButton = ({ mode: _mode, label }: { mode: string; label: string }) => {
     return (
-      <TextTooltip text={[props.mode]}>
-        <ActionButton
-          text={props.label}
-          onClick={() => setMode(props.mode)}
-          disabled={mode === props.mode}
-        />
+      <TextTooltip text={[_mode]}>
+        <ActionButton text={label} onClick={() => setMode(_mode)} disabled={mode === _mode} />
       </TextTooltip>
     );
   };
@@ -120,9 +117,10 @@ export const Requests = (props: Props) => {
       />
       <>
         <Pagination
-          isVisible={mode === 'search' && search.length < 2}
+          isVisible={mode === 'search'}
           selectedLetter={selectedLetter}
           onSelect={setSelectedLetter}
+          setSearch={setSearch}
         />
         <Searched
           isVisible={mode === 'search'}
