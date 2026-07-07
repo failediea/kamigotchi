@@ -1,0 +1,9 @@
+{
+  "name": "vault-kit",
+  "private": true,
+  "type": "module",
+  "description": "KamiVault go/no-go kit: Kamibots onboarding for a contract-owned game account",
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
