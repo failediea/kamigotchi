@@ -66,6 +66,15 @@ contract KamiLeaseMarket {
     uint256 delta;
   }
 
+  /// @dev a declared intent to deposit via in-game KamiSend (the flow players use).
+  /// MUST be registered BEFORE sending — prior in-game ownership is verified at
+  /// registration time and cannot be proven after the kami has arrived.
+  struct PendingSend {
+    address owner;
+    uint16 ownerShareBps;
+    uint128 minGasWei;
+  }
+
   ///////////////////
   // STATE
 
@@ -82,6 +91,8 @@ contract KamiLeaseMarket {
   uint32[] public tokenIndices;
   mapping(uint32 => uint256) internal tokenPos; // tokenIndex => position+1
 
+  mapping(uint32 => PendingSend) public pendingSends; // declared in-game deposits
+
   CarryEntry[] public carries;
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
 
@@ -94,6 +105,9 @@ contract KamiLeaseMarket {
   event OperatorRotated(address newOperator);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event Staked(uint32 indexed tokenIndex);
+  event SendPreRegistered(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
+  event SendConfirmed(address indexed owner, uint32 indexed tokenIndex);
+  event PendingCancelled(address indexed owner, uint32 indexed tokenIndex);
   event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs);
   event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund);
   event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs);
@@ -229,8 +243,74 @@ contract KamiLeaseMarket {
     }
   }
 
+  ///////////////////
+  // OWNER SIDE — in-game KamiSend deposits (the flow players actually use)
+
+  /// @notice STEP 1: declare an in-game deposit BEFORE sending. verifies the kami is
+  ///         currently in YOUR game account — this is what binds the listing to you,
+  ///         and it cannot be proven after the kami has already arrived.
+  function preRegisterSend(
+    uint32 tokenIndex,
+    uint16 ownerShareBps,
+    uint128 minGasWei
+  ) external {
+    require(accID != 0, "LeaseMkt: not initialized");
+    require(ownerShareBps <= 10000, "LeaseMkt: share > 100%");
+    require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
+
+    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    // the caller's game account IS uint160(caller) — verify current in-game ownership
+    require(
+      LibKami.getAccount(_comps(), kamiID) == uint256(uint160(msg.sender)),
+      "LeaseMkt: kami not in your account"
+    );
+
+    pendingSends[tokenIndex] = PendingSend(msg.sender, ownerShareBps, minGasWei);
+    emit SendPreRegistered(msg.sender, tokenIndex, ownerShareBps, minGasWei);
+  }
+
+  /// @notice STEP 2 happens in-game: KamiSend the kami to the market's account.
+  ///         STEP 3: confirm arrival (anyone/keeper) — creates the listing.
+  function confirmSendIn(uint32 tokenIndex) external nonReentrant {
+    PendingSend memory p = pendingSends[tokenIndex];
+    require(p.owner != address(0), "LeaseMkt: not pre-registered");
+    require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
+
+    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    require(
+      LibKami.getAccount(_comps(), kamiID) == accID,
+      "LeaseMkt: kami has not arrived"
+    );
+
+    delete pendingSends[tokenIndex];
+    listings[tokenIndex] = Listing({
+      owner: p.owner,
+      kamiID: kamiID,
+      xpBase: LibExperience.get(_comps(), kamiID),
+      ownerShareBps: p.ownerShareBps,
+      minGasWei: p.minGasWei,
+      staked: true, // in-world under the market account (arrived via KamiSend)
+      renter: address(0),
+      gasBudget: 0
+    });
+    tokenIndices.push(tokenIndex);
+    tokenPos[tokenIndex] = tokenIndices.length;
+
+    emit SendConfirmed(p.owner, tokenIndex);
+    emit Listed(p.owner, tokenIndex, p.ownerShareBps, p.minGasWei);
+  }
+
+  /// @notice abandon a declared deposit that was never sent
+  function cancelPending(uint32 tokenIndex) external {
+    require(pendingSends[tokenIndex].owner == msg.sender, "LeaseMkt: not yours");
+    delete pendingSends[tokenIndex];
+    emit PendingCancelled(msg.sender, tokenIndex);
+  }
+
   /// @notice withdraw a kami. only the owner, only when not leased; NFT goes only to
   ///         the recorded owner. un-settled earnings are carried to the next settle.
+  /// @dev works for BOTH deposit flows — a KamiSent kami is equally linked to the
+  ///      market account, so the owner-gated 721 unstake is its trustless exit too.
   function withdrawKami(uint32 tokenIndex) external nonReentrant {
     Listing memory l = listings[tokenIndex];
     require(l.owner == msg.sender, "LeaseMkt: not owner");
@@ -393,6 +473,13 @@ contract KamiLeaseMarket {
 
   function musuBalance() external view returns (uint256) {
     return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+  }
+
+  /// @notice has this kami arrived in the market's game account? (UI helper for the
+  ///         send-in flow's confirm step)
+  function kamiInMarket(uint32 tokenIndex) external view returns (bool) {
+    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    return LibKami.getAccount(_comps(), kamiID) == accID;
   }
 
   ///////////////////

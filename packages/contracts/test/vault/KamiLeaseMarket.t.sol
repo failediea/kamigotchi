@@ -300,6 +300,102 @@ contract KamiLeaseMarketTest is SetupTemplate {
   }
 
   /////////////////
+  // IN-GAME KAMISEND DEPOSIT FLOW (the flow live players actually use)
+
+  /// @dev full lifecycle: preRegister -> KamiSend in -> confirm -> lease -> settle -> withdraw
+  function testSendInFlowEndToEnd() public {
+    uint256 kamiID = _mintKami(alice); // minted kamis are already in-world in alice's account
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    // STEP 1: declare before sending (verifies current in-game ownership)
+    vm.prank(alice.owner);
+    market.preRegisterSend(tokenIndex, OWNER_BPS, MIN_GAS);
+
+    // confirm before arrival must fail
+    vm.expectRevert("LeaseMkt: kami has not arrived");
+    market.confirmSendIn(tokenIndex);
+
+    // STEP 2: the in-game send (operator-signed, targets the market's operator)
+    vm.prank(alice.operator);
+    _KamiSendSystem.executeTyped(tokenIndex, marketOperator);
+    assertEq(LibKami.getAccount(components, kamiID), market.accID(), "not arrived");
+    assertTrue(market.kamiInMarket(tokenIndex), "view helper wrong");
+
+    // STEP 3: confirm (anyone) -> listing exists at pre-registered terms
+    market.confirmSendIn(tokenIndex);
+    (address owner, , , uint16 shareBps, , bool staked, , ) = market.listings(tokenIndex);
+    assertEq(owner, alice.owner, "listing owner");
+    assertEq(shareBps, OWNER_BPS, "listing terms");
+    assertTrue(staked, "send-in should be live immediately");
+
+    // lease + harvest + settle works identically to the 721 flow
+    _fastForward(2 hours); // clear the post-send cooldown
+    _accept(bob, tokenIndex);
+    _marketHarvest(kamiID, 100_000);
+
+    uint256 bal = market.musuBalance();
+    uint256 feeBudget = 3 * TRANSFER_FEE;
+    uint256 pool = ((bal - feeBudget) * (10000 - MGMT_BPS)) / 10000;
+    uint256 bBefore = _accountMusu(bob);
+    market.settle();
+    assertEq(_accountMusu(bob) - bBefore, pool - (pool * OWNER_BPS) / 10000, "renter share");
+
+    // withdraw: same trustless 721-bridge exit, only to alice
+    vm.prank(bob.owner);
+    market.endLease(tokenIndex);
+    _setMarketRoom(uint32(BRIDGE_721_ROOM));
+    vm.prank(alice.owner);
+    market.withdrawKami(tokenIndex);
+    assertEq(_Kami721.ownerOf(uint256(tokenIndex)), alice.owner, "721 not returned");
+  }
+
+  function testPreRegisterRequiresInGameOwnership() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    // bob cannot pre-register alice's kami
+    vm.prank(bob.owner);
+    vm.expectRevert("LeaseMkt: kami not in your account");
+    market.preRegisterSend(tokenIndex, OWNER_BPS, MIN_GAS);
+  }
+
+  function testCannotClaimAfterArrivalWithoutPreRegistration() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    // alice sends WITHOUT pre-registering (the documented mistake case)
+    vm.prank(alice.operator);
+    _KamiSendSystem.executeTyped(tokenIndex, marketOperator);
+
+    // nobody can confirm (no pending) …
+    vm.expectRevert("LeaseMkt: not pre-registered");
+    market.confirmSendIn(tokenIndex);
+
+    // … and nobody can pre-register it now (kami is in the market account, prior
+    // ownership is unprovable) — recovery is a manual operator send-back
+    vm.prank(alice.owner);
+    vm.expectRevert("LeaseMkt: kami not in your account");
+    market.preRegisterSend(tokenIndex, OWNER_BPS, MIN_GAS);
+  }
+
+  function testCancelPending() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    vm.prank(alice.owner);
+    market.preRegisterSend(tokenIndex, OWNER_BPS, MIN_GAS);
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LeaseMkt: not yours");
+    market.cancelPending(tokenIndex);
+
+    vm.prank(alice.owner);
+    market.cancelPending(tokenIndex);
+    (address pOwner, , ) = market.pendingSends(tokenIndex);
+    assertEq(pOwner, address(0), "pending not cleared");
+  }
+
+  /////////////////
   // BOUNDARIES
 
   function testOperatorCannotTransferMarketItems() public {
