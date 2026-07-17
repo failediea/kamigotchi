@@ -48,12 +48,13 @@ contract KamiLeaseMarket {
   // TYPES
 
   struct Listing {
-    address owner; // lessor; only address that can ever receive the NFT back
+    address owner; // lessor; only address that can ever receive the kami back
     uint256 kamiID; // ECS entity
     uint256 xpBase; // attribution baseline (reset on settle / lease boundaries)
     uint16 ownerShareBps; // owner's share of post-fee earnings while leased
     uint128 minGasWei; // minimum gas budget to accept the lease
-    bool staked; // staked into the market's game account
+    bool staked; // in-world under the market's game account
+    bool returning; // owner requested an in-game send-back (blocks new leases)
     address renter; // active renter (0 = not leased)
     uint256 gasBudget; // renter's remaining ETH for farming gas
   }
@@ -95,6 +96,11 @@ contract KamiLeaseMarket {
 
   CarryEntry[] public carries;
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
+  mapping(address => uint256) public owedEth; // gas refunds that failed to send (pull)
+  mapping(address => uint256) public participations; // active listings + leases per address
+
+  uint64 public lastSettleAt;
+  uint64 public settleCooldown = 6 hours; // spam guard; admin-tunable, capped
 
   uint256 private locked = 1;
 
@@ -108,6 +114,11 @@ contract KamiLeaseMarket {
   event SendPreRegistered(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event SendConfirmed(address indexed owner, uint32 indexed tokenIndex);
   event PendingCancelled(address indexed owner, uint32 indexed tokenIndex);
+  event ReturnRequested(address indexed owner, uint32 indexed tokenIndex); // ops bot: KamiSend it home
+  event ReturnCleared(address indexed owner, uint32 indexed tokenIndex);
+  event EthOwed(address indexed to, uint256 amount);
+  event EthClaimed(address indexed to, uint256 amount);
+  event SettleCooldownSet(uint64 secs);
   event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs);
   event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund);
   event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs);
@@ -176,6 +187,13 @@ contract KamiLeaseMarket {
     reserveMusu = _reserveMusu;
   }
 
+  /// @notice settle spam guard, capped at 7 days so payouts can't be locked up
+  function setSettleCooldown(uint64 secs) external onlyAdmin {
+    require(secs <= 7 days, "LeaseMkt: cooldown too long");
+    settleCooldown = secs;
+    emit SettleCooldownSet(secs);
+  }
+
   /// @notice pull gas from a lease's budget to the operator wallet. admin-triggered,
   ///         but funds can ONLY go to the current account operator.
   function dripGas(uint32 tokenIndex, uint256 amount) external onlyAdmin {
@@ -209,11 +227,13 @@ contract KamiLeaseMarket {
       ownerShareBps: ownerShareBps,
       minGasWei: minGasWei,
       staked: false,
+      returning: false,
       renter: address(0),
       gasBudget: 0
     });
     tokenIndices.push(tokenIndex);
     tokenPos[tokenIndex] = tokenIndices.length;
+    participations[msg.sender]++;
 
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
   }
@@ -290,11 +310,13 @@ contract KamiLeaseMarket {
       ownerShareBps: p.ownerShareBps,
       minGasWei: p.minGasWei,
       staked: true, // in-world under the market account (arrived via KamiSend)
+      returning: false,
       renter: address(0),
       gasBudget: 0
     });
     tokenIndices.push(tokenIndex);
     tokenPos[tokenIndex] = tokenIndices.length;
+    participations[p.owner]++;
 
     emit SendConfirmed(p.owner, tokenIndex);
     emit Listed(p.owner, tokenIndex, p.ownerShareBps, p.minGasWei);
@@ -320,9 +342,40 @@ contract KamiLeaseMarket {
       _carryPending(tokenIndex);
       Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
     }
+    if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     kami721.transferFrom(address(this), l.owner, uint256(tokenIndex));
     emit KamiWithdrawn(l.owner, tokenIndex);
+  }
+
+  /// @notice PREFERRED exit: request an in-game send-back. Snapshots earnings, blocks
+  ///         new leases, and signals the automation to KamiSend the kami home — no
+  ///         bridge room, works from anywhere (1h in-game cooldown applies).
+  function requestReturn(uint32 tokenIndex) external nonReentrant {
+    Listing storage l = listings[tokenIndex];
+    require(l.owner == msg.sender, "LeaseMkt: not owner");
+    require(l.renter == address(0), "LeaseMkt: end lease first");
+    require(l.staked, "LeaseMkt: not in market");
+    require(!l.returning, "LeaseMkt: already returning");
+
+    _carryPending(tokenIndex); // freeze attribution at request time
+    l.returning = true;
+    emit ReturnRequested(msg.sender, tokenIndex);
+  }
+
+  /// @notice finalize a send-back once the kami is verifiably in the OWNER's account.
+  ///         callable by anyone; only clears if the kami actually went home.
+  function clearReturned(uint32 tokenIndex) external nonReentrant {
+    Listing memory l = listings[tokenIndex];
+    require(l.owner != address(0), "LeaseMkt: not listed");
+    require(l.returning, "LeaseMkt: no return requested");
+    require(
+      LibKami.getAccount(_comps(), l.kamiID) == uint256(uint160(l.owner)),
+      "LeaseMkt: kami not home yet"
+    );
+    if (participations[l.owner] > 0) participations[l.owner]--;
+    _removeListing(tokenIndex);
+    emit ReturnCleared(l.owner, tokenIndex);
   }
 
   ///////////////////
@@ -330,18 +383,27 @@ contract KamiLeaseMarket {
 
   /// @notice accept a lease: fund the gas budget (msg.value) and set strategy prefs.
   ///         attribution baseline resets so pre-lease earnings stay with the owner.
-  function acceptLease(uint32 tokenIndex, string calldata prefs) external payable nonReentrant {
+  /// @param expectedOwnerShareBps the terms the renter agreed to — reverts if the
+  ///        listing's terms changed since they read them (frontrun guard)
+  function acceptLease(
+    uint32 tokenIndex,
+    string calldata prefs,
+    uint16 expectedOwnerShareBps
+  ) external payable nonReentrant {
     Listing storage l = listings[tokenIndex];
     require(l.owner != address(0), "LeaseMkt: not listed");
     require(l.staked, "LeaseMkt: not staked yet");
+    require(!l.returning, "LeaseMkt: being returned");
     require(l.renter == address(0), "LeaseMkt: already leased");
     require(l.owner != msg.sender, "LeaseMkt: own kami");
+    require(l.ownerShareBps == expectedOwnerShareBps, "LeaseMkt: terms changed");
     require(msg.value >= l.minGasWei, "LeaseMkt: gas budget too low");
 
     _carryPending(tokenIndex); // owner keeps everything earned before this lease
 
     l.renter = msg.sender;
     l.gasBudget = msg.value;
+    participations[msg.sender]++;
     emit LeaseAccepted(msg.sender, tokenIndex, msg.value, prefs);
   }
 
@@ -371,20 +433,40 @@ contract KamiLeaseMarket {
     uint256 refund = l.gasBudget;
     l.renter = address(0);
     l.gasBudget = 0;
+    if (participations[renter] > 0) participations[renter]--;
 
-    if (refund > 0) {
-      (bool ok, ) = renter.call{ value: refund }("");
-      require(ok, "LeaseMkt: refund failed");
-    }
+    // pull-pattern fallback: a renter contract that reverts on receive must not be
+    // able to block lease termination
+    if (refund > 0) _sendEthOrOwe(renter, refund);
     emit LeaseEnded(tokenIndex, renter, refund);
+  }
+
+  /// @notice claim ETH refunds that could not be pushed
+  function claimEth() external nonReentrant {
+    uint256 amount = owedEth[msg.sender];
+    require(amount > 0, "LeaseMkt: nothing owed");
+    owedEth[msg.sender] = 0;
+    (bool ok, ) = msg.sender.call{ value: amount }("");
+    require(ok, "LeaseMkt: claim failed");
+    emit EthClaimed(msg.sender, amount);
   }
 
   ///////////////////
   // SETTLEMENT
 
-  /// @notice split accrued MUSU per-kami (XP delta), three ways. callable by anyone.
+  /// @notice split accrued MUSU per-kami (XP delta), three ways.
+  ///         callable by PARTICIPANTS (any listing owner or active renter) or admin —
+  ///         so payouts can never be withheld, but randoms can't spam fee-burn it.
   function settle() external nonReentrant {
     require(accID != 0, "LeaseMkt: not initialized");
+    require(
+      msg.sender == admin || participations[msg.sender] > 0,
+      "LeaseMkt: not a participant"
+    );
+    require(
+      lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
+      "LeaseMkt: cooldown"
+    );
     IUintComp comps = _comps();
 
     uint256 bal = LibInventory.getBalanceOf(comps, accID, MUSU_INDEX);
@@ -439,6 +521,7 @@ contract KamiLeaseMarket {
 
     if (mgmtCut > 0 && mgmtAccID != 0) _transferMusu(mgmtAccID, mgmtCut);
 
+    lastSettleAt = uint64(block.timestamp);
     emit Settled(paidOut, mgmtCut, totalDelta);
   }
 
@@ -513,6 +596,15 @@ contract KamiLeaseMarket {
     indices[0] = MUSU_INDEX;
     amts[0] = amount;
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, targetAccID);
+  }
+
+  /// @dev push ETH; on failure record it as claimable instead of reverting
+  function _sendEthOrOwe(address to, uint256 amount) internal {
+    (bool ok, ) = to.call{ value: amount, gas: 50_000 }("");
+    if (!ok) {
+      owedEth[to] += amount;
+      emit EthOwed(to, amount);
+    }
   }
 
   function _removeListing(uint32 tokenIndex) internal {

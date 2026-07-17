@@ -4,7 +4,7 @@ import { JsonRpcProvider, Contract, id as keccakId } from "ethers";
 
 const RPC = "https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz";
 const WORLD = "0x2729174c265dbBd8416C6449E0E813E88f43D0E7";
-const MARKET_ACC_ID = 43044749590305112253161995254083490137683785545n; // uint160(market v2)
+const MARKET_ACC_ID = 310159398724652805713480889308036416097312230532n; // uint160(market v3)
 
 const WORLD_ABI = ["function components() view returns (address)"];
 const REGISTRY_ABI = ["function getEntitiesWithValue(uint256 value) view returns (uint256[])"];

@@ -70,7 +70,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
   function _accept(PlayerAccount memory renter, uint32 tokenIndex) internal {
     vm.deal(renter.owner, 1 ether);
     vm.prank(renter.owner);
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, '{"node":1,"regen":"REST"}');
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, '{"node":1,"regen":"REST"}', OWNER_BPS);
   }
 
   function _marketHarvest(uint256 kamiID, uint256 bounty) internal {
@@ -99,7 +99,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     assertEq(_Kami721.ownerOf(uint256(tokenIndex)), address(_Kami721), "721 custody");
     assertEq(LibKami.getAccount(components, kamiID), market.accID(), "in-world owner");
-    (address owner, , , uint16 shareBps, , bool staked, address renter, ) = market.listings(
+    (address owner, , , uint16 shareBps, , bool staked, , address renter, ) = market.listings(
       tokenIndex
     );
     assertEq(owner, alice.owner);
@@ -143,13 +143,13 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
     vm.expectRevert("LeaseMkt: gas budget too low");
-    market.acceptLease{ value: MIN_GAS - 1 }(tokenIndex, "");
+    market.acceptLease{ value: MIN_GAS - 1 }(tokenIndex, "", OWNER_BPS);
 
     // owner cannot lease own kami
     vm.deal(alice.owner, 1 ether);
     vm.prank(alice.owner);
     vm.expectRevert("LeaseMkt: own kami");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
 
     _accept(bob, tokenIndex);
 
@@ -157,7 +157,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(charlie.owner, 1 ether);
     vm.prank(charlie.owner);
     vm.expectRevert("LeaseMkt: already leased");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
   }
 
   function testEndLeaseRefundsGas() public {
@@ -170,7 +170,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.endLease(tokenIndex);
     assertEq(bob.owner.balance - balBefore, MIN_GAS, "gas not refunded");
 
-    (, , , , , , address renter, uint256 gasBudget) = market.listings(tokenIndex);
+    (, , , , , , , address renter, uint256 gasBudget) = market.listings(tokenIndex);
     assertEq(renter, address(0));
     assertEq(gasBudget, 0);
   }
@@ -184,7 +184,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.dripGas(tokenIndex, 0.004 ether); // admin == this test contract
     assertEq(marketOperator.balance - opBefore, 0.004 ether, "operator not funded");
 
-    (, , , , , , , uint256 gasBudget) = market.listings(tokenIndex);
+    (, , , , , , , , uint256 gasBudget) = market.listings(tokenIndex);
     assertEq(gasBudget, MIN_GAS - 0.004 ether, "budget not decremented");
 
     vm.expectRevert("LeaseMkt: budget too low");
@@ -323,7 +323,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     // STEP 3: confirm (anyone) -> listing exists at pre-registered terms
     market.confirmSendIn(tokenIndex);
-    (address owner, , , uint16 shareBps, , bool staked, , ) = market.listings(tokenIndex);
+    (address owner, , , uint16 shareBps, , bool staked, , , ) = market.listings(tokenIndex);
     assertEq(owner, alice.owner, "listing owner");
     assertEq(shareBps, OWNER_BPS, "listing terms");
     assertTrue(staked, "send-in should be live immediately");
@@ -396,6 +396,120 @@ contract KamiLeaseMarketTest is SetupTemplate {
   }
 
   /////////////////
+  // AUDIT FIXES (v3)
+
+  function testSettleParticipantsOnly() public {
+    uint256 kamiID = _mintKami(alice);
+    _listToMarket(alice, kamiID);
+    _marketHarvest(kamiID, 50_000);
+
+    // a random address cannot settle (fee-burn spam guard)
+    address rando = _getNextUserAddress();
+    vm.prank(rando);
+    vm.expectRevert("LeaseMkt: not a participant");
+    market.settle();
+
+    // but a participant (listing owner) always can — payouts can't be withheld
+    vm.prank(alice.owner);
+    market.settle();
+  }
+
+  function testSettleCooldown() public {
+    uint256 kamiID = _mintKami(alice);
+    _listToMarket(alice, kamiID);
+    _marketHarvest(kamiID, 50_000);
+
+    market.settle(); // admin
+
+    _marketHarvest(kamiID, 50_000);
+    vm.expectRevert("LeaseMkt: cooldown");
+    market.settle();
+
+    _fastForward(6 hours + 1);
+    market.settle(); // ok after cooldown
+  }
+
+  function testAcceptRevertsIfTermsChanged() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listToMarket(alice, kamiID);
+
+    // owner bumps their share after bob read the listing
+    vm.prank(alice.owner);
+    market.updateTerms(tokenIndex, 5000, MIN_GAS);
+
+    // bob's accept (still expecting the old 30%) must revert, not silently bind
+    vm.deal(bob.owner, 1 ether);
+    vm.prank(bob.owner);
+    vm.expectRevert("LeaseMkt: terms changed");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+
+    // accepting the actual current terms works
+    vm.prank(bob.owner);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", 5000);
+  }
+
+  /// @dev preferred exit: in-game send-back, no bridge room involved
+  function testReturnFlowViaKamiSend() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    // list via the send-in flow
+    vm.prank(alice.owner);
+    market.preRegisterSend(tokenIndex, OWNER_BPS, MIN_GAS);
+    vm.prank(alice.operator);
+    _KamiSendSystem.executeTyped(tokenIndex, marketOperator);
+    market.confirmSendIn(tokenIndex);
+
+    _fastForward(2 hours);
+    _marketHarvest(kamiID, 60_000);
+
+    // owner requests return: attribution frozen, new leases blocked
+    vm.prank(alice.owner);
+    market.requestReturn(tokenIndex);
+    assertEq(market.numCarries(), 1, "delta not carried at request");
+
+    vm.deal(bob.owner, 1 ether);
+    vm.prank(bob.owner);
+    vm.expectRevert("LeaseMkt: being returned");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+
+    // premature clear must fail
+    vm.expectRevert("LeaseMkt: kami not home yet");
+    market.clearReturned(tokenIndex);
+
+    // ops bot sends it home (operator-signed, from anywhere — no bridge room)
+    _fastForward(_idleRequirement);
+    vm.prank(marketOperator);
+    _KamiSendSystem.executeTyped(tokenIndex, alice.operator);
+
+    market.clearReturned(tokenIndex);
+    assertEq(LibKami.getAccount(components, kamiID), alice.id, "kami not home");
+    assertEq(market.numListings(), 0, "listing not cleared");
+
+    // carried earnings still pay out at the next settle
+    uint256 aBefore = _accountMusu(alice);
+    market.settle();
+    assertTrue(_accountMusu(alice) > aBefore, "carried earnings lost");
+  }
+
+  function testEndLeaseCannotBeBlockedByRevertingRenter() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listToMarket(alice, kamiID);
+
+    RevertingRenter evil = new RevertingRenter();
+    vm.deal(address(evil), 1 ether);
+    evil.doAccept{ value: MIN_GAS }(market, tokenIndex, OWNER_BPS);
+
+    // owner can still terminate: refund falls back to pull-pattern instead of reverting
+    vm.prank(alice.owner);
+    market.endLease(tokenIndex);
+
+    assertEq(market.owedEth(address(evil)), MIN_GAS, "refund not owed");
+    (, , , , , , , address renter, ) = market.listings(tokenIndex);
+    assertEq(renter, address(0), "lease not cleared");
+  }
+
+  /////////////////
   // BOUNDARIES
 
   function testOperatorCannotTransferMarketItems() public {
@@ -421,5 +535,17 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.prank(alice.owner);
     vm.expectRevert("LeaseMkt: leased");
     market.updateTerms(tokenIndex, 5000, MIN_GAS);
+  }
+}
+
+/// @dev a renter contract that rejects ETH — used to prove lease termination
+/// cannot be held hostage by a refund that reverts
+contract RevertingRenter {
+  function doAccept(KamiLeaseMarket m, uint32 idx, uint16 bps) external payable {
+    m.acceptLease{ value: msg.value }(idx, "", bps);
+  }
+
+  receive() external payable {
+    revert("no eth");
   }
 }
