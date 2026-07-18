@@ -23,6 +23,9 @@
  */
 import { JsonRpcProvider, Wallet, Contract, id as keccakId } from "ethers";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 
 // ---- env / config -----------------------------------------------------------
 const envPath = new URL("./.env", import.meta.url).pathname;
@@ -121,6 +124,20 @@ async function wire() {
   marketAccID = await market.accID();
   for (const pod of pods.values()) {
     pod.accID = await pod.contract.accID();
+    // AUTO_REGISTER=1 (opt-in): the operator of this bot authorizes Kamibots
+    // registration for any pod that lacks one — same flow as register-pods.sh
+    if (!pod.creds && process.env.AUTO_REGISTER === "1") {
+      try {
+        console.log(`auto-registering pod ${pod.node} on Kamibots…`);
+        execSync(`bash ./register-pods.sh ${pod.node}`, {
+          cwd: dirname(fileURLToPath(import.meta.url)),
+          stdio: "inherit",
+        });
+        pod.creds = loadJson(`./kamibots-credentials-pod${pod.node}.json`);
+      } catch (e) {
+        console.error(`auto-register pod ${pod.node} failed: ${e.message?.slice(0, 160)}`);
+      }
+    }
     console.log(`pod node ${pod.node} (${pod.label}) acc ${pod.accID} kamibots:${pod.creds ? "✓" : "✗ NOT REGISTERED"}`);
   }
   console.log(`wired. hub acc ${marketAccID}, ${pods.size} pods`);
