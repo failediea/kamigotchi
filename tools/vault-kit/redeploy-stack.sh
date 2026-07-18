@@ -40,27 +40,31 @@ echo "=== deploy hub v9 (leasetest${NAME_SUFFIX}) ==="
 cd ~/kamigotchi/packages/contracts
 WORLD_ADDR=$WORLD MARKET_OPERATOR=$OP MARKET_NAME=leasetest${NAME_SUFFIX} MGMT_BPS=1000 \
   $FORGE script script/DeployKamiLeaseMarket.s.sol:DeployKamiLeaseMarket \
-  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 200 2>&1 \
+  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 1 2>&1 \
   | grep -E 'KamiLeaseMarket:|game accID:|Error' | tee /tmp/hub9.out
 HUB=$(grep 'KamiLeaseMarket:' /tmp/hub9.out | awk '{print $2}')
-[ -n "$HUB" ] || { echo "hub deploy failed"; exit 1; }
+[ -n "$HUB" ] || { echo "hub deploy failed (no address printed)"; exit 1; }
+# the printed address can be a SIMULATED CREATE addr even when broadcast failed
+# (e.g. size-limit). verify real on-chain code exists before continuing.
+HUBCODE=$($CAST code "$HUB" --rpc-url "$YOMINET_RPC" 2>/dev/null)
+[ "${#HUBCODE}" -gt 2 ] || { echo "ABORT: hub $HUB has NO on-chain code — deploy did not land (size limit?)"; exit 1; }
+echo "hub verified on-chain: $HUB (${#HUBCODE} bytes of code)"
 
 echo "=== mint FRESH pod operators (the old keys leaked into git — never reuse) ==="
 cd ~/kamigotchi/tools/vault-kit
-gen_key() { $CAST wallet new --json; }
 for i in 1 2 3; do
-  J=$(gen_key)
-  eval "P${i}OP=$(echo "$J" | grep -o '\"address\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
-  eval "P${i}KEY=$(echo "$J" | grep -o '\"private_key\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
+  read A K < <($CAST wallet new --json | python3 -c "import json,sys; w=json.load(sys.stdin)[0]; print(w['address'], w.get('private_key') or w.get('privateKey'))")
+  eval "P${i}OP=$A; P${i}KEY=$K"
 done
 echo "fresh pod operators: $P1OP $P2OP $P3OP"
+[ -n "$P1OP" ] && [ -n "$P2OP" ] && [ -n "$P3OP" ] || { echo "ABORT: key gen failed"; exit 1; }
 cd ~/kamigotchi/packages/contracts
 WORLD_ADDR=$WORLD HUB_ADDR=$HUB POD_COUNT=3 \
 POD1_NODE=1 POD1_LABEL='Misty Riverside (EERIE)' POD1_OPERATOR=$P1OP POD1_NAME=leasepod1${NAME_SUFFIX} \
 POD2_NODE=2 POD2_LABEL='Tunnel of Trees (NORMAL)' POD2_OPERATOR=$P2OP POD2_NAME=leasepod2${NAME_SUFFIX} \
 POD3_NODE=3 POD3_LABEL='Torii Gate (NORMAL)' POD3_OPERATOR=$P3OP POD3_NAME=leasepod3${NAME_SUFFIX} \
   $FORGE script script/DeployLeasePods.s.sol:DeployLeasePods \
-  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 200 2>&1 \
+  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 1 2>&1 \
   | grep -E 'LeasePodRegistry:|RoomPod:|accID:|Error' | tee /tmp/pods9.out
 REG=$(grep 'LeasePodRegistry:' /tmp/pods9.out | awk '{print $2}')
 PODS=($(grep 'RoomPod:' /tmp/pods9.out | awk '{print $2}'))
@@ -72,7 +76,7 @@ echo "=== deploy self-farm stack ==="
 WORLD_ADDR=$WORLD HUB_ADDR=$HUB KEEPER_ADDR=$OP POD_NODE=1 \
 POD_LABEL='Misty Riverside (EERIE)' POD_NAME=selfpod1${NAME_SUFFIX} \
   $FORGE script script/DeploySelfFarm.s.sol:DeploySelfFarm \
-  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 200 2>&1 \
+  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 1 2>&1 \
   | grep -E 'SelfFarmRegistry:|HarvestGuard:|RoomPod:|Error' | tee /tmp/self9.out
 SREG=$(grep 'SelfFarmRegistry:' /tmp/self9.out | awk '{print $2}')
 GUARD=$(grep 'HarvestGuard:' /tmp/self9.out | awk '{print $2}')

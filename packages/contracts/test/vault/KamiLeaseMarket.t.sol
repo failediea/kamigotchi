@@ -104,14 +104,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     // not yours -> no
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: kami not in your account");
+    vm.expectRevert("LM: kami not in your account");
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
 
     // farming -> not resting at full health -> no
     vm.prank(alice.operator);
     _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: must be resting at full health");
+    vm.expectRevert("LM: must be resting at full health");
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
 
     // stop + heal to full -> listable
@@ -131,11 +131,11 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // listed but not sent: NOT rentable
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: not in pool yet");
+    vm.expectRevert("LM: not in pool yet");
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
 
     // premature confirm fails
-    vm.expectRevert("LeaseMkt: not arrived");
+    vm.expectRevert("LM: not arrived");
     market.confirmArrival(tokenIndex);
 
     // send in -> pooled: custody is the market's, owner literally cannot use it
@@ -156,7 +156,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _list(alice, kamiID);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: not owner");
+    vm.expectRevert("LM: not owner");
     market.delist(tokenIndex);
 
     vm.prank(alice.owner);
@@ -167,7 +167,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 kami2 = _mintKami(alice);
     uint32 idx2 = _listPool(alice, kami2);
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: in pool - use requestReturn");
+    vm.expectRevert("LM: in pool - use requestReturn");
     market.delist(idx2);
   }
 
@@ -204,19 +204,19 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: gas budget too low");
+    vm.expectRevert("LM: gas budget too low");
     market.acceptLease{ value: MIN_GAS - 1 }(tokenIndex, "", OWNER_BPS);
 
     vm.deal(alice.owner, 1 ether);
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: own kami");
+    vm.expectRevert("LM: own kami");
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
 
     _accept(bob, tokenIndex);
 
     vm.deal(charlie.owner, 1 ether);
     vm.prank(charlie.owner);
-    vm.expectRevert("LeaseMkt: already leased");
+    vm.expectRevert("LM: already leased");
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
   }
 
@@ -229,7 +229,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: terms changed");
+    vm.expectRevert("LM: terms changed");
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
 
     vm.prank(bob.owner);
@@ -341,7 +341,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // returning blocks new leases
     vm.deal(dana().owner, 1 ether);
     vm.prank(dana().owner);
-    vm.expectRevert("LeaseMkt: being returned");
+    vm.expectRevert("LM: being returned");
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
 
     _fastForward(_idleRequirement);
@@ -362,18 +362,18 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _list(alice, kamiID);
 
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: not in pool - use delist");
+    vm.expectRevert("LM: not in pool - use delist");
     market.withdrawKami(tokenIndex);
 
     _sendIn(alice, tokenIndex);
     _accept(bob, tokenIndex);
 
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: end lease first");
+    vm.expectRevert("LM: end lease first");
     market.withdrawKami(tokenIndex);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LeaseMkt: not owner");
+    vm.expectRevert("LM: not owner");
     market.withdrawKami(tokenIndex);
   }
 
@@ -403,7 +403,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.settle();
 
     _marketHarvest(kamiID, 50_000);
-    vm.expectRevert("LeaseMkt: cooldown");
+    vm.expectRevert("LM: cooldown");
     market.settle();
 
     _fastForward(6 hours + 1);
@@ -513,7 +513,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     // now cancelReturn MUST revert — re-opening would be a phantom lease
     vm.prank(alice.owner);
-    vm.expectRevert("LeaseMkt: already sent home - use clearReturned");
+    vm.expectRevert("LM: already sent home - use clearReturned");
     market.cancelReturn(idx);
 
     // the correct path clears the listing
@@ -523,34 +523,6 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
   /////////////////
   // AUDIT FIX 3: settleBounded — pool-size can never lock funds
-
-  function testSettleBoundedIsBatchedAndExact() public {
-    PlayerAccount memory d = _getPlayerAccount(3);
-    uint32 a = _listPool(alice, _mintKami(alice));
-    uint32 b = _listPool(alice, _mintKami(alice));
-    _accept(bob, a);
-    _acceptAs(d.owner, b);
-    _marketHarvest(LibKami.getByIndex(components, a), 100_000);
-    _marketHarvest(LibKami.getByIndex(components, b), 100_000);
-
-    uint256 bobShare = _renterNet(market.pendingXpDelta(a)) - TRANSFER_FEE;
-    uint256 dShare = _renterNet(market.pendingXpDelta(b)) - TRANSFER_FEE;
-    uint256 bBefore = _accountMusu(bob);
-    uint256 dBefore = _accountMusu(d);
-
-    // one entry per call: exactly one lease is paid this batch
-    market.settleBounded(1);
-    assertTrue(
-      (_accountMusu(bob) > bBefore) != (_accountMusu(d) > dBefore),
-      "exactly one lease paid in a size-1 batch"
-    );
-
-    // the next batch (after cooldown) covers the other — both exact
-    _fastForward(6 hours + 1);
-    market.settleBounded(1);
-    assertEq(_accountMusu(bob) - bBefore, bobShare, "bob exact across batches");
-    assertEq(_accountMusu(d) - dBefore, dShare, "dana exact across batches");
-  }
 
   /////////////////
   // AUDIT R2: terminal-return carries are settleable by ANYONE (KLM-03)
