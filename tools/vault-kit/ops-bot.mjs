@@ -124,23 +124,62 @@ async function wire() {
   marketAccID = await market.accID();
   for (const pod of pods.values()) {
     pod.accID = await pod.contract.accID();
-    // AUTO_REGISTER=1 (opt-in): the operator of this bot authorizes Kamibots
-    // registration for any pod that lacks one — same flow as register-pods.sh
-    if (!pod.creds && process.env.AUTO_REGISTER === "1") {
-      try {
-        console.log(`auto-registering pod ${pod.node} on Kamibots…`);
-        execSync(`bash ./register-pods.sh ${pod.node}`, {
-          cwd: dirname(fileURLToPath(import.meta.url)),
-          stdio: "inherit",
-        });
-        pod.creds = loadJson(`./kamibots-credentials-pod${pod.node}.json`);
-      } catch (e) {
-        console.error(`auto-register pod ${pod.node} failed: ${e.message?.slice(0, 160)}`);
-      }
-    }
+    await ensureRegistered(pod);
     console.log(`pod node ${pod.node} (${pod.label}) acc ${pod.accID} kamibots:${pod.creds ? "✓" : "✗ NOT REGISTERED"}`);
   }
   console.log(`wired. hub acc ${marketAccID}, ${pods.size} pods`);
+}
+
+// AUTO_REGISTER=1: standing authorization to register creds-missing pods on
+// Kamibots (same flow as register-pods.sh). retries with a 10-min backoff.
+const regAttemptAt = new Map();
+async function ensureRegistered(pod) {
+  if (pod.creds) return;
+  pod.creds = loadJson(`./kamibots-credentials-pod${pod.node}.json`); // picked up externally?
+  if (pod.creds || process.env.AUTO_REGISTER !== "1") return;
+  const last = regAttemptAt.get(pod.node) || 0;
+  if (Date.now() - last < 600_000) return;
+  regAttemptAt.set(pod.node, Date.now());
+  try {
+    console.log(`🤝 auto-registering pod ${pod.node} on Kamibots…`);
+    execSync(`bash ./register-pods.sh ${pod.node}`, {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      stdio: "inherit",
+    });
+    pod.creds = loadJson(`./kamibots-credentials-pod${pod.node}.json`);
+    if (pod.creds) console.log(`✅ pod ${pod.node} registered on Kamibots`);
+  } catch (e) {
+    console.error(`auto-register pod ${pod.node} failed: ${e.message?.slice(0, 160)}`);
+  }
+}
+
+// pods.json is the source of truth — add-pod.sh appends to it, and the bot
+// hot-loads new pods every tick. fully self-sustaining: no restarts needed.
+async function refreshPods() {
+  const f = loadJson("./pods.json");
+  if (!f?.pods) return;
+  for (const p of f.pods) {
+    const n = Number(p.node);
+    if (!pods.has(n)) {
+      const pod = {
+        node: n,
+        label: p.label,
+        address: p.address,
+        contract: new Contract(p.address, POD_ABI, provider),
+        wallet: new Wallet(p.operatorKey, provider),
+        accID: null,
+        creds: loadJson(`./kamibots-credentials-pod${n}.json`),
+      };
+      try {
+        pod.accID = await pod.contract.accID();
+      } catch {
+        continue; // not deployed yet; retry next tick
+      }
+      pods.set(n, pod);
+      console.log(`🆕 pod node ${n} (${pod.label}) hot-loaded, acc ${pod.accID}`);
+    }
+    await ensureRegistered(pods.get(n));
+  }
 }
 
 const podByAccID = (acc) => [...pods.values()].find((p) => p.accID === acc) || null;
@@ -164,6 +203,10 @@ const RISK = {
   balanced: { useHpBasedRest: true, hpThresholdLow: 30, hpThresholdHigh: 80 },
   aggressive: { useHpBasedRest: true, hpThresholdLow: 15, hpThresholdHigh: 60 },
 };
+
+// a running strategy is identified by node AND risk — a style change on the
+// same tile must restart the strategy with the new config
+const stratSig = (node, risk) => `${node}:${risk}`;
 
 function parsePrefs(idx) {
   let risk = "balanced";
@@ -196,7 +239,7 @@ async function startStrategy(pod, tokenIndex, risk) {
         keyData: { privy_id: pod.creds.privyId },
       },
     });
-    state.strategies[tokenIndex] = pod.node;
+    state.strategies[tokenIndex] = stratSig(pod.node, risk);
     console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}) via ${pod.label}`);
   } catch (e) {
     console.error(`strategy start failed #${tokenIndex} on pod ${pod.node}: ${e.message}`);
@@ -204,8 +247,9 @@ async function startStrategy(pod, tokenIndex, risk) {
 }
 
 async function stopStrategy(tokenIndex) {
-  const node = state.strategies[tokenIndex];
-  if (node === undefined) return;
+  const sig = state.strategies[tokenIndex];
+  if (sig === undefined) return;
+  const node = Number(String(sig).split(":")[0]);
   const pod = pods.get(Number(node));
   if (pod?.creds) {
     try {
@@ -234,8 +278,8 @@ async function reconcile(idx, l) {
   const desiredAcc = leased ? targetPod.accID : marketAccID;
 
   if (actualAcc === desiredAcc) {
-    if (leased && state.strategies[idx] !== targetPod.node) {
-      // arrived at the right tile: strategy should be running there
+    // right tile: the renter's exact strategy (node AND risk) should be running
+    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk)) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
       await startStrategy(targetPod, idx, risk);
     }
@@ -340,6 +384,7 @@ async function theftCheck() {
 
 // ---- main loop --------------------------------------------------------------
 async function tick() {
+  await refreshPods(); // hot-load pods added by add-pod.sh; auto-register if enabled
   const head = await provider.getBlockNumber();
   const from = state.lastBlock ? state.lastBlock + 1 : Math.max(0, head - 5_000);
 
