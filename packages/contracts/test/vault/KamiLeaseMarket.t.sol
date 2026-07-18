@@ -205,14 +205,13 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     _marketHarvest(kamiID, 100_000);
 
-    uint256 bal = market.musuBalance();
-    // n=1 listing, m=0 carries -> feeBudget = (2*1+1)*fee
-    uint256 feeBudget = 3 * TRANSFER_FEE;
-    uint256 distributable = bal - feeBudget;
-    uint256 mgmtCut = (distributable * MGMT_BPS) / 10000;
-    uint256 pool = distributable - mgmtCut; // single kami: earns the whole pool
-    uint256 ownerCut = (pool * OWNER_BPS) / 10000;
-    uint256 renterCut = pool - ownerCut;
+    // PER-LEASE EXACT POOL: this kami's pool == its XP delta, nothing shared
+    uint256 gross = market.pendingXpDelta(tokenIndex);
+    assertTrue(gross >= 100_000, "delta should cover injected bounty");
+    uint256 mgmtCut = (gross * MGMT_BPS) / 10000;
+    uint256 net = gross - mgmtCut;
+    uint256 ownerCut = (net * OWNER_BPS) / 10000;
+    uint256 renterCut = net - ownerCut;
 
     uint256 aBefore = _accountMusu(alice);
     uint256 bBefore = _accountMusu(bob);
@@ -220,9 +219,10 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     market.settle();
 
-    assertEq(_accountMusu(alice) - aBefore, ownerCut, "owner share");
-    assertEq(_accountMusu(bob) - bBefore, renterCut, "renter share");
-    assertEq(_accountMusu(charlie) - cBefore, mgmtCut, "platform fee");
+    // each payout carries its own in-world transfer fee
+    assertEq(_accountMusu(alice) - aBefore, ownerCut - TRANSFER_FEE, "owner share");
+    assertEq(_accountMusu(bob) - bBefore, renterCut - TRANSFER_FEE, "renter share");
+    assertEq(_accountMusu(charlie) - cBefore, mgmtCut - TRANSFER_FEE, "platform fee");
   }
 
   function testUnleasedEarningsGoToOwner() public {
@@ -230,17 +230,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _listToMarket(alice, kamiID);
     // no renter — platform farms it anyway
     _marketHarvest(kamiID, 50_000);
-    assertTrue(market.pendingXpDelta(tokenIndex) > 0, "no attribution");
 
-    uint256 bal = market.musuBalance();
-    uint256 feeBudget = 3 * TRANSFER_FEE;
-    uint256 distributable = bal - feeBudget;
-    uint256 mgmtCut = (distributable * MGMT_BPS) / 10000;
-    uint256 pool = distributable - mgmtCut;
+    uint256 gross = market.pendingXpDelta(tokenIndex);
+    assertTrue(gross > 0, "no attribution");
+    uint256 net = gross - (gross * MGMT_BPS) / 10000;
 
     uint256 aBefore = _accountMusu(alice);
     market.settle();
-    assertEq(_accountMusu(alice) - aBefore, pool, "owner should keep all post-fee");
+    assertEq(_accountMusu(alice) - aBefore, net - TRANSFER_FEE, "owner should keep all post-fee");
   }
 
   function testPreLeaseEarningsStayWithOwner() public {
@@ -251,22 +248,16 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, tokenIndex); // acceptLease carries pending delta at owner-only terms
     _marketHarvest(kamiID, 50_000); // earned DURING the lease
 
-    uint256 bal = market.musuBalance();
-    // n=1 listing + m=1 carry -> feeBudget = (2*2+1)*fee
-    uint256 feeBudget = 5 * TRANSFER_FEE;
-    uint256 distributable = bal - feeBudget;
-    uint256 mgmtCut = (distributable * MGMT_BPS) / 10000;
-    uint256 pool = distributable - mgmtCut;
-
-    // read attribution: live entry (leased) + carry (owner-only)
+    // exact pools: live entry (leased split) + carry (owner-only), independent
     uint256 liveDelta = market.pendingXpDelta(tokenIndex);
     (, , , uint256 carryDelta_) = market.carries(0);
-    uint256 total = liveDelta + carryDelta_;
 
-    uint256 liveEarn = (pool * liveDelta) / total;
-    uint256 carryEarn = (pool * carryDelta_) / total;
-    uint256 ownerExpected = carryEarn + (liveEarn * OWNER_BPS) / 10000;
-    uint256 renterExpected = liveEarn - (liveEarn * OWNER_BPS) / 10000;
+    uint256 liveNet = liveDelta - (liveDelta * MGMT_BPS) / 10000;
+    uint256 carryNet = carryDelta_ - (carryDelta_ * MGMT_BPS) / 10000;
+    uint256 liveOwnerCut = (liveNet * OWNER_BPS) / 10000;
+    // alice is paid twice (carry + live owner cut) -> two transfer fees
+    uint256 ownerExpected = (carryNet - TRANSFER_FEE) + (liveOwnerCut - TRANSFER_FEE);
+    uint256 renterExpected = (liveNet - liveOwnerCut) - TRANSFER_FEE;
 
     uint256 aBefore = _accountMusu(alice);
     uint256 bBefore = _accountMusu(bob);
@@ -287,16 +278,13 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.prank(bob.owner);
     market.endLease(tokenIndex); // carries the delta AT LEASE TERMS
 
-    uint256 bal = market.musuBalance();
-    uint256 feeBudget = (2 * 2 + 1) * TRANSFER_FEE; // 1 listing + 1 carry
-    uint256 distributable = bal - feeBudget;
-    uint256 mgmtCut = (distributable * MGMT_BPS) / 10000;
-    uint256 pool = distributable - mgmtCut;
-    uint256 ownerCut = (pool * OWNER_BPS) / 10000;
+    (, , , uint256 carryDelta_) = market.carries(0);
+    uint256 net = carryDelta_ - (carryDelta_ * MGMT_BPS) / 10000;
+    uint256 ownerCut = (net * OWNER_BPS) / 10000;
 
     uint256 bBefore = _accountMusu(bob);
     market.settle();
-    assertEq(_accountMusu(bob) - bBefore, pool - ownerCut, "renter share after end");
+    assertEq(_accountMusu(bob) - bBefore, (net - ownerCut) - TRANSFER_FEE, "renter share after end");
   }
 
   /////////////////
@@ -333,12 +321,12 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, tokenIndex);
     _marketHarvest(kamiID, 100_000);
 
-    uint256 bal = market.musuBalance();
-    uint256 feeBudget = 3 * TRANSFER_FEE;
-    uint256 pool = ((bal - feeBudget) * (10000 - MGMT_BPS)) / 10000;
+    uint256 gross = market.pendingXpDelta(tokenIndex);
+    uint256 net = gross - (gross * MGMT_BPS) / 10000;
+    uint256 renterAmt = net - (net * OWNER_BPS) / 10000;
     uint256 bBefore = _accountMusu(bob);
     market.settle();
-    assertEq(_accountMusu(bob) - bBefore, pool - (pool * OWNER_BPS) / 10000, "renter share");
+    assertEq(_accountMusu(bob) - bBefore, renterAmt - TRANSFER_FEE, "renter share");
 
     // withdraw: same trustless 721-bridge exit, only to alice
     vm.prank(bob.owner);
@@ -393,6 +381,111 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.cancelPending(tokenIndex);
     (address pOwner, , ) = market.pendingSends(tokenIndex);
     assertEq(pOwner, address(0), "pending not cleared");
+  }
+
+  /// @dev THE per-rental-pool property: two leases are fully isolated — each pays
+  /// exactly its own kami's earnings regardless of what the other earned
+  function testPerLeasePoolsAreIsolated() public {
+    PlayerAccount memory dana = _getPlayerAccount(3); // NOT charlie — he's the mgmt account
+    uint256 aKami = _mintKami(alice);
+    uint256 dKami = _mintKami(alice); // alice owns both; bob and dana rent one each
+    uint32 aIdx = _listToMarket(alice, aKami);
+    uint32 dIdx = _listToMarket(alice, dKami);
+    _accept(bob, aIdx);
+    _accept(dana, dIdx);
+
+    _marketHarvest(aKami, 300_000); // bob's kami earns ~3x
+    _marketHarvest(dKami, 100_000);
+
+    uint256 aGross = market.pendingXpDelta(aIdx);
+    uint256 dGross = market.pendingXpDelta(dIdx);
+
+    uint256 aNet = aGross - (aGross * MGMT_BPS) / 10000;
+    uint256 dNet = dGross - (dGross * MGMT_BPS) / 10000;
+    uint256 bobExpected = (aNet - (aNet * OWNER_BPS) / 10000) - TRANSFER_FEE;
+    uint256 dExpected = (dNet - (dNet * OWNER_BPS) / 10000) - TRANSFER_FEE;
+
+    uint256 bBefore = _accountMusu(bob);
+    uint256 dBefore = _accountMusu(dana);
+    market.settle();
+
+    // exact — not pro-rata of a shared pot
+    assertEq(_accountMusu(bob) - bBefore, bobExpected, "bob's isolated pool");
+    assertEq(_accountMusu(dana) - dBefore, dExpected, "dana's isolated pool");
+  }
+
+  /// @dev platform fees accrue (never recycle) while mgmtAccID is unset
+  function testMgmtFeesAccrueWhenUnset() public {
+    KamiLeaseMarket m2 = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
+    address op2 = _getNextUserAddress();
+    m2.initialize(op2, "leasemkt2"); // mgmtAccID left unset
+
+    uint256 kamiID = _mintKami(alice);
+    _unstakeKami(kamiID);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+    vm.startPrank(alice.owner);
+    _Kami721.approve(address(m2), uint256(tokenIndex));
+    m2.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    vm.stopPrank();
+
+    uint256 m2Acc = m2.accID();
+    vm.prank(deployer);
+    _IndexRoomComponent.set(m2Acc, uint32(BRIDGE_721_ROOM));
+    uint32[] memory idxs = new uint32[](1);
+    idxs[0] = tokenIndex;
+    m2.stakeListings(idxs);
+    vm.prank(deployer);
+    _IndexRoomComponent.set(m2Acc, 1);
+
+    _fastForward(_idleRequirement);
+    vm.prank(op2);
+    bytes memory raw = _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
+    uint256 prodID = abi.decode(raw, (uint256));
+    _incHarvestBounty(prodID, 100_000);
+    _fastForward(_idleRequirement);
+    vm.prank(op2);
+    _HarvestStopSystem.executeTyped(prodID);
+
+    uint256 gross = m2.pendingXpDelta(tokenIndex);
+    uint256 expectedCut = (gross * MGMT_BPS) / 10000;
+
+    m2.settle();
+    assertEq(m2.mgmtAccrued(), expectedCut, "fee should accrue, not recycle");
+
+    // once the account is set, the next settle flushes it
+    m2.setMgmtAccount(charlie.id);
+    uint256 cBefore = _accountMusu(charlie);
+    _fastForward(7 hours); // clear the settle cooldown (template-tracked clock)
+    // trigger some earnings so settle runs
+    _fastForward(_idleRequirement);
+    vm.prank(op2);
+    raw = _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
+    prodID = abi.decode(raw, (uint256));
+    _incHarvestBounty(prodID, 10_000);
+    _fastForward(_idleRequirement);
+    vm.prank(op2);
+    _HarvestStopSystem.executeTyped(prodID);
+
+    m2.settle();
+    assertEq(m2.mgmtAccrued(), 0, "accrual should flush");
+    assertTrue(_accountMusu(charlie) > cBefore, "mgmt account paid");
+  }
+
+  function testCancelReturn() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listToMarket(alice, kamiID);
+
+    vm.prank(alice.owner);
+    market.requestReturn(tokenIndex);
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LeaseMkt: not owner");
+    market.cancelReturn(tokenIndex);
+
+    vm.prank(alice.owner);
+    market.cancelReturn(tokenIndex);
+
+    _accept(bob, tokenIndex); // leasable again
   }
 
   /////////////////

@@ -85,8 +85,8 @@ contract KamiLeaseMarket {
 
   uint256 public accID; // the market's game account
   uint16 public mgmtBps; // platform fee, lower-only
-  uint256 public reserveMusu; // MUSU held back at settle (ops: food, transfer fees)
   uint256 public mgmtAccID; // game account receiving the platform fee
+  uint256 public mgmtAccrued; // platform fees accrued, awaiting transfer to mgmtAccID
 
   mapping(uint32 => Listing) public listings; // by ERC721 token index
   uint32[] public tokenIndices;
@@ -183,10 +183,6 @@ contract KamiLeaseMarket {
     mgmtAccID = _mgmtAccID;
   }
 
-  function setReserve(uint256 _reserveMusu) external onlyAdmin {
-    reserveMusu = _reserveMusu;
-  }
-
   /// @notice settle spam guard, capped at 7 days so payouts can't be locked up
   function setSettleCooldown(uint64 secs) external onlyAdmin {
     require(secs <= 7 days, "LeaseMkt: cooldown too long");
@@ -243,6 +239,7 @@ contract KamiLeaseMarket {
     Listing storage l = listings[tokenIndex];
     require(l.owner == msg.sender, "LeaseMkt: not owner");
     require(l.renter == address(0), "LeaseMkt: leased");
+    require(!l.returning, "LeaseMkt: being returned");
     require(ownerShareBps <= 10000, "LeaseMkt: share > 100%");
     l.ownerShareBps = ownerShareBps;
     l.minGasWei = minGasWei;
@@ -363,6 +360,15 @@ contract KamiLeaseMarket {
     emit ReturnRequested(msg.sender, tokenIndex);
   }
 
+  /// @notice changed your mind (or the automation is down): re-open the listing
+  function cancelReturn(uint32 tokenIndex) external {
+    Listing storage l = listings[tokenIndex];
+    require(l.owner == msg.sender, "LeaseMkt: not owner");
+    require(l.returning, "LeaseMkt: not returning");
+    l.returning = false;
+    emit Listed(l.owner, tokenIndex, l.ownerShareBps, l.minGasWei);
+  }
+
   /// @notice finalize a send-back once the kami is verifiably in the OWNER's account.
   ///         callable by anyone; only clears if the kami actually went home.
   function clearReturned(uint32 tokenIndex) external nonReentrant {
@@ -398,6 +404,7 @@ contract KamiLeaseMarket {
     require(l.owner != msg.sender, "LeaseMkt: own kami");
     require(l.ownerShareBps == expectedOwnerShareBps, "LeaseMkt: terms changed");
     require(msg.value >= l.minGasWei, "LeaseMkt: gas budget too low");
+    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LeaseMkt: kami is dead");
 
     _carryPending(tokenIndex); // owner keeps everything earned before this lease
 
@@ -454,9 +461,12 @@ contract KamiLeaseMarket {
   ///////////////////
   // SETTLEMENT
 
-  /// @notice split accrued MUSU per-kami (XP delta), three ways.
-  ///         callable by PARTICIPANTS (any listing owner or active renter) or admin —
-  ///         so payouts can never be withheld, but randoms can't spam fee-burn it.
+  /// @notice PER-LEASE EXACT POOLS: each kami's XP delta IS its earned MUSU (XP
+  ///         increments 1:1 with collected harvest), so every lease is paid exactly
+  ///         what its own kami earned — nothing shared, nothing socialized. The
+  ///         platform fee and the in-world transfer fee come out of each payout.
+  ///         Callable by PARTICIPANTS (any listing owner or active renter) or admin —
+  ///         payouts can never be withheld, but randoms can't spam fee-burn it.
   function settle() external nonReentrant {
     require(accID != 0, "LeaseMkt: not initialized");
     require(
@@ -469,15 +479,14 @@ contract KamiLeaseMarket {
     );
     IUintComp comps = _comps();
 
+    // funds available for lease payouts (accrued platform fees stay reserved)
     uint256 bal = LibInventory.getBalanceOf(comps, accID, MUSU_INDEX);
+    uint256 payable_ = bal > mgmtAccrued ? bal - mgmtAccrued : 0;
+    if (payable_ == 0) return; // nothing to pay — leave all attribution untouched
+
+    // ---- pass 1: gather per-lease earnings (mutates baselines; consumes carries)
     uint256 n = tokenIndices.length;
     uint256 m = carries.length;
-    // worst case: 2 payees per kami + 2 per carry + platform fee transfer
-    uint256 feeBudget = (2 * (n + m) + 1) * TRANSFER_FEE;
-    if (bal <= reserveMusu + feeBudget) return;
-    uint256 distributable = bal - reserveMusu - feeBudget;
-
-    // ---- pass 1: gather attribution entries
     CarryEntry[] memory entries = new CarryEntry[](n + m);
     uint256 count;
     uint256 totalDelta;
@@ -500,39 +509,52 @@ contract KamiLeaseMarket {
 
     if (totalDelta == 0) return;
 
-    // ---- pass 2: split + transfer
-    uint256 mgmtCut = (distributable * mgmtBps) / 10000;
-    uint256 pool = distributable - mgmtCut;
-    uint256 paidOut;
+    // deltas should always be fully backed (inflow == sum of deltas); if the balance
+    // ever falls short, degrade pro-rata instead of reverting
+    bool scaled = totalDelta > payable_;
 
+    // ---- pass 2: pay each lease its own pool
+    uint256 mgmtAdd;
+    uint256 paidOut;
     for (uint256 i; i < count; i++) {
       CarryEntry memory e = entries[i];
-      uint256 earned = (pool * e.delta) / totalDelta;
-      if (earned == 0) continue;
+      uint256 gross = scaled ? (e.delta * payable_) / totalDelta : e.delta;
+      if (gross == 0) continue;
+
+      uint256 cut = (gross * mgmtBps) / 10000;
+      mgmtAdd += cut;
+      uint256 net = gross - cut;
 
       if (e.renter == address(0)) {
-        paidOut += _payout(e.owner, earned); // unleased: owner keeps it all
+        paidOut += _payout(e.owner, net); // unleased: owner keeps it all
       } else {
-        uint256 ownerCut = (earned * e.ownerShareBps) / 10000;
+        uint256 ownerCut = (net * e.ownerShareBps) / 10000;
         if (ownerCut > 0) paidOut += _payout(e.owner, ownerCut);
-        if (earned - ownerCut > 0) paidOut += _payout(e.renter, earned - ownerCut);
+        if (net - ownerCut > 0) paidOut += _payout(e.renter, net - ownerCut);
       }
     }
 
-    if (mgmtCut > 0 && mgmtAccID != 0) _transferMusu(mgmtAccID, mgmtCut);
+    // platform fees accrue and flush whenever a mgmt account is set — never recycled
+    mgmtAccrued += mgmtAdd;
+    if (mgmtAccID != 0 && mgmtAccrued > TRANSFER_FEE) {
+      uint256 acc = mgmtAccrued;
+      mgmtAccrued = 0;
+      _transferMusu(mgmtAccID, acc - TRANSFER_FEE); // in-world fee comes out of ours
+    }
 
     lastSettleAt = uint64(block.timestamp);
-    emit Settled(paidOut, mgmtCut, totalDelta);
+    emit Settled(paidOut, mgmtAdd, totalDelta);
   }
 
-  /// @notice claim MUSU held because the payee had no game account at settle time
+  /// @notice claim held MUSU (payee had no game account, or amount was below the
+  ///         transfer fee). the fee comes out of the claimed amount.
   function claimOwed() external nonReentrant {
     uint256 amount = owedMusu[msg.sender];
-    require(amount > 0, "LeaseMkt: nothing owed");
+    require(amount > TRANSFER_FEE, "LeaseMkt: nothing claimable");
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), "LeaseMkt: register an account first");
     owedMusu[msg.sender] = 0;
-    _transferMusu(target, amount);
+    _transferMusu(target, amount - TRANSFER_FEE);
     emit OwedClaimed(msg.sender, amount);
   }
 
@@ -578,10 +600,13 @@ contract KamiLeaseMarket {
     if (delta > 0) carries.push(CarryEntry(l.owner, l.renter, l.ownerShareBps, delta));
   }
 
+  /// @dev pay a lease participant; the in-world transfer fee comes out of their
+  ///      amount (their pool pays their costs — nothing is ever socialized).
+  ///      amounts too small to cover the fee are held until they grow (owedMusu).
   function _payout(address to, uint256 amount) internal returns (uint256) {
     uint256 target = uint256(uint160(to));
-    if (_isAccount(target)) {
-      _transferMusu(target, amount);
+    if (amount > TRANSFER_FEE && _isAccount(target)) {
+      _transferMusu(target, amount - TRANSFER_FEE);
       emit Payout(to, amount, false);
     } else {
       owedMusu[to] += amount;
