@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # FULL STACK REDEPLOY -> hub v9 (one-tx NFT listing) + pods + guard + registries.
-# Run AFTER funding the deployer (needs ~0.0001 ETH; check with cast balance).
+# Run AFTER funding the deployer (needs ~0.0002 ETH; check with cast balance).
 #
-# Preserves every Kamibots registration: each new account re-uses the SAME
-# operator key (old accounts get parked operators first). Walks the hub to the
-# bridge room and pods 2/3 to their tiles. Rewrites pods.json + env files.
+# SECURITY: mints FRESH pod operator keys (the previous keys leaked into git
+# history and must never be reused), funds them, and drops stale Kamibots creds
+# so the pods re-register on the new operators. The hub operator (in .env, never
+# tracked) is reused so the hub's Kamibots registration stays valid. Walks the
+# hub to the bridge room and pods 2/3 to their tiles. Rewrites pods.json + env.
 # The dApp needs NEXT_PUBLIC_* updates printed at the end + a server restart.
 set -e
 cd "$(dirname "$0")"
@@ -19,7 +21,8 @@ NAME_SUFFIX="${NAME_SUFFIX:-9}"
 
 BAL=$($CAST balance $($CAST wallet address --private-key "$DEPLOYER_KEY") --rpc-url "$YOMINET_RPC")
 echo "deployer balance: $BAL wei"
-[ "$BAL" -lt 60000000000000 ] && { echo "ABORT: fund the deployer first (~0.0001 ETH)"; exit 1; }
+# hub+pods+self deploys + 3 fresh-operator funding (45e12) + account walks
+[ "$BAL" -lt 130000000000000 ] && { echo "ABORT: fund the deployer first (~0.0002 ETH)"; exit 1; }
 
 park() { # park an account's operator so its key can be reused on the new account
   $CAST send "$1" 'rotateOperator(address)' \
@@ -42,11 +45,15 @@ WORLD_ADDR=$WORLD MARKET_OPERATOR=$OP MARKET_NAME=leasetest${NAME_SUFFIX} MGMT_B
 HUB=$(grep 'KamiLeaseMarket:' /tmp/hub9.out | awk '{print $2}')
 [ -n "$HUB" ] || { echo "hub deploy failed"; exit 1; }
 
-echo "=== deploy bot pods + registry (same operators -> kamibots regs stay valid) ==="
+echo "=== mint FRESH pod operators (the old keys leaked into git — never reuse) ==="
 cd ~/kamigotchi/tools/vault-kit
-P1OP=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("pods.json")).pods.find(p=>p.node==1).operator)')
-P2OP=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("pods.json")).pods.find(p=>p.node==2).operator)')
-P3OP=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("pods.json")).pods.find(p=>p.node==3).operator)')
+gen_key() { $CAST wallet new --json; }
+for i in 1 2 3; do
+  J=$(gen_key)
+  eval "P${i}OP=$(echo "$J" | grep -o '\"address\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
+  eval "P${i}KEY=$(echo "$J" | grep -o '\"private_key\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
+done
+echo "fresh pod operators: $P1OP $P2OP $P3OP"
 cd ~/kamigotchi/packages/contracts
 WORLD_ADDR=$WORLD HUB_ADDR=$HUB POD_COUNT=3 \
 POD1_NODE=1 POD1_LABEL='Misty Riverside (EERIE)' POD1_OPERATOR=$P1OP POD1_NAME=leasepod1${NAME_SUFFIX} \
@@ -75,21 +82,38 @@ $CAST send "$SREG" 'addPod(address)' "$SPOD" --rpc-url "$YOMINET_RPC" --private-
 
 echo "=== rewrite pods.json ==="
 cd ~/kamigotchi/tools/vault-kit
+# write the FRESH operator keys into pods.json (gitignored) and drop stale
+# Kamibots creds so register-pods.sh re-registers the new operators
+rm -f kamibots-credentials-pod1.json kamibots-credentials-pod2.json kamibots-credentials-pod3.json
 HUB=$HUB REG=$REG SREG=$SREG GUARD=$GUARD SPOD=$SPOD NS=$NAME_SUFFIX \
-P0=${PODS[0]} P1=${PODS[1]} P2=${PODS[2]} node -e '
+P0=${PODS[0]} P1=${PODS[1]} P2=${PODS[2]} \
+P1OP=$P1OP P1KEY=$P1KEY P2OP=$P2OP P2KEY=$P2KEY P3OP=$P3OP P3KEY=$P3KEY node -e '
 const fs = require("fs");
-const f = JSON.parse(fs.readFileSync("pods.json"));
 const e = process.env;
-f.hub = e.HUB; f.registry = e.REG; f.selfRegistry = e.SREG;
 const addrs = [e.P0, e.P1, e.P2];
-f.pods.forEach((p, i) => { p.address = addrs[i]; p.name = `leasepod${p.node}${e.NS}`; });
-f.selfPods = [{ node: 1, name: `selfpod1${e.NS}`, label: "Misty Riverside (EERIE)",
-  address: e.SPOD, guard: e.GUARD }];
+const ops = [[e.P1OP, e.P1KEY], [e.P2OP, e.P2KEY], [e.P3OP, e.P3KEY]];
+const labels = ["Misty Riverside (EERIE)", "Tunnel of Trees (NORMAL)", "Torii Gate (NORMAL)"];
+const f = {
+  hub: e.HUB, registry: e.REG, selfRegistry: e.SREG,
+  pods: [1, 2, 3].map((node, i) => ({
+    node, name: `leasepod${node}${e.NS}`, label: labels[i],
+    address: addrs[i], operator: ops[i][0], operatorKey: ops[i][1],
+  })),
+  selfPods: [{ node: 1, name: `selfpod1${e.NS}`, label: "Misty Riverside (EERIE)",
+    address: e.SPOD, guard: e.GUARD }],
+};
 fs.writeFileSync("pods.json", JSON.stringify(f, null, 2));
-console.log("pods.json rewritten");
+console.log("pods.json rewritten with FRESH operator keys");
 '
+chmod 600 pods.json
 sed -i "s/^MARKET_ADDRESS=.*/MARKET_ADDRESS=$HUB/" .env
 sed -i "s/^REGISTRY_ADDRESS=.*/REGISTRY_ADDRESS=$REG/" .env
+
+echo "=== fund the fresh pod operators (walk + farm gas) ==="
+for A in "$P1OP" "$P2OP" "$P3OP"; do
+  $CAST send "$A" --value 15000000000000 --rpc-url "$YOMINET_RPC" --private-key "$DEPLOYER_KEY" --legacy >/dev/null
+  echo "funded $A: $($CAST balance "$A" --rpc-url "$YOMINET_RPC") wei"
+done
 
 echo "=== walk accounts into position ==="
 HUBACC=$($CAST call "$HUB" 'accID()(uint256)' --rpc-url "$YOMINET_RPC" | awk '{print $1}')

@@ -446,6 +446,113 @@ contract KamiLeaseMarketTest is SetupTemplate {
     return _getPlayerAccount(3);
   }
 
+  /// @dev accept a lease from an ARBITRARY address (e.g. one with no game account)
+  function _acceptAs(address renter, uint32 tokenIndex) internal {
+    vm.deal(renter, 1 ether);
+    vm.prank(renter);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+  }
+
+  /// @dev the renter's pre-transfer-fee share of a kami's gross earnings
+  function _renterNet(uint256 gross) internal pure returns (uint256) {
+    uint256 net = gross - (gross * MGMT_BPS) / 10000;
+    return net - (net * OWNER_BPS) / 10000;
+  }
+
+  /////////////////
+  // AUDIT FIX 1: held payouts (owedMusu) are RESERVED, never re-promised
+
+  function testOwedMusuReservedAcrossSettles() public {
+    address ghost = _getNextUserAddress(); // no game account -> its share is held
+    uint32 a = _listPool(alice, _mintKami(alice));
+    _acceptAs(ghost, a);
+    _marketHarvest(LibKami.getByIndex(components, a), 100_000);
+    uint256 ghostShare = _renterNet(market.pendingXpDelta(a));
+
+    market.settle();
+    assertEq(market.owedMusu(ghost), ghostShare, "ghost share held");
+    assertEq(market.owedMusuTotal(), ghostShare, "reserved total tracks it");
+    assertGe(market.musuBalance(), market.owedMusuTotal(), "reserve physically backed");
+
+    // a second kami with a registered renter, its own harvest + settle: the held
+    // reserve must neither inflate nor deflate the new payout, and must survive
+    uint32 b = _listPool(alice, _mintKami(alice));
+    _acceptAs(bob.owner, b);
+    _marketHarvest(LibKami.getByIndex(components, b), 100_000);
+    _fastForward(6 hours + 1);
+
+    uint256 bobShare = _renterNet(market.pendingXpDelta(b)) - TRANSFER_FEE;
+    uint256 bBefore = _accountMusu(bob);
+    market.settle();
+    assertEq(_accountMusu(bob) - bBefore, bobShare, "bob paid exactly his own");
+    assertEq(market.owedMusu(ghost), ghostShare, "ghost reserve untouched by later settle");
+    assertGe(market.musuBalance(), market.owedMusuTotal(), "reserve still backed");
+  }
+
+  /////////////////
+  // AUDIT FIX 2: cancelReturn cannot re-open a listing after the kami went home
+
+  function testCancelReturnBlockedAfterSentHome() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 idx = _listPool(alice, kamiID);
+
+    // while still pooled, cancelReturn re-opens normally
+    vm.prank(alice.owner);
+    market.requestReturn(idx);
+    vm.prank(alice.owner);
+    market.cancelReturn(idx);
+    (, , , , , , bool returning, , ) = market.listings(idx);
+    assertFalse(returning, "reopened while still in the pool");
+
+    // request again, then the automation actually sends it home
+    vm.prank(alice.owner);
+    market.requestReturn(idx);
+    _fastForward(_idleRequirement);
+    vm.prank(marketOperator);
+    _KamiSendSystem.executeTyped(idx, alice.operator);
+    assertEq(LibKami.getAccount(components, kamiID), alice.id, "kami home");
+
+    // now cancelReturn MUST revert — re-opening would be a phantom lease
+    vm.prank(alice.owner);
+    vm.expectRevert("LeaseMkt: already sent home - use clearReturned");
+    market.cancelReturn(idx);
+
+    // the correct path clears the listing
+    market.clearReturned(idx);
+    assertEq(market.numListings(), 0, "listing cleared, no phantom");
+  }
+
+  /////////////////
+  // AUDIT FIX 3: settleBounded — pool-size can never lock funds
+
+  function testSettleBoundedIsBatchedAndExact() public {
+    PlayerAccount memory d = _getPlayerAccount(3);
+    uint32 a = _listPool(alice, _mintKami(alice));
+    uint32 b = _listPool(alice, _mintKami(alice));
+    _accept(bob, a);
+    _acceptAs(d.owner, b);
+    _marketHarvest(LibKami.getByIndex(components, a), 100_000);
+    _marketHarvest(LibKami.getByIndex(components, b), 100_000);
+
+    uint256 bobShare = _renterNet(market.pendingXpDelta(a)) - TRANSFER_FEE;
+    uint256 dShare = _renterNet(market.pendingXpDelta(b)) - TRANSFER_FEE;
+    uint256 bBefore = _accountMusu(bob);
+    uint256 dBefore = _accountMusu(d);
+
+    // one entry per call: exactly one lease is paid this batch
+    market.settleBounded(1);
+    assertTrue(
+      (_accountMusu(bob) > bBefore) != (_accountMusu(d) > dBefore),
+      "exactly one lease paid in a size-1 batch"
+    );
+
+    // the next batch (after cooldown) covers the other — both exact
+    _fastForward(6 hours + 1);
+    market.settleBounded(1);
+    assertEq(_accountMusu(bob) - bBefore, bobShare, "bob exact across batches");
+    assertEq(_accountMusu(d) - dBefore, dShare, "dana exact across batches");
+  }
+
   /////////////////
   // ONE-TX 721 LISTING (market account lives in the bridge room, like live)
 

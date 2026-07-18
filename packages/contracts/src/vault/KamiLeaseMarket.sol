@@ -88,11 +88,13 @@ contract KamiLeaseMarket {
 
   CarryEntry[] public carries;
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
+  uint256 public owedMusuTotal; // sum of owedMusu: RESERVED, never re-distributed
   mapping(address => uint256) public owedEth; // gas refunds that failed to send (pull)
   mapping(address => uint256) public participations; // active listings + leases per address
 
   uint64 public lastSettleAt;
   uint64 public settleCooldown = 6 hours; // spam guard; admin-tunable, capped
+  uint256 public settleCursor; // round-robin start for settleBounded (large pools)
 
   uint256 private locked = 1;
 
@@ -338,11 +340,19 @@ contract KamiLeaseMarket {
     emit ReturnRequested(msg.sender, tokenIndex);
   }
 
-  /// @notice changed your mind (or the automation is down): re-open the listing
+  /// @notice changed your mind (or the automation is down): re-open the listing.
+  ///         ONLY valid while the kami is still in the pool — if the automation
+  ///         already sent it home, the listing must be cleared (clearReturned),
+  ///         never re-opened as rentable while the owner controls the kami
+  ///         (that would be a phantom lease over an asset that isn't in custody).
   function cancelReturn(uint32 tokenIndex) external {
     Listing storage l = listings[tokenIndex];
     require(l.owner == msg.sender, "LeaseMkt: not owner");
     require(l.returning, "LeaseMkt: not returning");
+    require(
+      LibKami.getAccount(_comps(), l.kamiID) == accID,
+      "LeaseMkt: already sent home - use clearReturned"
+    );
     l.returning = false;
     emit Listed(l.owner, tokenIndex, l.ownerShareBps, l.minGasWei);
   }
@@ -460,9 +470,14 @@ contract KamiLeaseMarket {
     );
     IUintComp comps = _comps();
 
-    // funds available for lease payouts (accrued platform fees stay reserved)
+    // funds available for lease payouts. BOTH the accrued platform fee AND the
+    // already-promised held payouts (owedMusu) stay reserved — the held MUSU is
+    // still physically in this account, so without reserving it a later settle
+    // would count it as available and promise the same inventory twice.
     uint256 bal = LibInventory.getBalanceOf(comps, accID, MUSU_INDEX);
-    uint256 payable_ = bal > mgmtAccrued ? bal - mgmtAccrued : 0;
+    uint256 payable_ = bal > mgmtAccrued + owedMusuTotal
+      ? bal - mgmtAccrued - owedMusuTotal
+      : 0;
     if (payable_ == 0) return; // nothing to pay — leave all attribution untouched
 
     // ---- pass 1: gather per-lease earnings (mutates baselines; consumes carries)
@@ -497,25 +512,11 @@ contract KamiLeaseMarket {
     uint256 shortfall = totalDelta > payable_ ? totalDelta - payable_ : 0;
     bool scaled = shortfall > 0 && shortfall + count > (totalDelta * mgmtBps) / 10000;
 
-    // ---- pass 2: pay each lease its own pool
+    // ---- pass 2: pay each lease its own pool (via _payEntry to bound stack)
     uint256 mgmtAdd;
-    uint256 paidOut;
     for (uint256 i; i < count; i++) {
-      CarryEntry memory e = entries[i];
-      uint256 gross = scaled ? (e.delta * payable_) / totalDelta : e.delta;
-      if (gross == 0) continue;
-
-      uint256 cut = (gross * mgmtBps) / 10000;
-      mgmtAdd += cut;
-      uint256 net = gross - cut;
-
-      if (e.renter == address(0)) {
-        paidOut += _payout(e.owner, net); // unleased: owner keeps it all
-      } else {
-        uint256 ownerCut = (net * e.ownerShareBps) / 10000;
-        if (ownerCut > 0) paidOut += _payout(e.owner, ownerCut);
-        if (net - ownerCut > 0) paidOut += _payout(e.renter, net - ownerCut);
-      }
+      uint256 gross = scaled ? (entries[i].delta * payable_) / totalDelta : entries[i].delta;
+      if (gross > 0) mgmtAdd += _payEntry(entries[i], gross);
     }
 
     // the platform's cut pays the pods' sweep fees (see shortfall above)
@@ -530,7 +531,113 @@ contract KamiLeaseMarket {
     }
 
     lastSettleAt = uint64(block.timestamp);
-    emit Settled(paidOut, mgmtAdd, totalDelta);
+    emit Settled(totalDelta > mgmtAdd ? totalDelta - mgmtAdd : 0, mgmtAdd, totalDelta);
+  }
+
+  /// @notice BOUNDED settle for pools too large to settle in one transaction.
+  ///         Drains up to `maxEntries` accounting entries — carries first, then
+  ///         listings from a round-robin cursor — so gas stays O(maxEntries)
+  ///         instead of O(all listings). Each entry is still paid its EXACT own
+  ///         earnings (per-lease pools, no socialization); if this batch's
+  ///         balance is short it degrades pro-rata within the batch. Call
+  ///         repeatedly (respecting the cooldown) until numCarries()==0 and the
+  ///         cursor has covered the pool. Funds can never be locked by pool size.
+  function settleBounded(uint256 maxEntries) external nonReentrant {
+    require(accID != 0, "LeaseMkt: not initialized");
+    require(
+      msg.sender == admin || participations[msg.sender] > 0,
+      "LeaseMkt: not a participant"
+    );
+    require(
+      lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
+      "LeaseMkt: cooldown"
+    );
+    require(maxEntries > 0, "LeaseMkt: maxEntries=0");
+    IUintComp comps = _comps();
+
+    uint256 avail;
+    {
+      uint256 bal = LibInventory.getBalanceOf(comps, accID, MUSU_INDEX);
+      uint256 reserved = mgmtAccrued + owedMusuTotal;
+      avail = bal > reserved ? bal - reserved : 0;
+    }
+    if (avail == 0) return;
+
+    (CarryEntry[] memory entries, uint256 count, uint256 totalDelta) = _gatherBounded(maxEntries);
+    if (totalDelta == 0) {
+      lastSettleAt = uint64(block.timestamp);
+      return;
+    }
+
+    bool scaled = totalDelta > avail; // batch-local degradation if short
+    uint256 mgmtAdd;
+    for (uint256 i; i < count; i++) {
+      uint256 gross = scaled ? (entries[i].delta * avail) / totalDelta : entries[i].delta;
+      if (gross > 0) mgmtAdd += _payEntry(entries[i], gross);
+    }
+
+    // flush platform fees only when the balance covers it (bounded settle can
+    // leave the account tight); otherwise they stay accrued for the next flush
+    mgmtAccrued += mgmtAdd;
+    if (mgmtAccID != 0 && mgmtAccrued > TRANSFER_FEE) {
+      if (LibInventory.getBalanceOf(comps, accID, MUSU_INDEX) >= mgmtAccrued) {
+        uint256 acc = mgmtAccrued;
+        mgmtAccrued = 0;
+        _transferMusu(mgmtAccID, acc - TRANSFER_FEE);
+      }
+    }
+
+    lastSettleAt = uint64(block.timestamp);
+    emit Settled(totalDelta > mgmtAdd ? totalDelta - mgmtAdd : 0, mgmtAdd, totalDelta);
+  }
+
+  /// @dev gather a bounded batch of settlement entries: all drained carries
+  ///      first, then listings from a round-robin cursor. mutates baselines,
+  ///      consumes carries, and advances the cursor. split out to bound stack.
+  function _gatherBounded(
+    uint256 maxEntries
+  ) internal returns (CarryEntry[] memory entries, uint256 count, uint256 totalDelta) {
+    IUintComp comps = _comps();
+    entries = new CarryEntry[](maxEntries);
+
+    while (count < maxEntries && carries.length > 0) {
+      entries[count] = carries[carries.length - 1];
+      totalDelta += entries[count].delta;
+      count++;
+      carries.pop();
+    }
+
+    uint256 n = tokenIndices.length;
+    if (n > 0 && count < maxEntries) {
+      uint256 start = settleCursor % n;
+      uint256 steps = maxEntries - count;
+      if (steps > n) steps = n;
+      for (uint256 k; k < steps; k++) {
+        Listing storage l = listings[tokenIndices[(start + k) % n]];
+        if (!l.staked) continue;
+        uint256 xp = LibExperience.get(comps, l.kamiID);
+        uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
+        l.xpBase = xp;
+        if (delta == 0) continue;
+        entries[count++] = CarryEntry(l.owner, l.renter, l.ownerShareBps, delta);
+        totalDelta += delta;
+      }
+      settleCursor = (start + steps) % n;
+    }
+  }
+
+  /// @dev pay one entry's `gross` three ways (platform / owner / renter) and
+  ///      return the platform cut. shared by settleBounded to bound stack depth.
+  function _payEntry(CarryEntry memory e, uint256 gross) internal returns (uint256 cut) {
+    cut = (gross * mgmtBps) / 10000;
+    uint256 net = gross - cut;
+    if (e.renter == address(0)) {
+      _payout(e.owner, net);
+    } else {
+      uint256 ownerCut = (net * e.ownerShareBps) / 10000;
+      if (ownerCut > 0) _payout(e.owner, ownerCut);
+      if (net - ownerCut > 0) _payout(e.renter, net - ownerCut);
+    }
   }
 
   /// @notice claim held MUSU (payee had no game account, or amount was below the
@@ -541,6 +648,7 @@ contract KamiLeaseMarket {
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), "LeaseMkt: register an account first");
     owedMusu[msg.sender] = 0;
+    owedMusuTotal -= amount; // release the reservation as the funds leave
     _transferMusu(target, amount - TRANSFER_FEE);
     emit OwedClaimed(msg.sender, amount);
   }
@@ -597,6 +705,7 @@ contract KamiLeaseMarket {
       emit Payout(to, amount, false);
     } else {
       owedMusu[to] += amount;
+      owedMusuTotal += amount; // reserve it — this MUSU is now spoken for
       emit Payout(to, amount, true);
     }
     return amount;

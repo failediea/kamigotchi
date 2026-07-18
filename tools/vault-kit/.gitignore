@@ -1,3 +1,10 @@
+# SECRETS — never commit. pods.json holds raw operator private keys; the
+# kamibots-credentials*.json files hold API keys. Runtime state/logs too.
 .env
-kamibots-credentials.json
+pods.json
+kamibots-credentials*.json
+ops-state.json
+ops-bot.log
+THEFT-ALARM.txt
+walk*.json
 node_modules/
