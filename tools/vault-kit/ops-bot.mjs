@@ -584,6 +584,27 @@ async function theftCheck() {
   }
 }
 
+// kamibots strategy containers can crash and never auto-restart (FREE tier,
+// restarts=0) — seen live 2026-07-18: "Network response error" on boot left a
+// lease RESTING for hours while local state still said armed. Trust, but verify
+// the container each tick; clearing the local sig makes reconcile() re-arm it.
+async function verifyStrategies() {
+  for (const [idx, sig] of Object.entries(state.strategies)) {
+    const pod = pods.get(Number(String(sig).split(":")[0]));
+    if (!pod?.creds) continue;
+    try {
+      const s = await kb(pod.creds, `/api/strategies/status/${idx}`);
+      if (s?.state === "RUNNING") continue;
+      console.error(`💀 kamibots container for #${idx} is ${s?.state || "unknown"} — re-arming`);
+    } catch (e) {
+      // transient API failure: leave the sig alone rather than churn strategies
+      if (!/404/.test(e.message)) continue;
+      console.error(`💀 kamibots has no container for #${idx} — re-arming`);
+    }
+    delete state.strategies[idx];
+  }
+}
+
 // ---- main loop --------------------------------------------------------------
 async function tick() {
   await refreshPods(); // hot-load pods added by add-pod.sh; auto-register if enabled
@@ -602,6 +623,8 @@ async function tick() {
     delete state.prefs[idx];
     await stopStrategy(idx); // fast stop; reconciler ships it back to the hub
   }
+
+  await verifyStrategies();
 
   const n = Number(await market.numListings());
   for (let i = 0; i < n; i++) {
