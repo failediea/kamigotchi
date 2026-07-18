@@ -146,7 +146,13 @@ async function wire() {
     if (!e.length) throw new Error(`not found: ${idStr}`);
     return "0x" + e[0].toString(16).padStart(40, "0");
   };
-  idOwnsKami = new Contract(await lookup(comps, "component.id.kami.owns"), COMP_ABI, provider);
+  // IDOwnsKamiComponent: use safeGet(uint256)->uint256 (like LibKami.getAccount).
+  // getValue REVERTS on live Yominet; safeGet returns 0 for an unstaked kami.
+  idOwnsKami = new Contract(
+    await lookup(comps, "component.id.kami.owns"),
+    ["function safeGet(uint256) view returns (uint256)"],
+    provider
+  );
   // AddressOperatorComponent: use get(uint256)->address. getValue REVERTS on live.
   addrOperator = new Contract(
     await lookup(comps, "component.address.operator"),
@@ -356,7 +362,7 @@ async function stopStrategy(tokenIndex) {
 // back to the hub pool. converge with operator-gated KamiSends; cooldown
 // failures simply retry next tick.
 async function reconcile(idx, l) {
-  const actualAcc = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+  const actualAcc = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
   const { risk, node, mode } = parsePrefs(idx);
@@ -417,7 +423,7 @@ async function reconcile(idx, l) {
 // ---- return flow: ONE direct KamiSend from wherever the kami is (hub OR a
 // parked pod) straight to the owner — no intermediate hop, no extra cooldown
 async function sendKamiHome(idx, ownerAddr, kamiID) {
-  const at = await idOwnsKami.getValue(kamiID).catch(() => null);
+  const at = await idOwnsKami.safeGet(kamiID).catch(() => null);
   if (at === null) return;
   const holder = at === marketAccID ? null : podByAccID(at);
   if (at !== marketAccID && !holder) return; // outside the protocol: theft alarm's turf
@@ -478,7 +484,7 @@ async function theftCheck() {
     const idx = Number(await market.tokenIndices(i));
     const l = await market.listings(idx);
     if (!l.staked || l.returning) continue;
-    const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+    const at = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
     if (at === null || allowed.has(at)) continue;
 
     console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the protocol (now in acc ${at}) WITHOUT a return request!`);
@@ -554,7 +560,7 @@ async function tick() {
 
     // arrivals: listed-but-unpooled kami that landed in the hub joins the pool
     if (!l.staked) {
-      const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+      const at = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
       if (at !== null && at === marketAccID) {
         try {
           const tx = await market.connect(operator).confirmArrival(idx);
