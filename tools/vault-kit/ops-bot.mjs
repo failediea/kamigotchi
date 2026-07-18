@@ -92,12 +92,18 @@ const POD_ABI = [
   "function sweepMusu() returns (uint256)",
   "function rotateOperator(address newOperator)",
 ];
+const GUARD_ABI = [
+  "function ship(uint32 tokenIndex, address targetOperator)",
+  "function keeperStop(uint32 tokenIndex)",
+  "function harvestOf(uint32) view returns (uint256)",
+];
 const market = new Contract(MARKET, MARKET_ABI, provider);
 
-/** node -> { node, label, address, contract, wallet, accID, creds } */
+/** BOT pods: node -> { kind:'bot', node, label, address, contract, wallet, accID, creds } */
 const pods = new Map();
 for (const p of podsFile.pods) {
   pods.set(Number(p.node), {
+    kind: "bot",
     node: Number(p.node),
     label: p.label,
     address: p.address,
@@ -105,6 +111,21 @@ for (const p of podsFile.pods) {
     wallet: new Wallet(p.operatorKey, provider),
     accID: null,
     creds: loadJson(`./kamibots-credentials-pod${p.node}.json`),
+  });
+}
+/** SELF-FARM pods: node -> { kind:'self', ..., guard } — operator IS the guard
+ *  contract; renters farm themselves; we only ship (keeper) and sweep. */
+const selfPods = new Map();
+for (const p of podsFile.selfPods || []) {
+  selfPods.set(Number(p.node), {
+    kind: "self",
+    node: Number(p.node),
+    label: p.label,
+    address: p.address,
+    guard: p.guard,
+    contract: new Contract(p.address, POD_ABI, provider),
+    guardContract: new Contract(p.guard, GUARD_ABI, provider),
+    accID: null,
   });
 }
 const DEFAULT_NODE = Number(process.env.DEFAULT_NODE_INDEX || [...pods.keys()][0]);
@@ -134,7 +155,11 @@ async function wire() {
     await ensureRegistered(pod);
     console.log(`pod node ${pod.node} (${pod.label}) acc ${pod.accID} kamibots:${pod.creds ? "✓" : "✗ NOT REGISTERED"}`);
   }
-  console.log(`wired. hub acc ${marketAccID}, ${pods.size} pods`);
+  for (const sp of selfPods.values()) {
+    sp.accID = await sp.contract.accID();
+    console.log(`self-pod node ${sp.node} (${sp.label}) acc ${sp.accID} guard ${sp.guard}`);
+  }
+  console.log(`wired. hub acc ${marketAccID}, ${pods.size} bot pods, ${selfPods.size} self pods`);
 }
 
 // AUTO_REGISTER=1: standing authorization to register creds-missing pods on
@@ -187,10 +212,54 @@ async function refreshPods() {
     }
     await ensureRegistered(pods.get(n));
   }
+  for (const p of f.selfPods || []) {
+    const n = Number(p.node);
+    if (selfPods.has(n)) continue;
+    const sp = {
+      kind: "self",
+      node: n,
+      label: p.label,
+      address: p.address,
+      guard: p.guard,
+      contract: new Contract(p.address, POD_ABI, provider),
+      guardContract: new Contract(p.guard, GUARD_ABI, provider),
+      accID: null,
+    };
+    try {
+      sp.accID = await sp.contract.accID();
+    } catch {
+      continue;
+    }
+    selfPods.set(n, sp);
+    console.log(`🆕 self-pod node ${n} (${sp.label}) hot-loaded, acc ${sp.accID}`);
+  }
 }
 
-const podByAccID = (acc) => [...pods.values()].find((p) => p.accID === acc) || null;
+const podByAccID = (acc) =>
+  [...pods.values()].find((p) => p.accID === acc) ||
+  [...selfPods.values()].find((p) => p.accID === acc) ||
+  null;
 const kamiSendAs = (wallet) => new Contract(kamiSendAddr, KAMI_SEND_ABI, wallet);
+
+/** ship a kami OUT of `holder` (hub / bot pod / self pod) to targetAddr.
+ *  self pods have no operator key — the guard ships, keeper-signed, and the
+ *  guard enforces on-chain that the destination is the hub or the owner. */
+async function shipOut(holder, idx, targetAddr) {
+  if (holder?.kind === "self") {
+    const active = await holder.guardContract.harvestOf(idx).catch(() => 0n);
+    if (active !== 0n) {
+      await (await holder.guardContract.connect(operator).keeperStop(idx)).wait();
+      console.log(`⏹️  abandoned self-farm harvest stopped for #${idx}`);
+    }
+    const tx = await holder.guardContract.connect(operator).ship(idx, targetAddr);
+    await tx.wait();
+    return tx;
+  }
+  const wallet = holder === null ? operator : holder.wallet; // null = hub
+  const tx = await kamiSendAs(wallet).executeTyped(idx, targetAddr);
+  await tx.wait();
+  return tx;
+}
 
 // ---- kamibots (per-registration creds) --------------------------------------
 async function kb(creds, path, opts = {}) {
@@ -218,12 +287,16 @@ const stratSig = (node, risk) => `${node}:${risk}`;
 function parsePrefs(idx) {
   let risk = "balanced";
   let node = DEFAULT_NODE;
+  let mode = "bot";
   try {
     const p = JSON.parse(state.prefs[idx] || "{}");
+    if (p.mode === "self" && selfPods.has(Number(p.node))) {
+      mode = "self";
+      node = Number(p.node);
+    } else if (pods.has(Number(p.node))) node = Number(p.node);
     if (RISK[p.risk]) risk = p.risk;
-    if (pods.has(Number(p.node))) node = Number(p.node);
   } catch {}
-  return { risk, node };
+  return { risk, node, mode };
 }
 
 const warnedPods = new Set();
@@ -281,10 +354,10 @@ async function reconcile(idx, l) {
   const actualAcc = await idOwnsKami.getValue(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
-  const { risk, node } = parsePrefs(idx);
+  const { risk, node, mode } = parsePrefs(idx);
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
   const holdingPod = podByAccID(actualAcc);
-  const targetPod = leased ? pods.get(node) : null;
+  const targetPod = leased ? (mode === "self" ? selfPods.get(node) : pods.get(node)) : null;
 
   let desiredAcc;
   if (leased) {
@@ -300,6 +373,11 @@ async function reconcile(idx, l) {
   }
 
   if (actualAcc === desiredAcc) {
+    if (leased && mode === "self") {
+      // renter farms it themselves via the guard — never run a bot strategy
+      if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+      return;
+    }
     // right tile: the renter's exact strategy (node AND risk) should be running
     if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk)) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
@@ -311,20 +389,19 @@ async function reconcile(idx, l) {
   // wrong place. never farm while relocating.
   if (state.strategies[idx] !== undefined) await stopStrategy(idx);
 
-  // who currently holds it, and can we move it?
-  let fromWallet = null;
-  if (actualAcc === marketAccID) fromWallet = operator;
-  else {
-    const holdingPod = podByAccID(actualAcc);
-    if (holdingPod) fromWallet = holdingPod.wallet;
-  }
-  if (!fromWallet) return; // outside hub+pods: arrival flow or theft alarm owns this
+  // who currently holds it? (null = the hub itself; outside protocol = not ours)
+  const holder = actualAcc === marketAccID ? null : holdingPod;
+  if (actualAcc !== marketAccID && !holder) return; // arrival flow or theft alarm owns this
 
-  const toAddr = leased ? targetPod.wallet.address : operator.address;
+  // destination address: bot pod -> its operator EOA; self pod -> its guard; hub -> hub op
+  const toAddr = leased
+    ? targetPod.kind === "self"
+      ? targetPod.guard
+      : targetPod.wallet.address
+    : operator.address;
   try {
-    const tx = await kamiSendAs(fromWallet).executeTyped(idx, toAddr);
-    await tx.wait();
-    console.log(`🚚 kami #${idx} shipped -> ${leased ? `pod ${targetPod.node} (${targetPod.label})` : "hub pool"} (${tx.hash})`);
+    const tx = await shipOut(holder, idx, toAddr);
+    console.log(`🚚 kami #${idx} shipped -> ${leased ? `${targetPod.kind} pod ${targetPod.node} (${targetPod.label})` : "hub pool"} (${tx.hash})`);
   } catch (e) {
     const msg = e.message?.slice(0, 140) || "";
     if (!/cooldown|resting/i.test(msg)) console.error(`ship #${idx} failed: ${msg}`);
@@ -337,13 +414,8 @@ async function reconcile(idx, l) {
 async function sendKamiHome(idx, ownerAddr, kamiID) {
   const at = await idOwnsKami.getValue(kamiID).catch(() => null);
   if (at === null) return;
-  let fromWallet = null;
-  if (at === marketAccID) fromWallet = operator;
-  else {
-    const holdingPod = podByAccID(at);
-    if (holdingPod) fromWallet = holdingPod.wallet;
-  }
-  if (!fromWallet) return; // outside the protocol: theft alarm's turf
+  const holder = at === marketAccID ? null : podByAccID(at);
+  if (at !== marketAccID && !holder) return; // outside the protocol: theft alarm's turf
 
   const ownerOperator = await addrOperator.getValue(BigInt(ownerAddr)).catch(() => null);
   if (!ownerOperator) {
@@ -352,8 +424,7 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
   }
   const opAddr = "0x" + BigInt(ownerOperator).toString(16).padStart(40, "0");
   try {
-    const tx = await kamiSendAs(fromWallet).executeTyped(idx, opAddr);
-    await tx.wait();
+    const tx = await shipOut(holder, idx, opAddr);
     console.log(`🏠 kami #${idx} sent home to ${ownerAddr} (${tx.hash})`);
     const clear = await market.connect(operator).clearReturned(idx);
     await clear.wait();
@@ -377,13 +448,13 @@ async function sweepPods() {
   } catch {
     return;
   }
-  for (const pod of pods.values()) {
+  for (const pod of [...pods.values(), ...selfPods.values()]) {
     try {
       const bal = await pod.contract.musuBalance();
       if (bal >= BigInt(SWEEP_MIN_MUSU)) {
         const tx = await pod.contract.connect(operator).sweepMusu();
         await tx.wait();
-        console.log(`🧹 pod ${pod.node} swept ${bal} MUSU -> hub (settle window open)`);
+        console.log(`🧹 ${pod.kind} pod ${pod.node} swept ${bal} MUSU -> hub (settle window open)`);
       }
     } catch (e) {
       console.error(`sweep pod ${pod.node} failed: ${e.message?.slice(0, 120)}`);
@@ -393,7 +464,11 @@ async function sweepPods() {
 
 // ---- theft alarm ------------------------------------------------------------
 async function theftCheck() {
-  const allowed = new Set([marketAccID, ...[...pods.values()].map((p) => p.accID)]);
+  const allowed = new Set([
+    marketAccID,
+    ...[...pods.values()].map((p) => p.accID),
+    ...[...selfPods.values()].map((p) => p.accID),
+  ]);
   const n = Number(await market.numListings());
   for (let i = 0; i < n; i++) {
     const idx = Number(await market.tokenIndices(i));
@@ -406,7 +481,8 @@ async function theftCheck() {
     writeFileSync(new URL("./THEFT-ALARM.txt", import.meta.url).pathname,
       `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`, { flag: "a" });
     if (admin) {
-      // rotate EVERY operator — hub and pods — and cut all automation off
+      // rotate EVERY key-holding operator — hub and bot pods. self pods are
+      // skipped: their operator is the guard CONTRACT (no key to compromise).
       const rotations = [["hub", (a) => market.connect(admin).rotateOperator(a)]];
       for (const pod of pods.values())
         rotations.push([`pod ${pod.node}`, (a) => pod.contract.connect(admin).rotateOperator(a)]);

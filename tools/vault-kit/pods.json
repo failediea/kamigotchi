@@ -1,0 +1,40 @@
+{
+  "hub": "0xf9bf4bD08993Fc4a0462a4E8d4B1ED3A1BD5a160",
+  "registry": "0x1BD11aCF1f33F9d1e9dc39656C8416cEaF56dAA5",
+  "pods": [
+    {
+      "node": 1,
+      "name": "leasepod1",
+      "label": "Misty Riverside (EERIE)",
+      "address": "0x7459e9C39FCe4F03A4c3F355A0E53F28520E9624",
+      "operator": "0x5e6BbAedd928fFE4B32CD358ac19Ee439612ab43",
+      "operatorKey": "0x65bd81b71bba0b09c56e4922873269f07243b01eb89f439a651f4d4524dc5e22"
+    },
+    {
+      "node": 2,
+      "name": "leasepod2",
+      "label": "Tunnel of Trees (NORMAL)",
+      "address": "0x49e5f0e3CFd559c16bDF420A45f09C5294aeE5cC",
+      "operator": "0x8E17589128CB37A5A5Cc23ec3C336152FDF0648B",
+      "operatorKey": "0x5c2452584aa589c41a3316c4800242c020b14792649156c56ef30b0560b0c3b9"
+    },
+    {
+      "node": 3,
+      "name": "leasepod3",
+      "label": "Torii Gate (NORMAL)",
+      "address": "0xe055541526Aca30D18DDeCdc97456D733A9474FD",
+      "operator": "0x39Ba4D8384f0584b282ebB8185d057DC57878FC3",
+      "operatorKey": "0x5ca3d9a4e2d479f493d55f41cc06c91b4458c64f3fdcc02194a7b0256b2a9417"
+    }
+  ],
+  "selfRegistry": "0xD6E05BA192163804676d1f185303b646Eeb90e58",
+  "selfPods": [
+    {
+      "node": 1,
+      "name": "selfpod1",
+      "label": "Misty Riverside (EERIE)",
+      "address": "0x6B88fDb83bcc70ff5bDC93AEa8E712ede89C6786",
+      "guard": "0xc2AaCeEed64e00898E9B77F3c8b4cA7710b43d14"
+    }
+  ]
+}
