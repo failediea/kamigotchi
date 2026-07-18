@@ -55,10 +55,11 @@ const MARKET_ABI = [
   "function tokenIndices(uint256) view returns (uint32)",
   "function listings(uint32) view returns (address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, address renter, uint256 gasBudget)",
   "function clearReturned(uint32 tokenIndex)",
+  "function confirmDelivery(uint32 tokenIndex)",
   "function rotateOperator(address newOperator)",
   "event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs)",
   "event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund)",
-  "event SendConfirmed(address indexed owner, uint32 indexed tokenIndex)",
+  "event Delivered(address indexed owner, uint32 indexed tokenIndex)",
   "event ReturnRequested(address indexed owner, uint32 indexed tokenIndex)",
   "event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs)",
 ];
@@ -201,23 +202,43 @@ async function tick() {
   const head = await provider.getBlockNumber();
   const from = state.lastBlock ? state.lastBlock + 1 : Math.max(0, head - 5_000);
 
-  const [accepted, ended, confirmed, returns_] = await Promise.all([
+  const [accepted, ended, delivered, returns_] = await Promise.all([
     market.queryFilter(market.filters.LeaseAccepted(), from, head),
     market.queryFilter(market.filters.LeaseEnded(), from, head),
-    market.queryFilter(market.filters.SendConfirmed(), from, head),
+    market.queryFilter(market.filters.Delivered(), from, head),
     market.queryFilter(market.filters.ReturnRequested(), from, head),
   ]);
 
-  for (const e of confirmed) {
+  // v5: acceptance only opens the delivery window — remember the renter's prefs,
+  // farming starts at Delivered
+  state.prefs = state.prefs || {};
+  for (const e of accepted) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs;
+
+  for (const e of delivered) {
     const idx = Number(e.args.tokenIndex);
-    if (!state.strategies[idx]) await startStrategy(idx, ""); // platform farms unleased too
-  }
-  for (const e of accepted) {
-    const idx = Number(e.args.tokenIndex);
-    await stopStrategy(idx); // restart with the renter's prefs
-    await startStrategy(idx, e.args.prefs);
+    await startStrategy(idx, state.prefs[idx] || "");
   }
   for (const e of ended) await stopStrategy(Number(e.args.tokenIndex));
+
+  // auto-confirm: any rented-undelivered listing whose kami has arrived
+  {
+    const n = Number(await market.numListings());
+    for (let i = 0; i < n; i++) {
+      const idx = Number(await market.tokenIndices(i));
+      const l = await market.listings(idx);
+      if (l.renter === "0x0000000000000000000000000000000000000000" || l.staked) continue;
+      const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+      if (at !== null && at === marketAccID) {
+        try {
+          const tx = await market.connect(operator).confirmDelivery(idx);
+          await tx.wait();
+          console.log(`📬 auto-confirmed delivery of kami #${idx}`);
+        } catch (e2) {
+          console.error(`confirmDelivery #${idx} failed: ${e2.message?.slice(0, 120)}`);
+        }
+      }
+    }
+  }
   for (const e of returns_) {
     const idx = Number(e.args.tokenIndex);
     returningSet.add(idx);

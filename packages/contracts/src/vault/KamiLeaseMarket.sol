@@ -7,7 +7,6 @@ import { getAddrByID } from "solecs/utils.sol";
 
 import { AccountRegisterSystem, ID as AccountRegisterSystemID } from "systems/AccountRegisterSystem.sol";
 import { AccountSetOperatorSystem, ID as AccountSetOperatorSystemID } from "systems/AccountSetOperatorSystem.sol";
-import { Kami721StakeSystem, ID as Kami721StakeSystemID } from "systems/Kami721StakeSystem.sol";
 import { Kami721UnstakeSystem, ID as Kami721UnstakeSystemID } from "systems/Kami721UnstakeSystem.sol";
 import { ItemTransferSystem, ID as ItemTransferSystemID } from "systems/ItemTransferSystem.sol";
 
@@ -15,6 +14,8 @@ import { LibAccount } from "libraries/LibAccount.sol";
 import { LibExperience } from "libraries/LibExperience.sol";
 import { LibInventory, MUSU_INDEX, TRANSFER_FEE } from "libraries/LibInventory.sol";
 import { LibKami } from "libraries/LibKami.sol";
+import { LibStat } from "libraries/LibStat.sol";
+import { Stat } from "solecs/components/types/Stat.sol";
 import { LibEntityType } from "libraries/utils/LibEntityType.sol";
 
 import { Kami721 } from "tokens/Kami721.sol";
@@ -53,10 +54,11 @@ contract KamiLeaseMarket {
     uint256 xpBase; // attribution baseline (reset on settle / lease boundaries)
     uint16 ownerShareBps; // owner's share of post-fee earnings while leased
     uint128 minGasWei; // minimum gas budget to accept the lease
-    bool staked; // in-world under the market's game account
+    bool staked; // true = DELIVERED into the market account; false = still at home
     bool returning; // owner requested an in-game send-back (blocks new leases)
     address renter; // active renter (0 = not leased)
     uint256 gasBudget; // renter's remaining ETH for farming gas
+    uint64 deliverBy; // delivery deadline after a remote listing is rented (0 = n/a)
   }
 
   /// @dev earnings attribution carried across lease/withdraw boundaries until settle
@@ -67,14 +69,6 @@ contract KamiLeaseMarket {
     uint256 delta;
   }
 
-  /// @dev a declared intent to deposit via in-game KamiSend (the flow players use).
-  /// MUST be registered BEFORE sending — prior in-game ownership is verified at
-  /// registration time and cannot be proven after the kami has arrived.
-  struct PendingSend {
-    address owner;
-    uint16 ownerShareBps;
-    uint128 minGasWei;
-  }
 
   ///////////////////
   // STATE
@@ -92,8 +86,6 @@ contract KamiLeaseMarket {
   uint32[] public tokenIndices;
   mapping(uint32 => uint256) internal tokenPos; // tokenIndex => position+1
 
-  mapping(uint32 => PendingSend) public pendingSends; // declared in-game deposits
-
   CarryEntry[] public carries;
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
   mapping(address => uint256) public owedEth; // gas refunds that failed to send (pull)
@@ -101,6 +93,7 @@ contract KamiLeaseMarket {
 
   uint64 public lastSettleAt;
   uint64 public settleCooldown = 6 hours; // spam guard; admin-tunable, capped
+  uint64 public deliveryWindow = 24 hours; // owner's time to deliver after rental
 
   uint256 private locked = 1;
 
@@ -110,10 +103,10 @@ contract KamiLeaseMarket {
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
-  event Staked(uint32 indexed tokenIndex);
-  event SendPreRegistered(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
-  event SendConfirmed(address indexed owner, uint32 indexed tokenIndex);
-  event PendingCancelled(address indexed owner, uint32 indexed tokenIndex);
+  event Delisted(address indexed owner, uint32 indexed tokenIndex);
+  event Delivered(address indexed owner, uint32 indexed tokenIndex);
+  event DeliveryFailed(address indexed renter, uint32 indexed tokenIndex, uint256 refund);
+  event DeliveryWindowSet(uint64 secs);
   event ReturnRequested(address indexed owner, uint32 indexed tokenIndex); // ops bot: KamiSend it home
   event ReturnCleared(address indexed owner, uint32 indexed tokenIndex);
   event EthOwed(address indexed to, uint256 amount);
@@ -190,6 +183,13 @@ contract KamiLeaseMarket {
     emit SettleCooldownSet(secs);
   }
 
+  /// @notice how long owners get to deliver after a rental (bounded both ways)
+  function setDeliveryWindow(uint64 secs) external onlyAdmin {
+    require(secs >= 1 hours && secs <= 7 days, "LeaseMkt: window out of range");
+    deliveryWindow = secs;
+    emit DeliveryWindowSet(secs);
+  }
+
   /// @notice pull gas from a lease's budget to the operator wallet. admin-triggered,
   ///         but funds can ONLY go to the current account operator.
   function dripGas(uint32 tokenIndex, uint256 amount) external onlyAdmin {
@@ -206,32 +206,53 @@ contract KamiLeaseMarket {
   receive() external payable {}
 
   ///////////////////
-  // OWNER SIDE (lessor)
+  // OWNER SIDE (lessor) — list in place, deliver on rent
 
-  /// @notice list a kami for lease. pulls the ERC721 (requires prior approval).
-  function listKami(uint32 tokenIndex, uint16 ownerShareBps, uint128 minGasWei) external nonReentrant {
+  /// @notice list a kami WITHOUT sending it anywhere. the kami stays in YOUR account
+  ///         but is committed to the market: it must be RESTING at FULL HEALTH to
+  ///         list, and acceptance re-checks the same — farming a listed kami simply
+  ///         makes it unrentable until it's rested back to full.
+  function listKami(uint32 tokenIndex, uint16 ownerShareBps, uint128 minGasWei) external {
     require(accID != 0, "LeaseMkt: not initialized");
     require(ownerShareBps <= 10000, "LeaseMkt: share > 100%");
     require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
 
-    kami721.transferFrom(msg.sender, address(this), uint256(tokenIndex));
+    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    // the caller's game account IS uint160(caller) — verify current in-game ownership
+    require(
+      LibKami.getAccount(_comps(), kamiID) == uint256(uint160(msg.sender)),
+      "LeaseMkt: kami not in your account"
+    );
+    require(_isRestedFull(kamiID), "LeaseMkt: must be resting at full health");
 
     listings[tokenIndex] = Listing({
       owner: msg.sender,
-      kamiID: LibKami.getByIndex(_comps(), tokenIndex),
+      kamiID: kamiID,
       xpBase: 0,
       ownerShareBps: ownerShareBps,
       minGasWei: minGasWei,
-      staked: false,
+      staked: false, // still at home — delivered only after someone rents it
       returning: false,
       renter: address(0),
-      gasBudget: 0
+      gasBudget: 0,
+      deliverBy: 0
     });
     tokenIndices.push(tokenIndex);
     tokenPos[tokenIndex] = tokenIndices.length;
     participations[msg.sender]++;
 
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
+  }
+
+  /// @notice remove an unrented, undelivered listing (the kami never left home)
+  function delist(uint32 tokenIndex) external {
+    Listing memory l = listings[tokenIndex];
+    require(l.owner == msg.sender, "LeaseMkt: not owner");
+    require(l.renter == address(0), "LeaseMkt: leased");
+    require(!l.staked, "LeaseMkt: delivered - use requestReturn");
+    if (participations[l.owner] > 0) participations[l.owner]--;
+    _removeListing(tokenIndex);
+    emit Delisted(msg.sender, tokenIndex);
   }
 
   /// @notice update lease terms. only while not leased.
@@ -246,84 +267,37 @@ contract KamiLeaseMarket {
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
   }
 
-  /// @notice stake listed kamis into the market's game account (keeper; bridge room)
-  function stakeListings(uint32[] calldata idxs) external nonReentrant {
-    Kami721StakeSystem staker = Kami721StakeSystem(_sys(Kami721StakeSystemID));
-    for (uint256 i; i < idxs.length; i++) {
-      Listing storage l = listings[idxs[i]];
-      require(l.owner != address(0), "LeaseMkt: unknown listing");
-      require(!l.staked, "LeaseMkt: already staked");
-      staker.executeTyped(idxs[i]);
-      l.staked = true;
-      l.xpBase = LibExperience.get(_comps(), l.kamiID);
-      emit Staked(idxs[i]);
-    }
+  /// @notice after a rental: confirm the kami arrived in the market account.
+  ///         callable by anyone (the ops keeper races to call it). ACTIVATES the
+  ///         lease — the earnings clock starts here, at arrival.
+  function confirmDelivery(uint32 tokenIndex) external nonReentrant {
+    Listing storage l = listings[tokenIndex];
+    require(l.owner != address(0), "LeaseMkt: not listed");
+    require(l.renter != address(0), "LeaseMkt: not rented");
+    require(!l.staked, "LeaseMkt: already delivered");
+    require(LibKami.getAccount(_comps(), l.kamiID) == accID, "LeaseMkt: not arrived");
+
+    l.staked = true;
+    l.deliverBy = 0;
+    l.xpBase = LibExperience.get(_comps(), l.kamiID); // earnings clock starts NOW
+    emit Delivered(l.owner, tokenIndex);
   }
 
-  ///////////////////
-  // OWNER SIDE — in-game KamiSend deposits (the flow players actually use)
+  /// @notice renter escape hatch: the owner missed the delivery window. full refund,
+  ///         and the flaky listing is removed entirely.
+  function cancelUndelivered(uint32 tokenIndex) external nonReentrant {
+    Listing memory l = listings[tokenIndex];
+    require(l.renter == msg.sender, "LeaseMkt: not renter");
+    require(!l.staked, "LeaseMkt: already delivered");
+    require(block.timestamp > l.deliverBy, "LeaseMkt: window still open");
+    // guard the race: if it actually arrived but nobody confirmed, don't cancel
+    require(LibKami.getAccount(_comps(), l.kamiID) != accID, "LeaseMkt: it arrived - confirm it");
 
-  /// @notice STEP 1: declare an in-game deposit BEFORE sending. verifies the kami is
-  ///         currently in YOUR game account — this is what binds the listing to you,
-  ///         and it cannot be proven after the kami has already arrived.
-  function preRegisterSend(
-    uint32 tokenIndex,
-    uint16 ownerShareBps,
-    uint128 minGasWei
-  ) external {
-    require(accID != 0, "LeaseMkt: not initialized");
-    require(ownerShareBps <= 10000, "LeaseMkt: share > 100%");
-    require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
-
-    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
-    // the caller's game account IS uint160(caller) — verify current in-game ownership
-    require(
-      LibKami.getAccount(_comps(), kamiID) == uint256(uint160(msg.sender)),
-      "LeaseMkt: kami not in your account"
-    );
-
-    pendingSends[tokenIndex] = PendingSend(msg.sender, ownerShareBps, minGasWei);
-    emit SendPreRegistered(msg.sender, tokenIndex, ownerShareBps, minGasWei);
-  }
-
-  /// @notice STEP 2 happens in-game: KamiSend the kami to the market's account.
-  ///         STEP 3: confirm arrival (anyone/keeper) — creates the listing.
-  function confirmSendIn(uint32 tokenIndex) external nonReentrant {
-    PendingSend memory p = pendingSends[tokenIndex];
-    require(p.owner != address(0), "LeaseMkt: not pre-registered");
-    require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
-
-    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
-    require(
-      LibKami.getAccount(_comps(), kamiID) == accID,
-      "LeaseMkt: kami has not arrived"
-    );
-
-    delete pendingSends[tokenIndex];
-    listings[tokenIndex] = Listing({
-      owner: p.owner,
-      kamiID: kamiID,
-      xpBase: LibExperience.get(_comps(), kamiID),
-      ownerShareBps: p.ownerShareBps,
-      minGasWei: p.minGasWei,
-      staked: true, // in-world under the market account (arrived via KamiSend)
-      returning: false,
-      renter: address(0),
-      gasBudget: 0
-    });
-    tokenIndices.push(tokenIndex);
-    tokenPos[tokenIndex] = tokenIndices.length;
-    participations[p.owner]++;
-
-    emit SendConfirmed(p.owner, tokenIndex);
-    emit Listed(p.owner, tokenIndex, p.ownerShareBps, p.minGasWei);
-  }
-
-  /// @notice abandon a declared deposit that was never sent
-  function cancelPending(uint32 tokenIndex) external {
-    require(pendingSends[tokenIndex].owner == msg.sender, "LeaseMkt: not yours");
-    delete pendingSends[tokenIndex];
-    emit PendingCancelled(msg.sender, tokenIndex);
+    if (participations[l.renter] > 0) participations[l.renter]--;
+    if (participations[l.owner] > 0) participations[l.owner]--;
+    _removeListing(tokenIndex);
+    if (l.gasBudget > 0) _sendEthOrOwe(l.renter, l.gasBudget);
+    emit DeliveryFailed(l.renter, tokenIndex, l.gasBudget);
   }
 
   /// @notice withdraw a kami. only the owner, only when not leased; NFT goes only to
@@ -334,11 +308,10 @@ contract KamiLeaseMarket {
     Listing memory l = listings[tokenIndex];
     require(l.owner == msg.sender, "LeaseMkt: not owner");
     require(l.renter == address(0), "LeaseMkt: end lease first");
+    require(l.staked, "LeaseMkt: not delivered - use delist");
 
-    if (l.staked) {
-      _carryPending(tokenIndex);
-      Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
-    }
+    _carryPending(tokenIndex);
+    Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     kami721.transferFrom(address(this), l.owner, uint256(tokenIndex));
@@ -398,15 +371,26 @@ contract KamiLeaseMarket {
   ) external payable nonReentrant {
     Listing storage l = listings[tokenIndex];
     require(l.owner != address(0), "LeaseMkt: not listed");
-    require(l.staked, "LeaseMkt: not staked yet");
     require(!l.returning, "LeaseMkt: being returned");
     require(l.renter == address(0), "LeaseMkt: already leased");
     require(l.owner != msg.sender, "LeaseMkt: own kami");
     require(l.ownerShareBps == expectedOwnerShareBps, "LeaseMkt: terms changed");
     require(msg.value >= l.minGasWei, "LeaseMkt: gas budget too low");
-    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LeaseMkt: kami is dead");
 
-    _carryPending(tokenIndex); // owner keeps everything earned before this lease
+    if (l.staked) {
+      // already in the market (e.g. after a previous lease ended) — starts instantly
+      require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LeaseMkt: kami is dead");
+      _carryPending(tokenIndex); // owner keeps everything earned before this lease
+    } else {
+      // remote listing: the kami is still home. re-verify the owner's commitment —
+      // still theirs, still resting at full health — then open the delivery window.
+      require(
+        LibKami.getAccount(_comps(), l.kamiID) == uint256(uint160(l.owner)),
+        "LeaseMkt: kami left the owner's account"
+      );
+      require(_isRestedFull(l.kamiID), "LeaseMkt: kami not rested - try later");
+      l.deliverBy = uint64(block.timestamp) + deliveryWindow;
+    }
 
     l.renter = msg.sender;
     l.gasBudget = msg.value;
@@ -435,11 +419,12 @@ contract KamiLeaseMarket {
     require(renter != address(0), "LeaseMkt: not leased");
     require(msg.sender == renter || msg.sender == l.owner, "LeaseMkt: not party");
 
-    _carryPending(tokenIndex); // split at lease terms
+    _carryPending(tokenIndex); // split at lease terms (no-op if never delivered)
 
     uint256 refund = l.gasBudget;
     l.renter = address(0);
     l.gasBudget = 0;
+    l.deliverBy = 0;
     if (participations[renter] > 0) participations[renter]--;
 
     // pull-pattern fallback: a renter contract that reverts on receive must not be
@@ -643,6 +628,18 @@ contract KamiLeaseMarket {
     tokenIndices.pop();
     delete tokenPos[tokenIndex];
     delete listings[tokenIndex];
+  }
+
+  /// @dev the marketplace-readiness rule: RESTING and effectively at FULL HEALTH
+  ///      (stored HP plus resting regeneration since the last sync).
+  function _isRestedFull(uint256 kamiID) internal view returns (bool) {
+    IUintComp comps = _comps();
+    if (!LibKami.isState(comps, kamiID, "RESTING")) return false;
+    Stat memory hp = LibStat.get(comps, "HEALTH", kamiID);
+    int32 total = LibStat.getTotal(comps, "HEALTH", kamiID);
+    if (hp.sync >= total) return true;
+    uint256 recovered = LibKami.calcRecovery(comps, kamiID);
+    return int256(hp.sync) + int256(recovered) >= int256(total);
   }
 
   function _isAccount(uint256 id) internal view returns (bool) {
