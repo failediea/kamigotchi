@@ -1,57 +1,39 @@
 // Watch the market's game account for an incoming kami (via KamiSend).
-// Read-only. Prints the kami entity + token index when one arrives, then exits.
-import { JsonRpcProvider, Contract, id as keccakId } from "ethers";
+// Uses the Kamibots indexer (by-owner = the market CONTRACT address) because on-chain
+// reverse lookup of IDOwnsKami reverts on live Yominet. Prints arrivals, then keeps going.
+import { readFileSync, existsSync } from "node:fs";
 
-const RPC = "https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz";
-const WORLD = "0x2729174c265dbBd8416C6449E0E813E88f43D0E7";
-const MARKET_ACC_ID = 47407546209935698347549980167491934639655947760n; // uint160(market v4)
-
-const WORLD_ABI = ["function components() view returns (address)"];
-const REGISTRY_ABI = ["function getEntitiesWithValue(uint256 value) view returns (uint256[])"];
-const COMP_ABI = [
-  "function getEntitiesWithValue(uint256 value) view returns (uint256[])",
-  "function getValue(uint256 entity) view returns (uint256)",
-  "function has(uint256 entity) view returns (bool)",
-];
-
-const provider = new JsonRpcProvider(RPC);
-const world = new Contract(WORLD, WORLD_ABI, provider);
-const registryAddr = await world.components();
-const registry = new Contract(registryAddr, REGISTRY_ABI, provider);
-
-async function compAddr(idStr) {
-  const entities = await registry.getEntitiesWithValue(BigInt(keccakId(idStr)));
-  if (!entities.length) throw new Error(`component not found: ${idStr}`);
-  return "0x" + entities[0].toString(16).padStart(40, "0");
+const envPath = new URL("./.env", import.meta.url).pathname;
+if (existsSync(envPath)) {
+  for (const line of readFileSync(envPath, "utf8").split("\n")) {
+    const m = line.match(/^([A-Z_]+)=(.+)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+  }
 }
+const MARKET = process.env.MARKET_ADDRESS;
+const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
+const creds = JSON.parse(
+  readFileSync(new URL("./kamibots-credentials.json", import.meta.url).pathname, "utf8")
+);
 
-const idOwnsKami = new Contract(await compAddr("component.id.kami.owns"), COMP_ABI, provider);
-// kami token index component (per kamistats: component.index.kami)
-let indexComp = null;
-for (const guess of ["component.index.kami", "component.kami.index", "component.index"]) {
-  try {
-    indexComp = new Contract(await compAddr(guess), COMP_ABI, provider);
-    console.log(`(index component: ${guess})`);
-    break;
-  } catch {}
-}
-
-console.log(`watching market account ${MARKET_ACC_ID} for incoming kamis…`);
+console.log(`watching market ${MARKET} for incoming kamis (kamibots by-owner)…`);
+const seen = new Set();
 for (;;) {
   try {
-    const kamis = await idOwnsKami.getEntitiesWithValue(MARKET_ACC_ID);
-    if (kamis.length > 0) {
+    const res = await fetch(`${KAMIBOTS}/api/accounts/by-owner/${MARKET}/kamis`, {
+      headers: { "X-Agent-Key": creds.apiKey },
+    });
+    if (res.ok) {
+      const { kamis = [] } = await res.json();
       for (const k of kamis) {
-        let idx = "?";
-        if (indexComp) {
-          try { idx = (await indexComp.getValue(k)).toString(); } catch {}
+        if (!seen.has(k.index)) {
+          seen.add(k.index);
+          console.log(`KAMI ARRIVED: tokenIndex=${k.index} state=${k.state} name=${k.name}`);
         }
-        console.log(`KAMI ARRIVED: entity=${k.toString()} tokenIndex=${idx}`);
       }
-      process.exit(0);
     }
-  } catch (e) {
-    // transient RPC hiccup — keep watching
+  } catch {
+    // transient — keep watching
   }
   await new Promise((r) => setTimeout(r, 30_000));
 }
