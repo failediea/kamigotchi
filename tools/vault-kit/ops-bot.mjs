@@ -291,14 +291,20 @@ const RISK = {
   aggressive: { useHpBasedRest: true, hpThresholdLow: 15, hpThresholdHigh: 60 },
 };
 
-// a running strategy is identified by node AND risk — a style change on the
-// same tile must restart the strategy with the new config
-const stratSig = (node, risk) => `${node}:${risk}`;
+// renter-suppliable food (kamibots item ids). FEED mode uses the renter's own
+// food in the pod inventory — the pool never buys anything.
+const FOOD_IDS = new Set([11301, 11302, 11303, 11304, 11311, 11312, 11313, 11314]);
+
+// a running strategy is identified by node + risk + regen(+food) — ANY change
+// must restart the strategy with the new config
+const stratSig = (node, risk, regen = "REST", food = 0) => `${node}:${risk}:${regen}:${food}`;
 
 function parsePrefs(idx) {
   let risk = "balanced";
   let node = DEFAULT_NODE;
   let mode = "bot";
+  let regen = "REST";
+  let food = 0;
   try {
     const p = JSON.parse(state.prefs[idx] || "{}");
     if (p.mode === "self" && selfPods.has(Number(p.node))) {
@@ -306,12 +312,17 @@ function parsePrefs(idx) {
       node = Number(p.node);
     } else if (pods.has(Number(p.node))) node = Number(p.node);
     if (RISK[p.risk]) risk = p.risk;
+    // FEED mode: renter supplies the food (item id) into the pod inventory
+    if (p.regen === "FEED" && FOOD_IDS.has(Number(p.food))) {
+      regen = "FEED";
+      food = Number(p.food);
+    }
   } catch {}
-  return { risk, node, mode };
+  return { risk, node, mode, regen, food };
 }
 
 const warnedPods = new Set();
-async function startStrategy(pod, tokenIndex, risk) {
+async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0) {
   if (!pod.creds) {
     if (!warnedPods.has(pod.node)) {
       warnedPods.add(pod.node);
@@ -320,18 +331,36 @@ async function startStrategy(pod, tokenIndex, risk) {
     return;
   }
   try {
-    await kb(pod.creds, "/api/strategies/start", {
-      method: "POST",
-      body: {
-        strategyType: "harvestAndRest",
-        kamiId: tokenIndex,
-        nodeId: pod.node,
-        config: { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...(RISK[risk] || RISK.balanced) },
-        keyData: { privy_id: pod.creds.privyId },
-      },
-    });
-    state.strategies[tokenIndex] = stratSig(pod.node, risk);
-    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}) via ${pod.label}`);
+    // FEED mode: renter supplied food (their items, in the pod inventory) — the
+    // kami eats instead of resting for far higher uptime. failsafe rests when
+    // the food runs out. REST mode: classic harvestAndRest.
+    const base = { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...(RISK[risk] || RISK.balanced) };
+    const body =
+      regen === "FEED" && food
+        ? {
+            strategyType: "harvestAndFeed",
+            kamiId: tokenIndex,
+            nodeId: pod.node,
+            config: {
+              ...base,
+              enableFeedInterval: true,
+              feedInterval: 3600,
+              foodType: food,
+              enableFailsafeRest: true,
+              failsafeRestDuration: 600,
+            },
+            keyData: { privy_id: pod.creds.privyId },
+          }
+        : {
+            strategyType: "harvestAndRest",
+            kamiId: tokenIndex,
+            nodeId: pod.node,
+            config: base,
+            keyData: { privy_id: pod.creds.privyId },
+          };
+    await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
+    state.strategies[tokenIndex] = stratSig(pod.node, risk, regen, food);
+    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}${regen === "FEED" ? ` · FEED item ${food}` : ""}) via ${pod.label}`);
   } catch (e) {
     console.error(`strategy start failed #${tokenIndex} on pod ${pod.node}: ${e.message}`);
   }
@@ -365,7 +394,7 @@ async function reconcile(idx, l) {
   const actualAcc = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
-  const { risk, node, mode } = parsePrefs(idx);
+  const { risk, node, mode, regen, food } = parsePrefs(idx);
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
   const holdingPod = podByAccID(actualAcc);
   const targetPod = leased ? (mode === "self" ? selfPods.get(node) : pods.get(node)) : null;
@@ -389,10 +418,10 @@ async function reconcile(idx, l) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
       return;
     }
-    // right tile: the renter's exact strategy (node AND risk) should be running
-    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk)) {
+    // right tile: the renter's exact strategy (node/risk/regen/food) should run
+    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk, regen, food)) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
-      await startStrategy(targetPod, idx, risk);
+      await startStrategy(targetPod, idx, risk, regen, food);
     }
     return;
   }
@@ -443,6 +472,27 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
   } catch (e) {
     console.error(`return send failed #${idx}: ${e.message?.slice(0, 160)} (cooldown? retrying next tick)`);
   }
+}
+
+// ---- live status export -----------------------------------------------------
+// dumps the bot's view + each pod's kamibots strategy status to a JSON file the
+// dApp serves (same filesystem) — live "is it actually running" telemetry
+// without ever handing pod API keys to the web app.
+const LIVE_STATUS_FILE = new URL("./live-status.json", import.meta.url).pathname;
+async function exportLiveStatus() {
+  const out = { t: Date.now(), strategies: state.strategies, parkedAt: state.parkedAt, pods: {} };
+  for (const pod of pods.values()) {
+    if (!pod.creds) continue;
+    try {
+      const st = await kb(pod.creds, "/api/strategies/status/all");
+      out.pods[pod.node] = st;
+    } catch {
+      out.pods[pod.node] = { error: "status unavailable" };
+    }
+  }
+  try {
+    writeFileSync(LIVE_STATUS_FILE, JSON.stringify(out));
+  } catch {}
 }
 
 // ---- pod sweeps: PAYDAY-ONLY ------------------------------------------------
@@ -584,6 +634,7 @@ async function tick() {
 
   await sweepPods();
   await theftCheck();
+  await exportLiveStatus();
   state.lastBlock = head;
   saveState();
 }
