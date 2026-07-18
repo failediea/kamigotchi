@@ -7,6 +7,7 @@ import { getAddrByID } from "solecs/utils.sol";
 
 import { AccountRegisterSystem, ID as AccountRegisterSystemID } from "systems/AccountRegisterSystem.sol";
 import { AccountSetOperatorSystem, ID as AccountSetOperatorSystemID } from "systems/AccountSetOperatorSystem.sol";
+import { Kami721StakeSystem, ID as Kami721StakeSystemID } from "systems/Kami721StakeSystem.sol";
 import { Kami721UnstakeSystem, ID as Kami721UnstakeSystemID } from "systems/Kami721UnstakeSystem.sol";
 import { ItemTransferSystem, ID as ItemTransferSystemID } from "systems/ItemTransferSystem.sol";
 
@@ -230,6 +231,44 @@ contract KamiLeaseMarket {
     participations[msg.sender]++;
 
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
+  }
+
+  /// @notice ONE-TX LISTING for a kami held as an NFT in your wallet: approve
+  ///         (or setApprovalForAll once), then this pulls the token and stakes
+  ///         it STRAIGHT INTO THE POOL — the market account lives in the bridge
+  ///         room, so the kami is pooled and rentable in this same transaction.
+  ///         No send, no operator, no waiting. It rests (and heals) unfarmed
+  ///         until rented; withdrawKami returns it as an NFT, so every future
+  ///         listing of this kami is one click too.
+  function listKami721(uint32 tokenIndex, uint16 ownerShareBps, uint128 minGasWei)
+    external
+    nonReentrant
+  {
+    require(accID != 0, "LeaseMkt: not initialized");
+    require(ownerShareBps <= 10000, "LeaseMkt: share > 100%");
+    require(listings[tokenIndex].owner == address(0), "LeaseMkt: already listed");
+
+    kami721.transferFrom(msg.sender, address(this), uint256(tokenIndex));
+    Kami721StakeSystem(_sys(Kami721StakeSystemID)).executeTyped(tokenIndex);
+
+    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    listings[tokenIndex] = Listing({
+      owner: msg.sender,
+      kamiID: kamiID,
+      xpBase: LibExperience.get(_comps(), kamiID),
+      ownerShareBps: ownerShareBps,
+      minGasWei: minGasWei,
+      staked: true, // in the pool from this very transaction
+      returning: false,
+      renter: address(0),
+      gasBudget: 0
+    });
+    tokenIndices.push(tokenIndex);
+    tokenPos[tokenIndex] = tokenIndices.length;
+    participations[msg.sender]++;
+
+    emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
+    emit Arrived(msg.sender, tokenIndex);
   }
 
   /// @notice STEP 3: confirm the kami arrived in the pool (anyone/keeper). only now

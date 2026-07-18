@@ -445,6 +445,66 @@ contract KamiLeaseMarketTest is SetupTemplate {
   function dana() internal view returns (PlayerAccount memory) {
     return _getPlayerAccount(3);
   }
+
+  /////////////////
+  // ONE-TX 721 LISTING (market account lives in the bridge room, like live)
+
+  function _setMarketRoom(uint32 room) internal {
+    vm.startPrank(deployer);
+    _IndexRoomComponent.set(market.accID(), room);
+    vm.stopPrank();
+  }
+
+  function testListKami721OneTxAndFullCycle() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+    _unstakeKami(kamiID); // NFT sits in alice's wallet
+    _setMarketRoom(uint32(BRIDGE_721_ROOM));
+
+    // approve + list = pooled + rentable IN THE SAME TX. no send, no operator.
+    vm.startPrank(alice.owner);
+    _Kami721.approve(address(market), uint256(tokenIndex));
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    vm.stopPrank();
+
+    (, , , , , bool staked, , , ) = market.listings(tokenIndex);
+    assertTrue(staked, "pooled in the listing tx");
+    assertEq(LibKami.getAccount(components, kamiID), market.accID(), "custody: hub");
+
+    _fastForward(2 hours);
+    _accept(bob, tokenIndex);
+    assertEq(_renterOf(tokenIndex), bob.owner, "instantly rentable");
+
+    // full circle: lease ends -> NFT withdraw -> relist is one tx forever after
+    vm.prank(bob.owner);
+    market.endLease(tokenIndex);
+    vm.prank(alice.owner);
+    market.withdrawKami(tokenIndex);
+    assertEq(_Kami721.ownerOf(uint256(tokenIndex)), alice.owner, "NFT returned");
+
+    vm.startPrank(alice.owner);
+    _Kami721.approve(address(market), uint256(tokenIndex));
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    vm.stopPrank();
+    assertEq(market.numListings(), 1, "relisted in one tx");
+  }
+
+  function testListKami721Guards() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+    _unstakeKami(kamiID);
+    _setMarketRoom(uint32(BRIDGE_721_ROOM));
+
+    // not yours -> the 721 transfer itself refuses
+    vm.prank(bob.owner);
+    vm.expectRevert();
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+
+    // no approval -> refuses
+    vm.prank(alice.owner);
+    vm.expectRevert();
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+  }
 }
 
 /// @dev renter contract that rejects ETH — proves termination can't be held hostage

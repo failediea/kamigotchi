@@ -13,8 +13,13 @@ def room_of(acc):
     _, out, _ = cast("call", ROOMCOMP, "get(uint256)(uint32)", acc, "--rpc-url", RPC)
     return int(re.match(r"(\d+)", out).group(1)) if out else -1
 
+if len(sys.argv) > 1:
+    jobs = [(j["name"], j["acc"], j["key"], j["path"]) for j in json.load(open(sys.argv[1]))]
+else:
+    _hardcoded = True
 pods = json.load(open(os.path.expanduser("~/kamigotchi/tools/vault-kit/pods.json")))
-jobs = [
+if len(sys.argv) <= 1:
+ jobs = [
     ("HUB", "1425804748651105212219984478994559116987885527392",
      os.environ["OPERATOR_PRIVATE_KEY"], [29, 2, 3, 30, 4, 34, 12]),
     ("POD2", "421884181389582686297877971087608488169143461324",
