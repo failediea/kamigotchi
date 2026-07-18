@@ -43,13 +43,18 @@ const ADMIN_KEY = process.env.ADMIN_PRIVATE_KEY; // optional: enables auto-rotat
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const POLL_MS = 30_000;
 const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
+// after a lease ends the kami PARKS in its pod for this long — a re-rent on the
+// same tile starts instantly (no KamiSend, no 1h in-game cooldown). only after
+// the grace expires does it ship back to the hub pool.
+const PARK_GRACE_MS = Number(process.env.PARK_GRACE_HOURS || 2) * 3600_000;
 
 const STATE_FILE = new URL("./ops-state.json", import.meta.url).pathname;
 const state = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
   : { lastBlock: 0, strategies: {}, prefs: {} };
-state.strategies ??= {}; // tokenIndex -> node the strategy runs on
+state.strategies ??= {}; // tokenIndex -> node:risk the strategy runs as
 state.prefs ??= {}; // tokenIndex -> latest prefs JSON string
+state.parkedAt ??= {}; // tokenIndex -> ms timestamp the pod-park grace started
 const saveState = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 
 const loadJson = (rel) => {
@@ -73,6 +78,8 @@ const MARKET_ABI = [
   "function clearReturned(uint32 tokenIndex)",
   "function confirmArrival(uint32 tokenIndex)",
   "function rotateOperator(address newOperator)",
+  "function lastSettleAt() view returns (uint64)",
+  "function settleCooldown() view returns (uint64)",
   "event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs)",
   "event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund)",
   "event ReturnRequested(address indexed owner, uint32 indexed tokenIndex)",
@@ -266,16 +273,31 @@ async function stopStrategy(tokenIndex) {
 }
 
 // ---- the reconciler ---------------------------------------------------------
-// desired location: leased -> renter's pod; otherwise -> hub. converge with
-// operator-gated KamiSends; cooldown failures simply retry next tick.
+// desired location: leased -> renter's pod. unrented -> PARK IN PLACE for the
+// grace window (same-tile re-rents start instantly, no 1h send cooldown), then
+// back to the hub pool. converge with operator-gated KamiSends; cooldown
+// failures simply retry next tick.
 async function reconcile(idx, l) {
   const actualAcc = await idOwnsKami.getValue(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
   const { risk, node } = parsePrefs(idx);
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
+  const holdingPod = podByAccID(actualAcc);
   const targetPod = leased ? pods.get(node) : null;
-  const desiredAcc = leased ? targetPod.accID : marketAccID;
+
+  let desiredAcc;
+  if (leased) {
+    desiredAcc = targetPod.accID;
+    delete state.parkedAt[idx];
+  } else if (holdingPod) {
+    // unrented in a pod: parked. stay through the grace window, then go home.
+    if (state.parkedAt[idx] === undefined) state.parkedAt[idx] = Date.now();
+    const parked = Date.now() - state.parkedAt[idx] < PARK_GRACE_MS;
+    desiredAcc = parked ? actualAcc : marketAccID;
+  } else {
+    desiredAcc = marketAccID;
+  }
 
   if (actualAcc === desiredAcc) {
     // right tile: the renter's exact strategy (node AND risk) should be running
@@ -310,10 +332,19 @@ async function reconcile(idx, l) {
   }
 }
 
-// ---- return flow (kami must be in the HUB; reconciler brings it there) ------
+// ---- return flow: ONE direct KamiSend from wherever the kami is (hub OR a
+// parked pod) straight to the owner — no intermediate hop, no extra cooldown
 async function sendKamiHome(idx, ownerAddr, kamiID) {
   const at = await idOwnsKami.getValue(kamiID).catch(() => null);
-  if (at !== marketAccID) return; // still traveling pod -> hub; next tick
+  if (at === null) return;
+  let fromWallet = null;
+  if (at === marketAccID) fromWallet = operator;
+  else {
+    const holdingPod = podByAccID(at);
+    if (holdingPod) fromWallet = holdingPod.wallet;
+  }
+  if (!fromWallet) return; // outside the protocol: theft alarm's turf
+
   const ownerOperator = await addrOperator.getValue(BigInt(ownerAddr)).catch(() => null);
   if (!ownerOperator) {
     console.error(`return #${idx}: owner has no operator on file — manual return needed`);
@@ -321,26 +352,38 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
   }
   const opAddr = "0x" + BigInt(ownerOperator).toString(16).padStart(40, "0");
   try {
-    const tx = await kamiSendAs(operator).executeTyped(idx, opAddr);
+    const tx = await kamiSendAs(fromWallet).executeTyped(idx, opAddr);
     await tx.wait();
     console.log(`🏠 kami #${idx} sent home to ${ownerAddr} (${tx.hash})`);
     const clear = await market.connect(operator).clearReturned(idx);
     await clear.wait();
+    delete state.parkedAt[idx];
     console.log(`✅ return finalized on-chain for #${idx}`);
   } catch (e) {
     console.error(`return send failed #${idx}: ${e.message?.slice(0, 160)} (cooldown? retrying next tick)`);
   }
 }
 
-// ---- pod sweeps -------------------------------------------------------------
+// ---- pod sweeps: PAYDAY-ONLY ------------------------------------------------
+// settle() pays from the hub inventory, so pod earnings must be consolidated
+// before a settle — and ONLY then. no drip-sweeping (each sweep costs the
+// in-world transfer fee, which the platform absorbs; once per payday, not per
+// tick). the dApp's settle button also force-sweeps as a belt-and-suspenders.
 async function sweepPods() {
+  try {
+    const [last, cd] = await Promise.all([market.lastSettleAt(), market.settleCooldown()]);
+    const settleOpen = last === 0n || BigInt(Math.floor(Date.now() / 1000)) >= last + cd;
+    if (!settleOpen) return;
+  } catch {
+    return;
+  }
   for (const pod of pods.values()) {
     try {
       const bal = await pod.contract.musuBalance();
       if (bal >= BigInt(SWEEP_MIN_MUSU)) {
         const tx = await pod.contract.connect(operator).sweepMusu();
         await tx.wait();
-        console.log(`🧹 pod ${pod.node} swept ${bal} MUSU -> hub`);
+        console.log(`🧹 pod ${pod.node} swept ${bal} MUSU -> hub (settle window open)`);
       }
     } catch (e) {
       console.error(`sweep pod ${pod.node} failed: ${e.message?.slice(0, 120)}`);
@@ -423,9 +466,7 @@ async function tick() {
 
     if (l.returning) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
-      await sendKamiHome(idx, l.owner, l.kamiID); // reconciler handles pod->hub leg
-      const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
-      if (at !== null && at !== marketAccID && podByAccID(at)) await reconcile(idx, { ...l, renter: "0x0000000000000000000000000000000000000000" });
+      await sendKamiHome(idx, l.owner, l.kamiID); // direct from hub OR pod
       continue;
     }
 

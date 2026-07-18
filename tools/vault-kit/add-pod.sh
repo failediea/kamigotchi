@@ -29,6 +29,23 @@ if [ "$($CAST call "$REG" 'podForNode(uint32)(address)' "$NODE_IDX" --rpc-url "$
   echo "node $NODE_IDX already has a pod"; exit 1
 fi
 
+# PROTOCOL INVARIANT: pods only ever sit on MUSU-yield nodes. settle() attributes
+# earnings by XP delta, and XP == units of the node's OUTPUT ITEM — on a non-MUSU
+# node (VIP etc.) the hub would pay out MUSU that never arrived. Gated rooms are
+# a manual check: wilds only, no quest-locked areas (pod accounts can't quest).
+WORLD=0x2729174c265dbBd8416C6449E0E813E88f43D0E7
+COMPS=$($CAST call $WORLD 'components()(address)' --rpc-url "$YOMINET_RPC")
+IICOMP=$($CAST call $COMPS 'getEntitiesWithValue(uint256)(uint256[])' $($CAST keccak "component.index.item") --rpc-url "$YOMINET_RPC" \
+  | python3 -c "import re,sys;print('0x'+format(int(re.search(r'\[?(\d+)',sys.stdin.read()).group(1)),'040x'))")
+NODE_ID=$($CAST keccak $($CAST abi-encode --packed 'f(string,uint32)' "node" "$NODE_IDX"))
+NODE_ITEM=$($CAST call $IICOMP 'get(uint256)(uint32)' $NODE_ID --rpc-url "$YOMINET_RPC" 2>/dev/null || echo "0")
+if [ "${NODE_ITEM%% *}" != "1" ]; then
+  echo "REFUSED: node $NODE_IDX yields item ${NODE_ITEM:-none}, not MUSU (item 1)."
+  echo "Non-MUSU nodes break settle() attribution — pods are MUSU-wilds only."
+  exit 1
+fi
+echo "node $NODE_IDX verified: yields MUSU"
+
 echo "=== 1. operator keypair ==="
 J=$($CAST wallet new --json)
 OP_ADDR=$(echo "$J" | grep -o '"address": *"[^"]*"' | head -1 | cut -d'"' -f4)
