@@ -254,6 +254,9 @@ contract KamiLeaseMarket {
     Kami721StakeSystem(_sys(Kami721StakeSystemID)).executeTyped(tokenIndex);
 
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
+    // same admission rule as the legacy path: a renter must never receive a
+    // wounded kami. staking marks it RESTING; require effective full health too.
+    require(_isRestedFull(kamiID), "LeaseMkt: must be resting at full health");
     listings[tokenIndex] = Listing({
       owner: msg.sender,
       kamiID: kamiID,
@@ -367,6 +370,10 @@ contract KamiLeaseMarket {
       LibKami.getAccount(_comps(), l.kamiID) == uint256(uint160(l.owner)),
       "LeaseMkt: kami not home yet"
     );
+    // carry any earnings accrued AFTER requestReturn's snapshot (e.g. a harvest
+    // the automation hadn't stopped yet) before the listing is deleted, so the
+    // final delta is attributed to the owner instead of being orphaned.
+    _carryPending(tokenIndex);
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     emit ReturnCleared(l.owner, tokenIndex);
@@ -460,10 +467,12 @@ contract KamiLeaseMarket {
   ///         payouts can never be withheld, but randoms can't spam fee-burn it.
   function settle() external nonReentrant {
     require(accID != 0, "LeaseMkt: not initialized");
-    require(
-      msg.sender == admin || participations[msg.sender] > 0,
-      "LeaseMkt: not a participant"
-    );
+    // PERMISSIONLESS: anyone may trigger settlement (cooldown-gated). A former
+    // owner/renter whose listing was already cleared holds a carry but has zero
+    // active participations — gating on participation would let their payout be
+    // withheld until an admin acts. Spam is bounded by the cooldown, and the
+    // platform-fee flush is self-limiting (only its own accrued fee is ever
+    // burned), so opening this up costs an abuser only their own gas.
     require(
       lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
       "LeaseMkt: cooldown"
@@ -544,10 +553,7 @@ contract KamiLeaseMarket {
   ///         cursor has covered the pool. Funds can never be locked by pool size.
   function settleBounded(uint256 maxEntries) external nonReentrant {
     require(accID != 0, "LeaseMkt: not initialized");
-    require(
-      msg.sender == admin || participations[msg.sender] > 0,
-      "LeaseMkt: not a participant"
-    );
+    // permissionless, cooldown-gated (see settle())
     require(
       lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
       "LeaseMkt: cooldown"
@@ -658,6 +664,14 @@ contract KamiLeaseMarket {
 
   function numListings() external view returns (uint256) {
     return tokenIndices.length;
+  }
+
+  /// @notice the market account's CURRENT operator — the KamiSend destination.
+  ///         the dApp resolves the send target from THIS on-chain (not a
+  ///         hardcoded constant), so a redeploy can never leave a user sending
+  ///         a kami to a stale account.
+  function operatorAddr() external view returns (address) {
+    return LibAccount.getOperator(_comps(), accID);
   }
 
   function numCarries() external view returns (uint256) {

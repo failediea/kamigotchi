@@ -22,7 +22,7 @@
  * (per-pod Kamibots registrations). State persists in ops-state.json.
  */
 import { JsonRpcProvider, Wallet, Contract, id as keccakId } from "ethers";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -480,23 +480,46 @@ async function theftCheck() {
     console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the protocol (now in acc ${at}) WITHOUT a return request!`);
     writeFileSync(new URL("./THEFT-ALARM.txt", import.meta.url).pathname,
       `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`, { flag: "a" });
+
+    // LATCH: rotate ONCE per incident, never every tick. after an auto-rotate the
+    // stolen kami is still gone (condition persists), so without this the bot
+    // would re-rotate — and re-mint keys — on every poll.
+    if (state.alarmLatched) {
+      console.error(`🔒 alarm already latched — automation cut off; manual intervention required (clear state.alarmLatched to re-arm)`);
+      return;
+    }
+
     if (admin) {
-      // rotate EVERY key-holding operator — hub and bot pods. self pods are
+      // rotate EVERY key-holding operator to a fresh QUARANTINE key. self pods are
       // skipped: their operator is the guard CONTRACT (no key to compromise).
       const rotations = [["hub", (a) => market.connect(admin).rotateOperator(a)]];
       for (const pod of pods.values())
         rotations.push([`pod ${pod.node}`, (a) => pod.contract.connect(admin).rotateOperator(a)]);
+
+      // fresh keys are written to a 0600 file, NEVER to the log
+      const quarantine = {};
       for (const [name, rotate] of rotations) {
         try {
           const fresh = Wallet.createRandom();
-          console.error(`auto-rotating ${name} operator to ${fresh.address} (key printed ONCE): ${fresh.privateKey}`);
+          quarantine[name] = { address: fresh.address, privateKey: fresh.privateKey };
           const tx = await rotate(fresh.address);
           await tx.wait();
+          console.error(`🔒 ${name} operator rotated to ${fresh.address} (key in quarantine-keys.json, mode 600)`);
         } catch (e) {
           console.error(`rotate ${name} failed: ${e.message?.slice(0, 120)}`);
         }
       }
-      console.error(`🔒 all operators rotated — automation cut off`);
+      const qpath = new URL("./quarantine-keys.json", import.meta.url).pathname;
+      writeFileSync(qpath, JSON.stringify({ at: new Date().toISOString(), keys: quarantine }, null, 2), { mode: 0o600 });
+      try { chmodSync(qpath, 0o600); } catch {}
+      state.alarmLatched = true;
+      saveState();
+      console.error(`🔒 all operators rotated — automation cut off. keys quarantined; alarm LATCHED (no further auto-rotation).`);
+    } else {
+      // no admin key on this bot: alert only, and latch so we don't spam the alert
+      state.alarmLatched = true;
+      saveState();
+      console.error(`⚠️  no ADMIN key on this bot — CANNOT auto-rotate. Rotate operators manually NOW. Alarm latched.`);
     }
   }
 }

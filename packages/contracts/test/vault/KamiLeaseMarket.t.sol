@@ -380,19 +380,18 @@ contract KamiLeaseMarketTest is SetupTemplate {
   /////////////////
   // GOVERNANCE / GUARDS
 
-  function testSettleParticipantsOnly() public {
+  function testSettleIsPermissionless() public {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
     _marketHarvest(kamiID, 50_000);
 
-    address rando = _getNextUserAddress();
-    vm.prank(rando);
-    vm.expectRevert("LeaseMkt: not a participant");
+    // anyone can trigger settlement — payouts can never be withheld (KLM-03).
+    // still cooldown-gated so it can't be spammed.
+    uint256 bBefore = _accountMusu(bob);
+    vm.prank(_getNextUserAddress());
     market.settle();
-
-    vm.prank(alice.owner);
-    market.settle();
+    assertGt(_accountMusu(bob) - bBefore, 0, "rando-triggered settle paid the renter");
   }
 
   function testSettleCooldown() public {
@@ -551,6 +550,67 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.settleBounded(1);
     assertEq(_accountMusu(bob) - bBefore, bobShare, "bob exact across batches");
     assertEq(_accountMusu(d) - dBefore, dShare, "dana exact across batches");
+  }
+
+  /////////////////
+  // AUDIT R2: terminal-return carries are settleable by ANYONE (KLM-03)
+
+  function testTerminalCarrySettleableByAnyone() public {
+    uint32 idx = _listPool(alice, _mintKami(alice));
+    _accept(bob, idx);
+    _marketHarvest(LibKami.getByIndex(components, idx), 100_000);
+
+    vm.prank(bob.owner);
+    market.endLease(idx); // carries the lease split; bob participations -> 0
+    vm.prank(alice.owner);
+    market.requestReturn(idx);
+    _fastForward(_idleRequirement);
+    vm.prank(marketOperator);
+    _KamiSendSystem.executeTyped(idx, alice.operator);
+    market.clearReturned(idx); // alice participations -> 0
+
+    assertEq(market.numListings(), 0, "listing cleared");
+    assertGt(market.numCarries(), 0, "carry with earnings survives");
+
+    // a completely unrelated address (0 participations) can still settle: the
+    // documented "payouts can never be withheld" now holds in the terminal state
+    uint256 aBefore = _accountMusu(alice);
+    uint256 bBefore = _accountMusu(bob);
+    vm.prank(_getNextUserAddress());
+    market.settle();
+    assertGt(_accountMusu(alice) - aBefore, 0, "owner carry paid");
+    assertGt(_accountMusu(bob) - bBefore, 0, "renter carry paid");
+  }
+
+  /////////////////
+  // AUDIT R2: harvest after requestReturn is carried, not orphaned (KLM-04)
+
+  function testFinalHarvestAfterReturnIsCarried() public {
+    uint32 idx = _listPool(alice, _mintKami(alice));
+    uint256 kamiID = LibKami.getByIndex(components, idx);
+    _accept(bob, idx);
+    _marketHarvest(kamiID, 100_000);
+    vm.prank(bob.owner);
+    market.endLease(idx);
+
+    vm.prank(alice.owner);
+    market.requestReturn(idx); // snapshots XP here
+    _marketHarvest(kamiID, 50_000); // a harvest lands AFTER the snapshot
+    assertGt(market.pendingXpDelta(idx), 0, "post-request delta exists");
+
+    _fastForward(_idleRequirement);
+    vm.prank(marketOperator);
+    _KamiSendSystem.executeTyped(idx, alice.operator);
+
+    uint256 carriesBefore = market.numCarries();
+    market.clearReturned(idx);
+    // the post-request delta is carried by clearReturned, not deleted with the listing
+    assertGt(market.numCarries(), carriesBefore, "final harvest carried");
+
+    uint256 aBefore = _accountMusu(alice);
+    vm.prank(_getNextUserAddress());
+    market.settle();
+    assertGt(_accountMusu(alice) - aBefore, 0, "final harvest paid to owner, not lost");
   }
 
   /////////////////

@@ -3,6 +3,7 @@
 .env
 pods.json
 kamibots-credentials*.json
+quarantine-keys.json
 ops-state.json
 ops-bot.log
 THEFT-ALARM.txt
