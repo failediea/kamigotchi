@@ -55,11 +55,10 @@ const MARKET_ABI = [
   "function tokenIndices(uint256) view returns (uint32)",
   "function listings(uint32) view returns (address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, address renter, uint256 gasBudget)",
   "function clearReturned(uint32 tokenIndex)",
-  "function confirmDelivery(uint32 tokenIndex)",
+  "function confirmArrival(uint32 tokenIndex)",
   "function rotateOperator(address newOperator)",
   "event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs)",
   "event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund)",
-  "event Delivered(address indexed owner, uint32 indexed tokenIndex)",
   "event ReturnRequested(address indexed owner, uint32 indexed tokenIndex)",
   "event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs)",
 ];
@@ -116,8 +115,14 @@ const RISK = {
 };
 
 async function startStrategy(tokenIndex, prefsJson) {
+  // the RENTER's choices: node (tile) + risk profile
   let risk = "balanced";
-  try { risk = JSON.parse(prefsJson || "{}").risk || "balanced"; } catch {}
+  let node = DEFAULT_NODE;
+  try {
+    const p = JSON.parse(prefsJson || "{}");
+    risk = p.risk || "balanced";
+    if (Number.isFinite(Number(p.node)) && Number(p.node) > 0) node = Number(p.node);
+  } catch {}
   const cfg = RISK[risk] || RISK.balanced;
   try {
     await kb("/api/strategies/start", {
@@ -125,7 +130,7 @@ async function startStrategy(tokenIndex, prefsJson) {
       body: {
         strategyType: "harvestAndRest",
         kamiId: tokenIndex,
-        nodeId: DEFAULT_NODE,
+        nodeId: node,
         config: { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...cfg },
         keyData: { privy_id: creds.privyId },
       },
@@ -202,39 +207,35 @@ async function tick() {
   const head = await provider.getBlockNumber();
   const from = state.lastBlock ? state.lastBlock + 1 : Math.max(0, head - 5_000);
 
-  const [accepted, ended, delivered, returns_] = await Promise.all([
+  const [accepted, ended, returns_] = await Promise.all([
     market.queryFilter(market.filters.LeaseAccepted(), from, head),
     market.queryFilter(market.filters.LeaseEnded(), from, head),
-    market.queryFilter(market.filters.Delivered(), from, head),
     market.queryFilter(market.filters.ReturnRequested(), from, head),
   ]);
 
-  // v5: acceptance only opens the delivery window — remember the renter's prefs,
-  // farming starts at Delivered
-  state.prefs = state.prefs || {};
-  for (const e of accepted) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs;
-
-  for (const e of delivered) {
+  // v6 pool model: the kami is already pooled — the RENTER's prefs (their node/tile
+  // + strategy) start farming immediately. Pool kamis are NEVER farmed unrented.
+  for (const e of accepted) {
     const idx = Number(e.args.tokenIndex);
-    await startStrategy(idx, state.prefs[idx] || "");
+    await startStrategy(idx, e.args.prefs || "");
   }
   for (const e of ended) await stopStrategy(Number(e.args.tokenIndex));
 
-  // auto-confirm: any rented-undelivered listing whose kami has arrived
+  // auto-confirm arrivals: listed-but-unpooled kamis that have landed join the pool
   {
     const n = Number(await market.numListings());
     for (let i = 0; i < n; i++) {
       const idx = Number(await market.tokenIndices(i));
       const l = await market.listings(idx);
-      if (l.renter === "0x0000000000000000000000000000000000000000" || l.staked) continue;
+      if (l.staked) continue;
       const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
       if (at !== null && at === marketAccID) {
         try {
-          const tx = await market.connect(operator).confirmDelivery(idx);
+          const tx = await market.connect(operator).confirmArrival(idx);
           await tx.wait();
-          console.log(`📬 auto-confirmed delivery of kami #${idx}`);
+          console.log(`📬 kami #${idx} joined the pool`);
         } catch (e2) {
-          console.error(`confirmDelivery #${idx} failed: ${e2.message?.slice(0, 120)}`);
+          console.error(`confirmArrival #${idx} failed: ${e2.message?.slice(0, 120)}`);
         }
       }
     }
