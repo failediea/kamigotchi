@@ -147,7 +147,12 @@ async function wire() {
     return "0x" + e[0].toString(16).padStart(40, "0");
   };
   idOwnsKami = new Contract(await lookup(comps, "component.id.kami.owns"), COMP_ABI, provider);
-  addrOperator = new Contract(await lookup(comps, "component.address.operator"), COMP_ABI, provider);
+  // AddressOperatorComponent: use get(uint256)->address. getValue REVERTS on live.
+  addrOperator = new Contract(
+    await lookup(comps, "component.address.operator"),
+    ["function get(uint256) view returns (address)"],
+    provider
+  );
   kamiSendAddr = await lookup(systems, "system.kami.send");
   marketAccID = await market.accID();
   for (const pod of pods.values()) {
@@ -417,12 +422,11 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
   const holder = at === marketAccID ? null : podByAccID(at);
   if (at !== marketAccID && !holder) return; // outside the protocol: theft alarm's turf
 
-  const ownerOperator = await addrOperator.getValue(BigInt(ownerAddr)).catch(() => null);
-  if (!ownerOperator) {
+  const opAddr = await addrOperator.get(BigInt(ownerAddr)).catch(() => null);
+  if (!opAddr || opAddr === "0x0000000000000000000000000000000000000000") {
     console.error(`return #${idx}: owner has no operator on file — manual return needed`);
     return;
   }
-  const opAddr = "0x" + BigInt(ownerOperator).toString(16).padStart(40, "0");
   try {
     const tx = await shipOut(holder, idx, opAddr);
     console.log(`🏠 kami #${idx} sent home to ${ownerAddr} (${tx.hash})`);
