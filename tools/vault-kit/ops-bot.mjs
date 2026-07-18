@@ -1,18 +1,25 @@
 #!/usr/bin/env node
 /**
- * KamiLeaseMarket ops bot — the ONLY off-chain automation the market needs.
- * Everything user-facing is a dApp button; this covers the actions that require
- * the platform's keys:
+ * KamiLeaseMarket ops bot — v7 POD MODEL.
  *
- *   1. LeaseAccepted / SendConfirmed  -> start a Kamibots strategy (risk-mapped)
- *   2. LeaseEnded                     -> stop the strategy
- *   3. ReturnRequested               -> stop strategy, operator-KamiSend the kami
- *                                       home, then clearReturned() on-chain
- *   4. THEFT ALARM: any listed kami that leaves the market account without a
- *      return request -> loud alert (+ optional auto-rotate if ADMIN key present)
+ * Topology: one HUB account (the pool) + one parked RoomPod account per tile.
+ * Accounts NEVER move rooms; kamis are KamiSent between accounts instead:
  *
- * State (last processed block, active strategies) persists in ops-state.json.
- * Run: node ops-bot.mjs        (uses ./.env + ./kamibots-credentials.json)
+ *   idle / returning  -> kami belongs in the HUB
+ *   leased            -> kami belongs in the POD of the renter's chosen node
+ *
+ * Every tick runs a RECONCILER: desired location vs actual location, and issues
+ * the operator-gated KamiSend to converge (post-send cooldowns just mean the
+ * same move retries next tick). Strategies only ever run on a pod, only while
+ * leased, with the renter's node + risk. Pool kamis are NEVER farmed.
+ *
+ * Also: auto-confirmArrival, pod MUSU sweeps to the hub, owner returns
+ * (hub -> owner + clearReturned), and the THEFT ALARM (kami outside hub+pods
+ * without a return request -> alert + optional rotate of ALL operators).
+ *
+ * Files: ./.env, ./pods.json (pod addresses + operator keys),
+ * ./kamibots-credentials.json (hub), ./kamibots-credentials-pod<node>.json
+ * (per-pod Kamibots registrations). State persists in ops-state.json.
  */
 import { JsonRpcProvider, Wallet, Contract, id as keccakId } from "ethers";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -32,21 +39,27 @@ const OP_KEY = process.env.OPERATOR_PRIVATE_KEY;
 const ADMIN_KEY = process.env.ADMIN_PRIVATE_KEY; // optional: enables auto-rotate on theft
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const POLL_MS = 30_000;
-const DEFAULT_NODE = Number(process.env.DEFAULT_NODE_INDEX || 1);
+const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
 
 const STATE_FILE = new URL("./ops-state.json", import.meta.url).pathname;
 const state = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
-  : { lastBlock: 0, strategies: {} }; // strategies: tokenIndex -> true
+  : { lastBlock: 0, strategies: {}, prefs: {} };
+state.strategies ??= {}; // tokenIndex -> node the strategy runs on
+state.prefs ??= {}; // tokenIndex -> latest prefs JSON string
 const saveState = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 
-const creds = existsSync(new URL("./kamibots-credentials.json", import.meta.url).pathname)
-  ? JSON.parse(readFileSync(new URL("./kamibots-credentials.json", import.meta.url).pathname, "utf8"))
-  : null;
+const loadJson = (rel) => {
+  const p = new URL(rel, import.meta.url).pathname;
+  return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : null;
+};
+const hubCreds = loadJson("./kamibots-credentials.json");
+const podsFile = loadJson("./pods.json");
+if (!podsFile?.pods?.length) throw new Error("pods.json missing — deploy pods first");
 
 // ---- chain wiring -----------------------------------------------------------
 const provider = new JsonRpcProvider(RPC);
-const operator = new Wallet(OP_KEY, provider);
+const operator = new Wallet(OP_KEY, provider); // HUB operator
 const admin = ADMIN_KEY ? new Wallet(ADMIN_KEY, provider) : null;
 
 const MARKET_ABI = [
@@ -62,41 +75,62 @@ const MARKET_ABI = [
   "event ReturnRequested(address indexed owner, uint32 indexed tokenIndex)",
   "event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs)",
 ];
+const POD_ABI = [
+  "function accID() view returns (uint256)",
+  "function nodeIndex() view returns (uint32)",
+  "function musuBalance() view returns (uint256)",
+  "function sweepMusu() returns (uint256)",
+  "function rotateOperator(address newOperator)",
+];
 const market = new Contract(MARKET, MARKET_ABI, provider);
+
+/** node -> { node, label, address, contract, wallet, accID, creds } */
+const pods = new Map();
+for (const p of podsFile.pods) {
+  pods.set(Number(p.node), {
+    node: Number(p.node),
+    label: p.label,
+    address: p.address,
+    contract: new Contract(p.address, POD_ABI, provider),
+    wallet: new Wallet(p.operatorKey, provider),
+    accID: null,
+    creds: loadJson(`./kamibots-credentials-pod${p.node}.json`),
+  });
+}
+const DEFAULT_NODE = Number(process.env.DEFAULT_NODE_INDEX || [...pods.keys()][0]);
 
 const world = new Contract(WORLD, ["function components() view returns (address)", "function systems() view returns (address)"], provider);
 const REG_ABI = ["function getEntitiesWithValue(uint256 value) view returns (uint256[])"];
 const COMP_ABI = [...REG_ABI, "function getValue(uint256 entity) view returns (uint256)"];
 
-let comps, systems, idOwnsKami, addrOperator, kamiSendSystem, marketAccID;
+let comps, idOwnsKami, addrOperator, kamiSendAddr, marketAccID;
+const KAMI_SEND_ABI = ["function executeTyped(uint32 kamiIndex, address toAddress) returns (bytes)"];
 
 async function wire() {
   const [compsAddr, sysAddr] = await Promise.all([world.components(), world.systems()]);
   comps = new Contract(compsAddr, REG_ABI, provider);
-  systems = new Contract(sysAddr, REG_ABI, provider);
-  const compAddr = async (idStr) => {
-    const e = await comps.getEntitiesWithValue(BigInt(keccakId(idStr)));
-    if (!e.length) throw new Error(`component not found: ${idStr}`);
+  const systems = new Contract(sysAddr, REG_ABI, provider);
+  const lookup = async (reg, idStr) => {
+    const e = await reg.getEntitiesWithValue(BigInt(keccakId(idStr)));
+    if (!e.length) throw new Error(`not found: ${idStr}`);
     return "0x" + e[0].toString(16).padStart(40, "0");
   };
-  const sysAddrOf = async (idStr) => {
-    const e = await systems.getEntitiesWithValue(BigInt(keccakId(idStr)));
-    if (!e.length) throw new Error(`system not found: ${idStr}`);
-    return "0x" + e[0].toString(16).padStart(40, "0");
-  };
-  idOwnsKami = new Contract(await compAddr("component.id.kami.owns"), COMP_ABI, provider);
-  addrOperator = new Contract(await compAddr("component.address.operator"), COMP_ABI, provider);
-  kamiSendSystem = new Contract(
-    await sysAddrOf("system.kami.send"),
-    ["function executeTyped(uint32 kamiIndex, address toAddress) returns (bytes)"],
-    operator
-  );
+  idOwnsKami = new Contract(await lookup(comps, "component.id.kami.owns"), COMP_ABI, provider);
+  addrOperator = new Contract(await lookup(comps, "component.address.operator"), COMP_ABI, provider);
+  kamiSendAddr = await lookup(systems, "system.kami.send");
   marketAccID = await market.accID();
-  console.log(`wired. market acc ${marketAccID}`);
+  for (const pod of pods.values()) {
+    pod.accID = await pod.contract.accID();
+    console.log(`pod node ${pod.node} (${pod.label}) acc ${pod.accID} kamibots:${pod.creds ? "✓" : "✗ NOT REGISTERED"}`);
+  }
+  console.log(`wired. hub acc ${marketAccID}, ${pods.size} pods`);
 }
 
-// ---- kamibots ---------------------------------------------------------------
-async function kb(path, opts = {}) {
+const podByAccID = (acc) => [...pods.values()].find((p) => p.accID === acc) || null;
+const kamiSendAs = (wallet) => new Contract(kamiSendAddr, KAMI_SEND_ABI, wallet);
+
+// ---- kamibots (per-registration creds) --------------------------------------
+async function kb(creds, path, opts = {}) {
   if (!creds) throw new Error("no kamibots credentials");
   const res = await fetch(`${KAMIBOTS}${path}`, {
     method: opts.method || "GET",
@@ -114,90 +148,175 @@ const RISK = {
   aggressive: { useHpBasedRest: true, hpThresholdLow: 15, hpThresholdHigh: 60 },
 };
 
-async function startStrategy(tokenIndex, prefsJson) {
-  // the RENTER's choices: node (tile) + risk profile
+function parsePrefs(idx) {
   let risk = "balanced";
   let node = DEFAULT_NODE;
   try {
-    const p = JSON.parse(prefsJson || "{}");
-    risk = p.risk || "balanced";
-    if (Number.isFinite(Number(p.node)) && Number(p.node) > 0) node = Number(p.node);
+    const p = JSON.parse(state.prefs[idx] || "{}");
+    if (RISK[p.risk]) risk = p.risk;
+    if (pods.has(Number(p.node))) node = Number(p.node);
   } catch {}
-  const cfg = RISK[risk] || RISK.balanced;
+  return { risk, node };
+}
+
+const warnedPods = new Set();
+async function startStrategy(pod, tokenIndex, risk) {
+  if (!pod.creds) {
+    if (!warnedPods.has(pod.node)) {
+      warnedPods.add(pod.node);
+      console.error(`⚠️  pod node ${pod.node} has NO Kamibots registration (kamibots-credentials-pod${pod.node}.json) — kami #${tokenIndex} is parked but NOT farming`);
+    }
+    return;
+  }
   try {
-    await kb("/api/strategies/start", {
+    await kb(pod.creds, "/api/strategies/start", {
       method: "POST",
       body: {
         strategyType: "harvestAndRest",
         kamiId: tokenIndex,
-        nodeId: node,
-        config: { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...cfg },
-        keyData: { privy_id: creds.privyId },
+        nodeId: pod.node,
+        config: { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...(RISK[risk] || RISK.balanced) },
+        keyData: { privy_id: pod.creds.privyId },
       },
     });
-    state.strategies[tokenIndex] = true;
-    console.log(`▶️  strategy started for kami #${tokenIndex} (${risk})`);
+    state.strategies[tokenIndex] = pod.node;
+    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}) via ${pod.label}`);
   } catch (e) {
-    console.error(`strategy start failed #${tokenIndex}: ${e.message}`);
+    console.error(`strategy start failed #${tokenIndex} on pod ${pod.node}: ${e.message}`);
   }
 }
 
 async function stopStrategy(tokenIndex) {
-  try {
-    await kb(`/api/strategies/kami/${tokenIndex}`, {
-      method: "DELETE",
-      body: { keyData: { privy_id: creds.privyId } },
-    });
-  } catch (e) {
-    if (!/404/.test(e.message)) console.error(`strategy stop failed #${tokenIndex}: ${e.message}`);
+  const node = state.strategies[tokenIndex];
+  if (node === undefined) return;
+  const pod = pods.get(Number(node));
+  if (pod?.creds) {
+    try {
+      await kb(pod.creds, `/api/strategies/kami/${tokenIndex}`, {
+        method: "DELETE",
+        body: { keyData: { privy_id: pod.creds.privyId } },
+      });
+    } catch (e) {
+      if (!/404/.test(e.message)) console.error(`strategy stop failed #${tokenIndex}: ${e.message}`);
+    }
   }
   delete state.strategies[tokenIndex];
-  console.log(`⏹️  strategy stopped for kami #${tokenIndex}`);
+  console.log(`⏹️  strategy stopped for kami #${tokenIndex} (pod ${node})`);
 }
 
-// ---- return flow ------------------------------------------------------------
-async function sendKamiHome(tokenIndex, ownerAddr) {
-  // KamiSend targets are resolved by the TARGET account's operator address
-  const ownerAccID = BigInt(ownerAddr);
-  const ownerOperator = await addrOperator.getValue(ownerAccID).catch(() => null);
+// ---- the reconciler ---------------------------------------------------------
+// desired location: leased -> renter's pod; otherwise -> hub. converge with
+// operator-gated KamiSends; cooldown failures simply retry next tick.
+async function reconcile(idx, l) {
+  const actualAcc = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+  if (actualAcc === null) return;
+
+  const { risk, node } = parsePrefs(idx);
+  const leased = l.renter !== "0x0000000000000000000000000000000000000000";
+  const targetPod = leased ? pods.get(node) : null;
+  const desiredAcc = leased ? targetPod.accID : marketAccID;
+
+  if (actualAcc === desiredAcc) {
+    if (leased && state.strategies[idx] !== targetPod.node) {
+      // arrived at the right tile: strategy should be running there
+      if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+      await startStrategy(targetPod, idx, risk);
+    }
+    return;
+  }
+
+  // wrong place. never farm while relocating.
+  if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+
+  // who currently holds it, and can we move it?
+  let fromWallet = null;
+  if (actualAcc === marketAccID) fromWallet = operator;
+  else {
+    const holdingPod = podByAccID(actualAcc);
+    if (holdingPod) fromWallet = holdingPod.wallet;
+  }
+  if (!fromWallet) return; // outside hub+pods: arrival flow or theft alarm owns this
+
+  const toAddr = leased ? targetPod.wallet.address : operator.address;
+  try {
+    const tx = await kamiSendAs(fromWallet).executeTyped(idx, toAddr);
+    await tx.wait();
+    console.log(`🚚 kami #${idx} shipped -> ${leased ? `pod ${targetPod.node} (${targetPod.label})` : "hub pool"} (${tx.hash})`);
+  } catch (e) {
+    const msg = e.message?.slice(0, 140) || "";
+    if (!/cooldown|resting/i.test(msg)) console.error(`ship #${idx} failed: ${msg}`);
+    // else: kami mid-rest or post-send cooldown — retry next tick
+  }
+}
+
+// ---- return flow (kami must be in the HUB; reconciler brings it there) ------
+async function sendKamiHome(idx, ownerAddr, kamiID) {
+  const at = await idOwnsKami.getValue(kamiID).catch(() => null);
+  if (at !== marketAccID) return; // still traveling pod -> hub; next tick
+  const ownerOperator = await addrOperator.getValue(BigInt(ownerAddr)).catch(() => null);
   if (!ownerOperator) {
-    console.error(`return #${tokenIndex}: owner has no operator on file — manual return needed`);
+    console.error(`return #${idx}: owner has no operator on file — manual return needed`);
     return;
   }
   const opAddr = "0x" + BigInt(ownerOperator).toString(16).padStart(40, "0");
   try {
-    const tx = await kamiSendSystem.executeTyped(tokenIndex, opAddr);
+    const tx = await kamiSendAs(operator).executeTyped(idx, opAddr);
     await tx.wait();
-    console.log(`🏠 kami #${tokenIndex} sent home to ${ownerAddr} (${tx.hash})`);
-    const clear = await market.connect(operator).clearReturned(tokenIndex);
+    console.log(`🏠 kami #${idx} sent home to ${ownerAddr} (${tx.hash})`);
+    const clear = await market.connect(operator).clearReturned(idx);
     await clear.wait();
-    console.log(`✅ return finalized on-chain for #${tokenIndex}`);
+    console.log(`✅ return finalized on-chain for #${idx}`);
   } catch (e) {
-    console.error(`return send failed #${tokenIndex}: ${e.message?.slice(0, 200)} (cooldown? retrying next tick)`);
+    console.error(`return send failed #${idx}: ${e.message?.slice(0, 160)} (cooldown? retrying next tick)`);
+  }
+}
+
+// ---- pod sweeps -------------------------------------------------------------
+async function sweepPods() {
+  for (const pod of pods.values()) {
+    try {
+      const bal = await pod.contract.musuBalance();
+      if (bal >= BigInt(SWEEP_MIN_MUSU)) {
+        const tx = await pod.contract.connect(operator).sweepMusu();
+        await tx.wait();
+        console.log(`🧹 pod ${pod.node} swept ${bal} MUSU -> hub`);
+      }
+    } catch (e) {
+      console.error(`sweep pod ${pod.node} failed: ${e.message?.slice(0, 120)}`);
+    }
   }
 }
 
 // ---- theft alarm ------------------------------------------------------------
-const returningSet = new Set();
 async function theftCheck() {
+  const allowed = new Set([marketAccID, ...[...pods.values()].map((p) => p.accID)]);
   const n = Number(await market.numListings());
   for (let i = 0; i < n; i++) {
     const idx = Number(await market.tokenIndices(i));
     const l = await market.listings(idx);
     if (!l.staked || l.returning) continue;
-    const kamis = await idOwnsKami.getValue(l.kamiID).catch(() => null);
-    if (kamis === null) continue;
-    if (kamis !== marketAccID) {
-      console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the market account WITHOUT a return request!`);
-      writeFileSync(new URL("./THEFT-ALARM.txt", import.meta.url).pathname,
-        `${new Date().toISOString()} kami #${idx} moved to acc ${kamis}\n`, { flag: "a" });
-      if (admin) {
-        const fresh = Wallet.createRandom();
-        console.error(`auto-rotating operator to ${fresh.address} (key printed ONCE): ${fresh.privateKey}`);
-        const tx = await market.connect(admin).rotateOperator(fresh.address);
-        await tx.wait();
-        console.error(`🔒 operator rotated — automation cut off`);
+    const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+    if (at === null || allowed.has(at)) continue;
+
+    console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the protocol (now in acc ${at}) WITHOUT a return request!`);
+    writeFileSync(new URL("./THEFT-ALARM.txt", import.meta.url).pathname,
+      `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`, { flag: "a" });
+    if (admin) {
+      // rotate EVERY operator — hub and pods — and cut all automation off
+      const rotations = [["hub", (a) => market.connect(admin).rotateOperator(a)]];
+      for (const pod of pods.values())
+        rotations.push([`pod ${pod.node}`, (a) => pod.contract.connect(admin).rotateOperator(a)]);
+      for (const [name, rotate] of rotations) {
+        try {
+          const fresh = Wallet.createRandom();
+          console.error(`auto-rotating ${name} operator to ${fresh.address} (key printed ONCE): ${fresh.privateKey}`);
+          const tx = await rotate(fresh.address);
+          await tx.wait();
+        } catch (e) {
+          console.error(`rotate ${name} failed: ${e.message?.slice(0, 120)}`);
+        }
       }
+      console.error(`🔒 all operators rotated — automation cut off`);
     }
   }
 }
@@ -207,27 +326,26 @@ async function tick() {
   const head = await provider.getBlockNumber();
   const from = state.lastBlock ? state.lastBlock + 1 : Math.max(0, head - 5_000);
 
-  const [accepted, ended, returns_] = await Promise.all([
+  const [accepted, ended, prefEvents] = await Promise.all([
     market.queryFilter(market.filters.LeaseAccepted(), from, head),
     market.queryFilter(market.filters.LeaseEnded(), from, head),
-    market.queryFilter(market.filters.ReturnRequested(), from, head),
+    market.queryFilter(market.filters.PrefsUpdated(), from, head),
   ]);
-
-  // v6 pool model: the kami is already pooled — the RENTER's prefs (their node/tile
-  // + strategy) start farming immediately. Pool kamis are NEVER farmed unrented.
-  for (const e of accepted) {
+  for (const e of accepted) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs || "";
+  for (const e of prefEvents) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs || "";
+  for (const e of ended) {
     const idx = Number(e.args.tokenIndex);
-    await startStrategy(idx, e.args.prefs || "");
+    delete state.prefs[idx];
+    await stopStrategy(idx); // fast stop; reconciler ships it back to the hub
   }
-  for (const e of ended) await stopStrategy(Number(e.args.tokenIndex));
 
-  // auto-confirm arrivals: listed-but-unpooled kamis that have landed join the pool
-  {
-    const n = Number(await market.numListings());
-    for (let i = 0; i < n; i++) {
-      const idx = Number(await market.tokenIndices(i));
-      const l = await market.listings(idx);
-      if (l.staked) continue;
+  const n = Number(await market.numListings());
+  for (let i = 0; i < n; i++) {
+    const idx = Number(await market.tokenIndices(i));
+    const l = await market.listings(idx);
+
+    // arrivals: listed-but-unpooled kami that landed in the hub joins the pool
+    if (!l.staked) {
       const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
       if (at !== null && at === marketAccID) {
         try {
@@ -238,29 +356,28 @@ async function tick() {
           console.error(`confirmArrival #${idx} failed: ${e2.message?.slice(0, 120)}`);
         }
       }
+      continue;
     }
-  }
-  for (const e of returns_) {
-    const idx = Number(e.args.tokenIndex);
-    returningSet.add(idx);
-    await stopStrategy(idx);
-    await sendKamiHome(idx, e.args.owner);
+
+    if (l.returning) {
+      if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+      await sendKamiHome(idx, l.owner, l.kamiID); // reconciler handles pod->hub leg
+      const at = await idOwnsKami.getValue(l.kamiID).catch(() => null);
+      if (at !== null && at !== marketAccID && podByAccID(at)) await reconcile(idx, { ...l, renter: "0x0000000000000000000000000000000000000000" });
+      continue;
+    }
+
+    await reconcile(idx, l);
   }
 
-  // retry unfinished returns (cooldown etc.)
-  for (const idx of [...returningSet]) {
-    const l = await market.listings(idx).catch(() => null);
-    if (!l || !l.returning) { returningSet.delete(idx); continue; }
-    await sendKamiHome(idx, l.owner);
-  }
-
+  await sweepPods();
   await theftCheck();
   state.lastBlock = head;
   saveState();
 }
 
 await wire();
-console.log(`ops-bot online. market ${MARKET}, operator ${operator.address}, admin ${admin ? "armed" : "not set"}`);
+console.log(`ops-bot v7 online. hub ${MARKET}, hub operator ${operator.address}, pods [${[...pods.keys()].join(", ")}], admin ${admin ? "armed" : "not set"}`);
 for (;;) {
   try { await tick(); } catch (e) { console.error(`tick error: ${e.message?.slice(0, 200)}`); }
   await new Promise((r) => setTimeout(r, POLL_MS));

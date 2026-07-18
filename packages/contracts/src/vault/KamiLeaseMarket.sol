@@ -451,9 +451,12 @@ contract KamiLeaseMarket {
 
     if (totalDelta == 0) return;
 
-    // deltas should always be fully backed (inflow == sum of deltas); if the balance
-    // ever falls short, degrade pro-rata instead of reverting
-    bool scaled = totalDelta > payable_;
+    // pods sweep their earnings to the hub minus the in-world transfer fee, so the
+    // balance can run slightly short of attribution. THE PLATFORM ABSORBS that gap
+    // out of its own cut — lease pools stay exact, nothing is socialized. only if
+    // the gap somehow exceeded the entire platform cut do payouts degrade pro-rata.
+    uint256 shortfall = totalDelta > payable_ ? totalDelta - payable_ : 0;
+    bool scaled = shortfall > 0 && shortfall + count > (totalDelta * mgmtBps) / 10000;
 
     // ---- pass 2: pay each lease its own pool
     uint256 mgmtAdd;
@@ -475,6 +478,9 @@ contract KamiLeaseMarket {
         if (net - ownerCut > 0) paidOut += _payout(e.renter, net - ownerCut);
       }
     }
+
+    // the platform's cut pays the pods' sweep fees (see shortfall above)
+    if (!scaled && shortfall > 0) mgmtAdd = mgmtAdd > shortfall ? mgmtAdd - shortfall : 0;
 
     // platform fees accrue and flush whenever a mgmt account is set — never recycled
     mgmtAccrued += mgmtAdd;

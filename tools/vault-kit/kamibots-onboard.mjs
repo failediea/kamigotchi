@@ -27,8 +27,19 @@
 import { Wallet } from "ethers";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
+// auto-load ./.env (KEY=value lines) so no exports are needed
+const envPath = new URL("./.env", import.meta.url).pathname;
+if (existsSync(envPath)) {
+  for (const line of readFileSync(envPath, "utf8").split("\n")) {
+    const m = line.match(/^([A-Z_]+)=(.+)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+  }
+}
+
 const API = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
-const CREDS_FILE = new URL("./kamibots-credentials.json", import.meta.url).pathname;
+// override for per-pod registrations, e.g. CREDS_FILE=./kamibots-credentials-pod1.json
+const CREDS_FILE = new URL(process.env.CREDS_FILE || "./kamibots-credentials.json", import.meta.url)
+  .pathname;
 
 function loadCreds() {
   if (!existsSync(CREDS_FILE)) return null;
