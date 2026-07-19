@@ -32,7 +32,7 @@ contract DeploySelfFarm is Script {
       : LeasePodRegistry(regAddr);
 
     HarvestGuard guard = new HarvestGuard(world, hub, keeper);
-    RoomPod pod = new RoomPod(world, hub, node, label);
+    RoomPod pod = new RoomPod(world, hub, node, label, uint32(vm.envOr("PAY_ITEM", uint256(1))));
     pod.initialize(address(guard), name); // THE GUARD IS THE OPERATOR
     guard.setPod(address(pod));
     registry.addPod(address(pod));

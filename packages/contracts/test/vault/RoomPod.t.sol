@@ -38,13 +38,13 @@ contract RoomPodTest is SetupTemplate {
     marketOperator = _getNextUserAddress();
     podOperator = _getNextUserAddress();
 
-    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
+    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, 1);
     market.initialize(marketOperator, "leasemkt");
     market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);
 
     registry = new LeasePodRegistry(address(market));
-    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (EERIE)");
+    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (EERIE)", 1);
     pod.initialize(podOperator, "leasepod1");
     registry.addPod(address(pod));
 
@@ -111,18 +111,18 @@ contract RoomPodTest is SetupTemplate {
     assertTrue(pod.accID() != 0, "pod account registered");
 
     // one pod per node
-    RoomPod dup = new RoomPod(world, address(market), POD_NODE, "dup");
+    RoomPod dup = new RoomPod(world, address(market), POD_NODE, "dup", 1);
     dup.initialize(_getNextUserAddress(), "leasepodx");
     vm.expectRevert("Registry: node already served");
     registry.addPod(address(dup));
 
     // wrong hub rejected
-    RoomPod stray = new RoomPod(world, address(0xdead), 2, "stray");
+    RoomPod stray = new RoomPod(world, address(0xdead), 2, "stray", 1);
     vm.expectRevert("Registry: pod serves another hub");
     registry.addPod(address(stray));
 
     // uninitialized rejected
-    RoomPod raw = new RoomPod(world, address(market), 2, "raw");
+    RoomPod raw = new RoomPod(world, address(market), 2, "raw", 1);
     vm.expectRevert("Registry: pod not initialized");
     registry.addPod(address(raw));
 

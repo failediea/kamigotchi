@@ -34,13 +34,13 @@ contract HarvestGuardTest is SetupTemplate {
     marketOperator = _getNextUserAddress();
     keeper = _getNextUserAddress();
 
-    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
+    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, 1);
     market.initialize(marketOperator, "leasemkt");
     market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);
 
     guard = new HarvestGuard(world, address(market), keeper);
-    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (self-farm)");
+    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (self-farm)", 1);
     pod.initialize(address(guard), "selfpod1"); // THE GUARD IS THE OPERATOR
     guard.setPod(address(pod));
 

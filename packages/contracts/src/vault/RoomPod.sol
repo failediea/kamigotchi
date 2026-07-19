@@ -36,7 +36,8 @@ interface IHub {
 contract RoomPod {
   IWorld public immutable world;
   IHub public immutable hub;
-  uint32 public immutable nodeIndex; // the tile this pod farms, forever
+  uint32 public immutable nodeIndex;
+  uint32 public immutable payItem; // the ONE item this pod sweeps to the hub // the tile this pod farms, forever
 
   address public admin;
   uint256 public accID; // this pod's game account
@@ -51,12 +52,13 @@ contract RoomPod {
     _;
   }
 
-  constructor(IWorld _world, address _hub, uint32 _nodeIndex, string memory _label) {
+  constructor(IWorld _world, address _hub, uint32 _nodeIndex, string memory _label, uint32 _payItem) {
     world = _world;
     hub = IHub(_hub);
     nodeIndex = _nodeIndex;
     label = _label;
     admin = msg.sender;
+    payItem = _payItem;
   }
 
   /// @notice register this pod's game account (contract-owned, like the hub's)
@@ -80,20 +82,20 @@ contract RoomPod {
   ///         the destination is hard-wired to the hub's game account. the
   ///         in-world transfer fee comes out of the swept amount.
   function sweepMusu() external returns (uint256 swept) {
-    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     if (bal <= TRANSFER_FEE) return 0;
     swept = bal - TRANSFER_FEE;
 
     uint32[] memory indices = new uint32[](1);
     uint256[] memory amts = new uint256[](1);
-    indices[0] = MUSU_INDEX;
+    indices[0] = payItem;
     amts[0] = swept;
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, hub.accID());
     emit Swept(swept);
   }
 
   function musuBalance() external view returns (uint256) {
-    return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    return LibInventory.getBalanceOf(_comps(), accID, payItem);
   }
 
   function _sys(uint256 id) internal view returns (address) {

@@ -30,7 +30,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     super.setUp();
 
     marketOperator = _getNextUserAddress();
-    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
+    market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, 1);
     market.initialize(marketOperator, "leasemkt");
     market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);

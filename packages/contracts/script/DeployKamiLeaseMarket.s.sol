@@ -40,7 +40,7 @@ contract DeployKamiLeaseMarket is Script {
     require(kami721Addr != address(0), "Kami721 address not found");
 
     vm.startBroadcast();
-    KamiLeaseMarket market = new KamiLeaseMarket(world, Kami721(kami721Addr), mgmtBps);
+    KamiLeaseMarket market = new KamiLeaseMarket(world, Kami721(kami721Addr), mgmtBps, uint32(vm.envOr("PAY_ITEM", uint256(1))));
     market.initialize(operator, name);
     market.setSettler(settler);
     uint256 mgmtAccID = vm.envOr("MGMT_ACC_ID", uint256(0));

@@ -25,10 +25,15 @@ import { JsonRpcProvider, Wallet, Contract, id as keccakId } from "ethers";
 import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 // ---- env / config -----------------------------------------------------------
-const envPath = new URL("./.env", import.meta.url).pathname;
+// OPS_DIR: run several markets from ONE bot binary — each market gets its own
+// config directory (.env, pods.json, creds, state). Defaults to this file dir.
+const OPS_DIR = process.env.OPS_DIR
+  ? resolve(process.env.OPS_DIR)
+  : dirname(fileURLToPath(import.meta.url));
+const envPath = join(OPS_DIR, ".env");
 if (existsSync(envPath)) {
   for (const line of readFileSync(envPath, "utf8").split("\n")) {
     const m = line.match(/^([A-Z_]+)=(.+)$/);
@@ -50,7 +55,7 @@ const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
 // the grace expires does it ship back to the hub pool.
 const PARK_GRACE_MS = Number(process.env.PARK_GRACE_HOURS || 2) * 3600_000;
 
-const STATE_FILE = new URL("./ops-state.json", import.meta.url).pathname;
+const STATE_FILE = join(OPS_DIR, "ops-state.json");
 const state = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
   : { lastBlock: 0, strategies: {}, prefs: {} };
@@ -60,7 +65,7 @@ state.parkedAt ??= {}; // tokenIndex -> ms timestamp the pod-park grace started
 const saveState = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 
 const loadJson = (rel) => {
-  const p = new URL(rel, import.meta.url).pathname;
+  const p = join(OPS_DIR, rel);
   return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : null;
 };
 const hubCreds = loadJson("./kamibots-credentials.json");
@@ -199,7 +204,7 @@ async function ensureRegistered(pod) {
   try {
     console.log(`🤝 auto-registering pod ${pod.node} on Kamibots…`);
     execSync(`bash ./register-pods.sh ${pod.node}`, {
-      cwd: dirname(fileURLToPath(import.meta.url)),
+      cwd: OPS_DIR,
       stdio: "inherit",
     });
     pod.creds = loadJson(`./kamibots-credentials-pod${pod.node}.json`);
@@ -594,7 +599,7 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
 // dumps the bot's view + each pod's kamibots strategy status to a JSON file the
 // dApp serves (same filesystem) — live "is it actually running" telemetry
 // without ever handing pod API keys to the web app.
-const LIVE_STATUS_FILE = new URL("./live-status.json", import.meta.url).pathname;
+const LIVE_STATUS_FILE = join(OPS_DIR, "live-status.json");
 async function exportLiveStatus() {
   const out = { t: Date.now(), strategies: state.strategies, parkedAt: state.parkedAt, pods: {} };
   for (const pod of pods.values()) {
@@ -679,7 +684,7 @@ async function theftCheck() {
     if (at === null || allowed.has(at)) continue;
 
     console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the protocol (now in acc ${at}) WITHOUT a return request!`);
-    writeFileSync(new URL("./THEFT-ALARM.txt", import.meta.url).pathname,
+    writeFileSync(join(OPS_DIR, "THEFT-ALARM.txt"),
       `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`, { flag: "a" });
 
     // LATCH: rotate ONCE per incident, never every tick. after an auto-rotate the
@@ -710,7 +715,7 @@ async function theftCheck() {
           console.error(`rotate ${name} failed: ${e.message?.slice(0, 120)}`);
         }
       }
-      const qpath = new URL("./quarantine-keys.json", import.meta.url).pathname;
+      const qpath = join(OPS_DIR, "quarantine-keys.json");
       writeFileSync(qpath, JSON.stringify({ at: new Date().toISOString(), keys: quarantine }, null, 2), { mode: 0o600 });
       try { chmodSync(qpath, 0o600); } catch {}
       state.alarmLatched = true;

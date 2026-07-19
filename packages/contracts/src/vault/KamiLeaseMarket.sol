@@ -72,6 +72,10 @@ contract KamiLeaseMarket {
 
   IWorld public immutable world;
   Kami721 public immutable kami721;
+  /// @notice the ONE item this market settles in (1 = MUSU, 2 = VIPP, …).
+  ///         Every pod of this market sits on a node yielding exactly this item,
+  ///         so XP-delta attribution stays exact per market.
+  uint32 public immutable payItem;
   address public admin;
 
   uint256 public accID; // the market's game account
@@ -129,6 +133,7 @@ contract KamiLeaseMarket {
   error NoGas();
   error NoReturnRequested();
   error NotAdmin();
+  error PayItemZero();
   error NotAnAccount();
   error NotArrived();
   error NotEnding();
@@ -198,12 +203,14 @@ contract KamiLeaseMarket {
   ///////////////////
   // SETUP / ADMIN
 
-  constructor(IWorld _world, Kami721 _kami721, uint16 _mgmtBps) {
+  constructor(IWorld _world, Kami721 _kami721, uint16 _mgmtBps, uint32 _payItem) {
     require(_mgmtBps <= 3000, FeeTooHigh());
+    require(_payItem != 0, PayItemZero());
     world = _world;
     kami721 = _kami721;
     admin = msg.sender;
     mgmtBps = _mgmtBps;
+    payItem = _payItem;
   }
 
   function initialize(address operator, string calldata name) external onlyAdmin {
@@ -671,13 +678,13 @@ contract KamiLeaseMarket {
   ///         transfer fee). the fee comes out of the claimed amount.
   function claimOwed() external nonReentrant {
     uint256 amount = owedMusu[msg.sender];
-    require(amount > TRANSFER_FEE, NothingClaimable());
+    require(amount > _claimFee(), NothingClaimable());
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), RegisterAnAccountFirst());
-    require(LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) >= amount, "LM: not backed yet");
+    require(LibInventory.getBalanceOf(_comps(), accID, payItem) >= amount, "LM: not backed yet");
     owedMusu[msg.sender] = 0;
     owedMusuTotal -= amount; // release the reservation as the funds leave
-    _transferMusu(target, amount - TRANSFER_FEE);
+    _transferMusu(target, amount - _claimFee());
     emit OwedClaimed(msg.sender, amount);
   }
 
@@ -686,12 +693,19 @@ contract KamiLeaseMarket {
   ///         out of management, never from owners or renters.
   function claimMgmt() external onlyAdmin nonReentrant {
     require(mgmtAccID != 0, MgmtAccountUnset());
-    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 surplus = bal > owedMusuTotal ? bal - owedMusuTotal : 0;
     uint256 amount = mgmtAccrued < surplus ? mgmtAccrued : surplus;
-    require(amount > TRANSFER_FEE, NothingClaimable());
+    require(amount > _claimFee(), NothingClaimable());
     mgmtAccrued -= amount;
-    _transferMusu(mgmtAccID, amount - TRANSFER_FEE);
+    _transferMusu(mgmtAccID, amount - _claimFee());
+  }
+
+  /// @dev the in-game transfer fee is ALWAYS 15 MUSU. A MUSU market nets it out
+  ///      of the payout; a non-MUSU market pays it from the hub's MUSU float, so
+  ///      claimants receive their full item amount.
+  function _claimFee() internal view returns (uint256) {
+    return payItem == MUSU_INDEX ? TRANSFER_FEE : 0;
   }
 
   ///////////////////
@@ -722,14 +736,14 @@ contract KamiLeaseMarket {
   }
 
   function musuBalance() external view returns (uint256) {
-    return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    return LibInventory.getBalanceOf(_comps(), accID, payItem);
   }
 
   /// @notice Difference between all recorded claims and current hub inventory.
   ///         User claims are still senior because claimMgmt can use only surplus.
   function backingShortfall() external view returns (uint256) {
     uint256 promised = owedMusuTotal + mgmtAccrued;
-    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     return promised > bal ? promised - bal : 0;
   }
 
@@ -766,7 +780,7 @@ contract KamiLeaseMarket {
   function _transferMusu(uint256 targetAccID, uint256 amount) internal {
     uint32[] memory indices = new uint32[](1);
     uint256[] memory amts = new uint256[](1);
-    indices[0] = MUSU_INDEX;
+    indices[0] = payItem;
     amts[0] = amount;
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, targetAccID);
   }
