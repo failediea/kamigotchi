@@ -39,7 +39,9 @@ const RPC = process.env.YOMINET_RPC;
 const WORLD = process.env.WORLD_ADDR;
 const MARKET = process.env.MARKET_ADDRESS;
 const OP_KEY = process.env.OPERATOR_PRIVATE_KEY;
-const ADMIN_KEY = process.env.ADMIN_PRIVATE_KEY; // optional: enables auto-rotate on theft
+// Keep emergency admin authority out of the always-on process unless it is
+// explicitly supplied. DEPLOYER_KEY is intentionally never treated as admin.
+const ADMIN_KEY = process.env.ADMIN_PRIVATE_KEY;
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const POLL_MS = 30_000;
 const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
@@ -74,12 +76,17 @@ const MARKET_ABI = [
   "function accID() view returns (uint256)",
   "function numListings() view returns (uint256)",
   "function tokenIndices(uint256) view returns (uint32)",
-  "function listings(uint32) view returns (address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, address renter, uint256 gasBudget)",
+  "function listings(uint32) view returns (address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, bool ending, address renter, uint256 gasBudget)",
   "function clearReturned(uint32 tokenIndex)",
   "function confirmArrival(uint32 tokenIndex)",
+  "function finalizeLease(uint32 tokenIndex)",
   "function rotateOperator(address newOperator)",
+  "function operatorAddr() view returns (address)",
+  "function settler() view returns (address)",
+  "function pendingXpDelta(uint32) view returns (uint256)",
   "function lastSettleAt() view returns (uint64)",
   "function settleCooldown() view returns (uint64)",
+  "function settle()",
   "event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs)",
   "event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund)",
   "event ReturnRequested(address indexed owner, uint32 indexed tokenIndex)",
@@ -161,6 +168,11 @@ async function wire() {
   );
   kamiSendAddr = await lookup(systems, "system.kami.send");
   marketAccID = await market.accID();
+  const [hubOperator, dailySettler] = await Promise.all([market.operatorAddr(), market.settler()]);
+  if (hubOperator.toLowerCase() !== operator.address.toLowerCase())
+    throw new Error(`configured hub key does not match on-chain operator ${hubOperator}`);
+  if (dailySettler.toLowerCase() !== operator.address.toLowerCase())
+    throw new Error(`configured hub key does not match on-chain settler ${dailySettler}`);
   for (const pod of pods.values()) {
     pod.accID = await pod.contract.accID();
     await ensureRegistered(pod);
@@ -366,11 +378,10 @@ async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0) {
   }
 }
 
-async function stopStrategy(tokenIndex) {
+async function stopStrategy(tokenIndex, explicitPod = null) {
   const sig = state.strategies[tokenIndex];
-  if (sig === undefined) return;
-  const node = Number(String(sig).split(":")[0]);
-  const pod = pods.get(Number(node));
+  const node = sig === undefined ? explicitPod?.node : Number(String(sig).split(":")[0]);
+  const pod = explicitPod || pods.get(Number(node));
   if (pod?.creds) {
     try {
       await kb(pod.creds, `/api/strategies/kami/${tokenIndex}`, {
@@ -378,11 +389,63 @@ async function stopStrategy(tokenIndex) {
         body: { keyData: { privy_id: pod.creds.privyId } },
       });
     } catch (e) {
-      if (!/404/.test(e.message)) console.error(`strategy stop failed #${tokenIndex}: ${e.message}`);
+      if (!/404/.test(e.message)) {
+        console.error(`strategy stop failed #${tokenIndex}: ${e.message}`);
+        return false;
+      }
     }
   }
   delete state.strategies[tokenIndex];
-  console.log(`⏹️  strategy stopped for kami #${tokenIndex} (pod ${node})`);
+  if (sig !== undefined || explicitPod)
+    console.log(`⏹️  strategy stopped for kami #${tokenIndex} (pod ${node})`);
+  return true;
+}
+
+// Lease end is deliberately two-stage. A party requests `ending`; the keeper
+// must stop the strategy, sweep the pod, and only then finalize accounting.
+async function finalizeEnding(idx, l) {
+  const actualAcc = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
+  if (actualAcc === null) return;
+  const holder = actualAcc === marketAccID ? null : podByAccID(actualAcc);
+  if (actualAcc !== marketAccID && !holder) {
+    console.error(`finalize #${idx}: kami is outside the hub/pods (acc ${actualAcc})`);
+    return;
+  }
+
+  if (holder?.kind === "bot") {
+    if (!(await stopStrategy(idx, holder))) return; // fail closed on Kamibots errors
+  } else if (holder?.kind === "self") {
+    const active = await holder.guardContract.harvestOf(idx).catch(() => 0n);
+    if (active !== 0n) {
+      try {
+        await (await holder.guardContract.connect(operator).keeperStop(idx)).wait();
+      } catch (e) {
+        console.error(`finalize #${idx}: self-farm stop failed: ${e.message?.slice(0, 140)}`);
+        return;
+      }
+    }
+  } else if (state.strategies[idx] !== undefined && !(await stopStrategy(idx))) {
+    return;
+  }
+
+  if (holder) {
+    try {
+      const bal = await holder.contract.musuBalance();
+      if (bal > 0n) await (await holder.contract.connect(operator).sweepMusu()).wait();
+    } catch (e) {
+      console.error(`finalize #${idx}: pod sweep failed: ${e.message?.slice(0, 140)}`);
+      return;
+    }
+  }
+
+  try {
+    const tx = await market.connect(operator).finalizeLease(idx);
+    await tx.wait();
+    console.log(`✅ lease #${idx} finalized after stop + sweep (${tx.hash})`);
+  } catch (e) {
+    const msg = e.message?.slice(0, 160) || "";
+    if (!/still harvesting/i.test(msg)) console.error(`finalize #${idx} failed: ${msg}`);
+  }
 }
 
 // ---- the reconciler ---------------------------------------------------------
@@ -398,6 +461,15 @@ async function reconcile(idx, l) {
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
   const holdingPod = podByAccID(actualAcc);
   const targetPod = leased ? (mode === "self" ? selfPods.get(node) : pods.get(node)) : null;
+
+  // Bad or stale prefs must never crash the whole reconciler and must never
+  // silently route a kami to an arbitrary account. Stop any known strategy and
+  // leave the asset where it is until the renter fixes the destination.
+  if (leased && !targetPod) {
+    if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+    console.error(`reconcile #${idx}: no registered ${mode === "self" ? "self-farm" : "bot"} pod for node ${node}; refusing to route`);
+    return;
+  }
 
   let desiredAcc;
   if (leased) {
@@ -495,11 +567,9 @@ async function exportLiveStatus() {
   } catch {}
 }
 
-// ---- pod sweeps: PAYDAY-ONLY ------------------------------------------------
-// settle() pays from the hub inventory, so pod earnings must be consolidated
-// before a settle — and ONLY then. no drip-sweeping (each sweep costs the
-// in-world transfer fee, which the platform absorbs; once per payday, not per
-// tick). the dApp's settle button also force-sweeps as a belt-and-suspenders.
+// ---- daily accounting -------------------------------------------------------
+// The keeper is the only settler. Every daily window it sweeps every pod first,
+// then records exact pull-based claims. Users never need a settlement signature.
 async function sweepPods() {
   try {
     const [last, cd] = await Promise.all([market.lastSettleAt(), market.settleCooldown()]);
@@ -519,6 +589,20 @@ async function sweepPods() {
     } catch (e) {
       console.error(`sweep pod ${pod.node} failed: ${e.message?.slice(0, 120)}`);
     }
+  }
+  try {
+    const n = Number(await market.numListings());
+    let hasDelta = false;
+    for (let i = 0; i < n && !hasDelta; i++) {
+      const idx = Number(await market.tokenIndices(i));
+      hasDelta = (await market.pendingXpDelta(idx)) > 0n;
+    }
+    if (!hasDelta) return;
+    const tx = await market.connect(operator).settle();
+    await tx.wait();
+    console.log(`💰 daily accounting completed (${tx.hash})`);
+  } catch (e) {
+    console.error(`daily settle failed: ${e.message?.slice(0, 140)}`);
   }
 }
 
@@ -646,6 +730,11 @@ async function tick() {
       continue;
     }
 
+    if (l.ending) {
+      await finalizeEnding(idx, l);
+      continue;
+    }
+
     if (l.returning) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
       await sendKamiHome(idx, l.owner, l.kamiID); // direct from hub OR pod
@@ -663,7 +752,7 @@ async function tick() {
 }
 
 await wire();
-console.log(`ops-bot v7 online. hub ${MARKET}, hub operator ${operator.address}, pods [${[...pods.keys()].join(", ")}], admin ${admin ? "armed" : "not set"}`);
+console.log(`ops-bot v12 online. hub ${MARKET}, hub operator ${operator.address}, pods [${[...pods.keys()].join(", ")}], emergency admin ${admin ? "explicitly armed" : "not loaded"}`);
 for (;;) {
   try { await tick(); } catch (e) { console.error(`tick error: ${e.message?.slice(0, 200)}`); }
   await new Promise((r) => setTimeout(r, POLL_MS));

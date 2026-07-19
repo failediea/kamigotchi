@@ -32,6 +32,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     marketOperator = _getNextUserAddress();
     market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
     market.initialize(marketOperator, "leasemkt");
+    market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);
 
     // pre-existing snapshot gap: harvest systems unauthorized on TimeComponent
@@ -92,7 +93,20 @@ contract KamiLeaseMarketTest is SetupTemplate {
   }
 
   function _renterOf(uint32 tokenIndex) internal view returns (address renter) {
-    (, , , , , , , renter, ) = market.listings(tokenIndex);
+    (, , , , , , , , renter, ) = market.listings(tokenIndex);
+  }
+
+  function _endingOf(uint32 tokenIndex) internal view returns (bool ending) {
+    (, , , , , , , ending, , ) = market.listings(tokenIndex);
+  }
+
+  function _finishLease(uint32 tokenIndex) internal {
+    market.finalizeLease(tokenIndex);
+  }
+
+  function _claim(PlayerAccount memory acc) internal {
+    vm.prank(acc.owner);
+    market.claimOwed();
   }
 
   /////////////////
@@ -141,7 +155,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // send in -> pooled: custody is the market's, owner literally cannot use it
     _sendIn(alice, tokenIndex);
     assertEq(LibKami.getAccount(components, kamiID), market.accID(), "custody");
-    (, , , , , bool staked, , , ) = market.listings(tokenIndex);
+    (, , , , , bool staked, , , , ) = market.listings(tokenIndex);
     assertTrue(staked, "pooled");
 
     // owner's operator can no longer act on it (it's not in alice's account)
@@ -244,9 +258,50 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 balBefore = bob.owner.balance;
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    assertEq(_renterOf(tokenIndex), bob.owner, "keeper has not finalized");
+    _finishLease(tokenIndex);
     assertEq(bob.owner.balance - balBefore, MIN_GAS, "refund");
     assertEq(_renterOf(tokenIndex), address(0), "cleared");
     assertEq(market.numListings(), 1, "listing survives; kami back in the pool");
+  }
+
+  function testOwnerCanEndAndEndingBlocksChanges() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex);
+
+    vm.prank(alice.owner);
+    market.endLease(tokenIndex);
+    assertTrue(_endingOf(tokenIndex), "owner started ending");
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: lease ending");
+    market.setPrefs(tokenIndex, "{}");
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: lease ending");
+    market.topUpGas{ value: 1 }(tokenIndex);
+  }
+
+  function testRenterRecoversGasAndFinalizesAfterGrace() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex);
+
+    vm.prank(bob.owner);
+    market.endLease(tokenIndex);
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: grace");
+    market.reclaimEndingGas(tokenIndex);
+
+    _fastForward(2 days + 1);
+    uint256 before = bob.owner.balance;
+    vm.prank(bob.owner);
+    market.reclaimEndingGas(tokenIndex);
+    assertEq(bob.owner.balance - before, MIN_GAS, "timeout gas refund");
+
+    vm.prank(bob.owner);
+    market.finalizeLease(tokenIndex);
+    assertEq(_renterOf(tokenIndex), address(0), "renter timeout finalized");
   }
 
   /////////////////
@@ -271,10 +326,17 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 cBefore = _accountMusu(charlie);
 
     market.settle();
-
-    assertEq(_accountMusu(alice) - aBefore, ownerCut - TRANSFER_FEE, "owner share");
-    assertEq(_accountMusu(bob) - bBefore, renterCut - TRANSFER_FEE, "renter share");
-    assertEq(_accountMusu(charlie) - cBefore, mgmtCut - TRANSFER_FEE, "platform fee");
+    assertEq(_accountMusu(alice), aBefore, "settle only records claims");
+    assertEq(_accountMusu(bob), bBefore, "settle only records claims");
+    assertEq(_accountMusu(charlie), cBefore, "mgmt is pull-based");
+    assertEq(market.owedMusu(alice.owner), ownerCut, "owner credited");
+    assertEq(market.owedMusu(bob.owner), renterCut, "renter credited");
+    _claim(alice);
+    _claim(bob);
+    market.claimMgmt();
+    assertEq(_accountMusu(alice) - aBefore, ownerCut - TRANSFER_FEE, "owner claim");
+    assertEq(_accountMusu(bob) - bBefore, renterCut - TRANSFER_FEE, "renter claim");
+    assertEq(_accountMusu(charlie) - cBefore, mgmtCut - TRANSFER_FEE, "platform claim");
   }
 
   function testPerLeasePoolsAreIsolated() public {
@@ -299,7 +361,8 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 bBefore = _accountMusu(bob);
     uint256 dBefore = _accountMusu(dana);
     market.settle();
-
+    _claim(bob);
+    _claim(dana);
     assertEq(_accountMusu(bob) - bBefore, bobExpected, "bob's isolated pool");
     assertEq(_accountMusu(dana) - dBefore, dExpected, "dana's isolated pool");
   }
@@ -313,13 +376,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    uint256 gross = market.pendingXpDelta(tokenIndex);
+    _finishLease(tokenIndex);
 
-    (, , , uint256 carryDelta_) = market.carries(0);
-    uint256 net = carryDelta_ - (carryDelta_ * MGMT_BPS) / 10000;
+    uint256 net = gross - (gross * MGMT_BPS) / 10000;
     uint256 ownerCut = (net * OWNER_BPS) / 10000;
 
     uint256 bBefore = _accountMusu(bob);
-    market.settle();
+    _claim(bob);
     assertEq(_accountMusu(bob) - bBefore, (net - ownerCut) - TRANSFER_FEE, "renter share");
   }
 
@@ -334,6 +398,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    _finishLease(tokenIndex);
 
     vm.prank(alice.owner);
     market.requestReturn(tokenIndex);
@@ -353,7 +418,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertEq(market.numListings(), 0, "listing cleared");
 
     uint256 aBefore = _accountMusu(alice);
-    market.settle();
+    _claim(alice);
     assertTrue(_accountMusu(alice) > aBefore, "carried earnings paid");
   }
 
@@ -380,18 +445,34 @@ contract KamiLeaseMarketTest is SetupTemplate {
   /////////////////
   // GOVERNANCE / GUARDS
 
-  function testSettleIsPermissionless() public {
+  function testSettleIsKeeperScoped() public {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
     _marketHarvest(kamiID, 50_000);
 
-    // anyone can trigger settlement — payouts can never be withheld (KLM-03).
-    // still cooldown-gated so it can't be spammed.
-    uint256 bBefore = _accountMusu(bob);
     vm.prank(_getNextUserAddress());
+    vm.expectRevert("LM: not settler");
     market.settle();
-    assertGt(_accountMusu(bob) - bBefore, 0, "rando-triggered settle paid the renter");
+    market.settle();
+    assertGt(market.owedMusu(bob.owner), 0, "keeper credited renter");
+  }
+
+  function testSettleBecomesPermissionlessWhenKeeperIsStale() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex);
+    _marketHarvest(kamiID, 50_000);
+    address caller = _getNextUserAddress();
+
+    vm.prank(caller);
+    vm.expectRevert("LM: not settler");
+    market.settle();
+
+    _fastForward(3 days + 1);
+    vm.prank(caller);
+    market.settle();
+    assertGt(market.owedMusu(bob.owner), 0, "stale fallback credited renter");
   }
 
   function testSettleCooldown() public {
@@ -406,7 +487,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.expectRevert("LM: cooldown");
     market.settle();
 
-    _fastForward(6 hours + 1);
+    _fastForward(1 days + 1);
     market.settle();
   }
 
@@ -420,6 +501,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.prank(alice.owner);
     market.endLease(tokenIndex);
+    market.finalizeLease(tokenIndex);
 
     assertEq(market.owedEth(address(evil)), MIN_GAS, "refund not owed");
     assertEq(_renterOf(tokenIndex), address(0), "lease not cleared");
@@ -470,7 +552,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     market.settle();
     assertEq(market.owedMusu(ghost), ghostShare, "ghost share held");
-    assertEq(market.owedMusuTotal(), ghostShare, "reserved total tracks it");
+    assertGe(market.owedMusuTotal(), ghostShare, "reserved total tracks all claims");
     assertGe(market.musuBalance(), market.owedMusuTotal(), "reserve physically backed");
 
     // a second kami with a registered renter, its own harvest + settle: the held
@@ -478,11 +560,12 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 b = _listPool(alice, _mintKami(alice));
     _acceptAs(bob.owner, b);
     _marketHarvest(LibKami.getByIndex(components, b), 100_000);
-    _fastForward(6 hours + 1);
+    _fastForward(1 days + 1);
 
     uint256 bobShare = _renterNet(market.pendingXpDelta(b)) - TRANSFER_FEE;
     uint256 bBefore = _accountMusu(bob);
     market.settle();
+    _claim(bob);
     assertEq(_accountMusu(bob) - bBefore, bobShare, "bob paid exactly his own");
     assertEq(market.owedMusu(ghost), ghostShare, "ghost reserve untouched by later settle");
     assertGe(market.musuBalance(), market.owedMusuTotal(), "reserve still backed");
@@ -500,7 +583,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.requestReturn(idx);
     vm.prank(alice.owner);
     market.cancelReturn(idx);
-    (, , , , , , bool returning, , ) = market.listings(idx);
+    (, , , , , , bool returning, , , ) = market.listings(idx);
     assertFalse(returning, "reopened while still in the pool");
 
     // request again, then the automation actually sends it home
@@ -525,7 +608,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
   // AUDIT FIX 3: settleBounded — pool-size can never lock funds
 
   /////////////////
-  // AUDIT R2: terminal-return carries are settleable by ANYONE (KLM-03)
+  // Terminal returns preserve already-credited claims without a public settle.
 
   function testTerminalCarrySettleableByAnyone() public {
     uint32 idx = _listPool(alice, _mintKami(alice));
@@ -533,7 +616,8 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _marketHarvest(LibKami.getByIndex(components, idx), 100_000);
 
     vm.prank(bob.owner);
-    market.endLease(idx); // carries the lease split; bob participations -> 0
+    market.endLease(idx);
+    _finishLease(idx);
     vm.prank(alice.owner);
     market.requestReturn(idx);
     _fastForward(_idleRequirement);
@@ -542,16 +626,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.clearReturned(idx); // alice participations -> 0
 
     assertEq(market.numListings(), 0, "listing cleared");
-    assertGt(market.numCarries(), 0, "carry with earnings survives");
-
-    // a completely unrelated address (0 participations) can still settle: the
-    // documented "payouts can never be withheld" now holds in the terminal state
+    assertGt(market.owedMusu(alice.owner), 0, "owner claim survives");
+    assertGt(market.owedMusu(bob.owner), 0, "renter claim survives");
     uint256 aBefore = _accountMusu(alice);
     uint256 bBefore = _accountMusu(bob);
-    vm.prank(_getNextUserAddress());
-    market.settle();
-    assertGt(_accountMusu(alice) - aBefore, 0, "owner carry paid");
-    assertGt(_accountMusu(bob) - bBefore, 0, "renter carry paid");
+    _claim(alice);
+    _claim(bob);
+    assertGt(_accountMusu(alice) - aBefore, 0, "owner claim paid");
+    assertGt(_accountMusu(bob) - bBefore, 0, "renter claim paid");
   }
 
   /////////////////
@@ -564,6 +646,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _marketHarvest(kamiID, 100_000);
     vm.prank(bob.owner);
     market.endLease(idx);
+    _finishLease(idx);
 
     vm.prank(alice.owner);
     market.requestReturn(idx); // snapshots XP here
@@ -574,14 +657,12 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.prank(marketOperator);
     _KamiSendSystem.executeTyped(idx, alice.operator);
 
-    uint256 carriesBefore = market.numCarries();
+    uint256 owedBefore = market.owedMusu(alice.owner);
     market.clearReturned(idx);
-    // the post-request delta is carried by clearReturned, not deleted with the listing
-    assertGt(market.numCarries(), carriesBefore, "final harvest carried");
+    assertGt(market.owedMusu(alice.owner), owedBefore, "final harvest credited");
 
     uint256 aBefore = _accountMusu(alice);
-    vm.prank(_getNextUserAddress());
-    market.settle();
+    _claim(alice);
     assertGt(_accountMusu(alice) - aBefore, 0, "final harvest paid to owner, not lost");
   }
 
@@ -606,7 +687,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
     vm.stopPrank();
 
-    (, , , , , bool staked, , , ) = market.listings(tokenIndex);
+    (, , , , , bool staked, , , , ) = market.listings(tokenIndex);
     assertTrue(staked, "pooled in the listing tx");
     assertEq(LibKami.getAccount(components, kamiID), market.accID(), "custody: hub");
 
@@ -617,6 +698,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // full circle: lease ends -> NFT withdraw -> relist is one tx forever after
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    _finishLease(tokenIndex);
     vm.prank(alice.owner);
     market.withdrawKami(tokenIndex);
     assertEq(_Kami721.ownerOf(uint256(tokenIndex)), alice.owner, "NFT returned");

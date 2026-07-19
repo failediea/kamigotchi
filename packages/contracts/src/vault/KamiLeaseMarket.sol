@@ -57,6 +57,7 @@ contract KamiLeaseMarket {
     uint128 minGasWei; // minimum gas budget to accept the lease
     bool staked; // true = IN THE POOL (market account custody); false = send pending
     bool returning; // owner requested an in-game send-back (blocks new leases)
+    bool ending; // a party requested lease end; keeper must stop/sweep/finalize
     address renter; // active renter (0 = waiting in the pool)
     uint256 gasBudget; // renter's remaining ETH for farming gas
   }
@@ -81,19 +82,24 @@ contract KamiLeaseMarket {
   uint16 public mgmtBps; // platform fee, lower-only
   uint256 public mgmtAccID; // game account receiving the platform fee
   uint256 public mgmtAccrued; // platform fees accrued, awaiting transfer to mgmtAccID
+  address public settler; // daily accounting + lease-finalization keeper
 
   mapping(uint32 => Listing) public listings; // by ERC721 token index
   uint32[] public tokenIndices;
   mapping(uint32 => uint256) internal tokenPos; // tokenIndex => position+1
 
-  CarryEntry[] public carries;
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
   uint256 public owedMusuTotal; // sum of owedMusu: RESERVED, never re-distributed
   mapping(address => uint256) public owedEth; // gas refunds that failed to send (pull)
   mapping(address => uint256) public participations; // active listings + leases per address
+  mapping(uint32 => uint64) internal endingAt; // timeout clock for user recovery
 
   uint64 public lastSettleAt;
-  uint64 public settleCooldown = 6 hours; // spam guard; admin-tunable, capped
+  uint64 public settleCooldown = 1 days; // daily accounting cadence; admin-tunable, capped
+  uint64 internal initializedAt;
+
+  uint64 internal constant ENDING_GRACE = 2 days;
+  uint64 internal constant SETTLER_STALE = 3 days;
 
   uint256 private locked = 1;
 
@@ -102,6 +108,7 @@ contract KamiLeaseMarket {
 
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
+  event SettlerSet(address newSettler);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event Delisted(address indexed owner, uint32 indexed tokenIndex);
   event Arrived(address indexed owner, uint32 indexed tokenIndex); // kami joined the pool
@@ -115,6 +122,8 @@ contract KamiLeaseMarket {
   event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs);
   event GasToppedUp(uint32 indexed tokenIndex, uint256 amount);
   event GasDripped(uint32 indexed tokenIndex, address operator, uint256 amount);
+  event LeaseEnding(uint32 indexed tokenIndex, address indexed renter, address indexed requestedBy);
+  event EndingGasReclaimed(uint32 indexed tokenIndex, address indexed renter, uint256 amount);
   event KamiWithdrawn(address indexed owner, uint32 indexed tokenIndex);
   event Settled(uint256 distributed, uint256 mgmtCut, uint256 totalDelta);
   event Payout(address indexed to, uint256 amount, bool held);
@@ -154,6 +163,7 @@ contract KamiLeaseMarket {
       name
     );
     accID = abi.decode(result, (uint256));
+    initializedAt = uint64(block.timestamp);
     emit Initialized(accID, operator, name);
   }
 
@@ -161,6 +171,12 @@ contract KamiLeaseMarket {
   function rotateOperator(address newOperator) external onlyAdmin {
     AccountSetOperatorSystem(_sys(AccountSetOperatorSystemID)).executeTyped(newOperator);
     emit OperatorRotated(newOperator);
+  }
+
+  function setSettler(address newSettler) external onlyAdmin {
+    require(newSettler != address(0), "LM: zero settler");
+    settler = newSettler;
+    emit SettlerSet(newSettler);
   }
 
   function lowerMgmtBps(uint16 newBps) external onlyAdmin {
@@ -224,6 +240,7 @@ contract KamiLeaseMarket {
       minGasWei: minGasWei,
       staked: false, // becomes true when the kami arrives in the pool
       returning: false,
+      ending: false,
       renter: address(0),
       gasBudget: 0
     });
@@ -264,6 +281,7 @@ contract KamiLeaseMarket {
       minGasWei: minGasWei,
       staked: true, // in the pool from this very transaction
       returning: false,
+      ending: false,
       renter: address(0),
       gasBudget: 0
     });
@@ -319,7 +337,7 @@ contract KamiLeaseMarket {
     require(l.renter == address(0), "LM: end lease first");
     require(l.staked, "LM: not in pool - use delist");
 
-    _carryPending(tokenIndex);
+    _creditPending(tokenIndex);
     Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
@@ -337,7 +355,7 @@ contract KamiLeaseMarket {
     require(l.staked, "LM: not in market");
     require(!l.returning, "LM: already returning");
 
-    _carryPending(tokenIndex); // freeze attribution at request time
+    _creditPending(tokenIndex); // freeze attribution at request time
     l.returning = true;
     emit ReturnRequested(msg.sender, tokenIndex);
   }
@@ -372,7 +390,7 @@ contract KamiLeaseMarket {
     // carry any earnings accrued AFTER requestReturn's snapshot (e.g. a harvest
     // the automation hadn't stopped yet) before the listing is deleted, so the
     // final delta is attributed to the owner instead of being orphaned.
-    _carryPending(tokenIndex);
+    _creditPending(tokenIndex);
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     emit ReturnCleared(l.owner, tokenIndex);
@@ -403,7 +421,7 @@ contract KamiLeaseMarket {
     require(msg.value >= l.minGasWei, "LM: gas budget too low");
     require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
 
-    _carryPending(tokenIndex); // any pre-lease earnings stay with the owner
+    _creditPending(tokenIndex); // any pre-lease earnings stay with the owner
 
     l.renter = msg.sender;
     l.gasBudget = msg.value;
@@ -413,36 +431,76 @@ contract KamiLeaseMarket {
 
   /// @notice update strategy preferences (relayed off-chain to the automation)
   function setPrefs(uint32 tokenIndex, string calldata prefs) external {
-    require(listings[tokenIndex].renter == msg.sender, "LM: not renter");
+    Listing storage l = listings[tokenIndex];
+    require(l.renter == msg.sender, "LM: not renter");
+    require(!l.ending, "LM: lease ending");
     emit PrefsUpdated(tokenIndex, msg.sender, prefs);
   }
 
   function topUpGas(uint32 tokenIndex) external payable {
     Listing storage l = listings[tokenIndex];
     require(l.renter == msg.sender, "LM: not renter");
+    require(!l.ending, "LM: lease ending");
     l.gasBudget += msg.value;
     emit GasToppedUp(tokenIndex, msg.value);
   }
 
-  /// @notice end a lease: renter or owner can end. pending earnings are carried at
-  ///         the lease's split; the unused gas budget refunds to the renter.
+  /// @notice Request lease end. The renter or owner may request it, but accounting
+  ///         is finalized only after the keeper has stopped the active harvest and
+  ///         swept its pod. This prevents the final harvest from being orphaned.
   function endLease(uint32 tokenIndex) external nonReentrant {
     Listing storage l = listings[tokenIndex];
     address renter = l.renter;
     require(renter != address(0), "LM: not leased");
     require(msg.sender == renter || msg.sender == l.owner, "LM: not party");
+    require(!l.ending, "LM: already ending");
 
-    _carryPending(tokenIndex); // split at lease terms
+    l.ending = true;
+    endingAt[tokenIndex] = uint64(block.timestamp);
+    emit LeaseEnding(tokenIndex, renter, msg.sender);
+  }
+
+  /// @notice Keeper-only finalization after strategy stop + pod sweep. Credits the
+  ///         exact final XP delta at the lease split, then refunds unused gas.
+  function finalizeLease(uint32 tokenIndex) external nonReentrant {
+    Listing storage l = listings[tokenIndex];
+    address renter = l.renter;
+    require(renter != address(0), "LM: not leased");
+    require(l.ending, "LM: not ending");
+    bool timedOut = block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE;
+    require(
+      msg.sender == settler || (timedOut && (msg.sender == renter || msg.sender == l.owner)),
+      "LM: not finalizer"
+    );
+    require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), "LM: still harvesting");
+
+    _creditPending(tokenIndex); // final split at the lease's terms
 
     uint256 refund = l.gasBudget;
     l.renter = address(0);
     l.gasBudget = 0;
+    l.ending = false;
+    delete endingAt[tokenIndex];
     if (participations[renter] > 0) participations[renter]--;
 
     // pull-pattern fallback: a renter contract that reverts on receive must not be
     // able to block lease termination
     if (refund > 0) _sendEthOrOwe(renter, refund);
     emit LeaseEnded(tokenIndex, renter, refund);
+  }
+
+  /// @notice If automation cannot finish an ending lease, the renter can recover
+  ///         the still-unused gas budget after the grace period even while the
+  ///         kami remains harvesting. Final accounting can complete later.
+  function reclaimEndingGas(uint32 tokenIndex) external nonReentrant {
+    Listing storage l = listings[tokenIndex];
+    require(l.renter == msg.sender, "LM: not renter");
+    require(l.ending && block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE, "LM: grace");
+    uint256 refund = l.gasBudget;
+    require(refund > 0, "LM: no gas");
+    l.gasBudget = 0;
+    _sendEthOrOwe(msg.sender, refund);
+    emit EndingGasReclaimed(tokenIndex, msg.sender, refund);
   }
 
   /// @notice claim ETH refunds that could not be pushed
@@ -458,40 +516,20 @@ contract KamiLeaseMarket {
   ///////////////////
   // SETTLEMENT
 
-  /// @notice PER-LEASE EXACT POOLS: each kami's XP delta IS its earned MUSU (XP
-  ///         increments 1:1 with collected harvest), so every lease is paid exactly
-  ///         what its own kami earned — nothing shared, nothing socialized. The
-  ///         platform fee and the in-world transfer fee come out of each payout.
-  ///         Callable by PARTICIPANTS (any listing owner or active renter) or admin —
-  ///         payouts can never be withheld, but randoms can't spam fee-burn it.
+  /// @notice Daily keeper accounting. XP deltas are converted into exact claims;
+  ///         no transfers happen here, so one settlement cannot burn several
+  ///         transfer fees or fail because a recipient has not registered yet.
   function settle() external nonReentrant {
     require(accID != 0, "LM: not initialized");
-    // PERMISSIONLESS: anyone may trigger settlement (cooldown-gated). A former
-    // owner/renter whose listing was already cleared holds a carry but has zero
-    // active participations — gating on participation would let their payout be
-    // withheld until an admin acts. Spam is bounded by the cooldown, and the
-    // platform-fee flush is self-limiting (only its own accrued fee is ever
-    // burned), so opening this up costs an abuser only their own gas.
+    uint256 base = lastSettleAt == 0 ? initializedAt : lastSettleAt;
+    require(msg.sender == settler || block.timestamp >= base + SETTLER_STALE, "LM: not settler");
     require(
       lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
       "LM: cooldown"
     );
     IUintComp comps = _comps();
-
-    // funds available for lease payouts. BOTH the accrued platform fee AND the
-    // already-promised held payouts (owedMusu) stay reserved — the held MUSU is
-    // still physically in this account, so without reserving it a later settle
-    // would count it as available and promise the same inventory twice.
-    uint256 bal = LibInventory.getBalanceOf(comps, accID, MUSU_INDEX);
-    uint256 payable_ = bal > mgmtAccrued + owedMusuTotal
-      ? bal - mgmtAccrued - owedMusuTotal
-      : 0;
-    if (payable_ == 0) return; // nothing to pay — leave all attribution untouched
-
-    // ---- pass 1: gather per-lease earnings (mutates baselines; consumes carries)
     uint256 n = tokenIndices.length;
-    uint256 m = carries.length;
-    CarryEntry[] memory entries = new CarryEntry[](n + m);
+    CarryEntry[] memory entries = new CarryEntry[](n);
     uint256 count;
     uint256 totalDelta;
 
@@ -505,54 +543,24 @@ contract KamiLeaseMarket {
       entries[count++] = CarryEntry(l.owner, l.renter, l.ownerShareBps, delta);
       totalDelta += delta;
     }
-    for (uint256 i; i < m; i++) {
-      entries[count++] = carries[i];
-      totalDelta += carries[i].delta;
-    }
-    delete carries;
-
-    if (totalDelta == 0) return;
-
-    // pods sweep their earnings to the hub minus the in-world transfer fee, so the
-    // balance can run slightly short of attribution. THE PLATFORM ABSORBS that gap
-    // out of its own cut — lease pools stay exact, nothing is socialized. only if
-    // the gap somehow exceeded the entire platform cut do payouts degrade pro-rata.
-    uint256 shortfall = totalDelta > payable_ ? totalDelta - payable_ : 0;
-    bool scaled = shortfall > 0 && shortfall + count > (totalDelta * mgmtBps) / 10000;
-
-    // ---- pass 2: pay each lease its own pool (via _payEntry to bound stack)
     uint256 mgmtAdd;
-    for (uint256 i; i < count; i++) {
-      uint256 gross = scaled ? (entries[i].delta * payable_) / totalDelta : entries[i].delta;
-      if (gross > 0) mgmtAdd += _payEntry(entries[i], gross);
-    }
-
-    // the platform's cut pays the pods' sweep fees (see shortfall above)
-    if (!scaled && shortfall > 0) mgmtAdd = mgmtAdd > shortfall ? mgmtAdd - shortfall : 0;
-
-    // platform fees accrue and flush whenever a mgmt account is set — never recycled
+    for (uint256 i; i < count; i++) mgmtAdd += _creditEntry(entries[i], entries[i].delta);
     mgmtAccrued += mgmtAdd;
-    if (mgmtAccID != 0 && mgmtAccrued > TRANSFER_FEE) {
-      uint256 acc = mgmtAccrued;
-      mgmtAccrued = 0;
-      _transferMusu(mgmtAccID, acc - TRANSFER_FEE); // in-world fee comes out of ours
-    }
-
     lastSettleAt = uint64(block.timestamp);
-    emit Settled(totalDelta > mgmtAdd ? totalDelta - mgmtAdd : 0, mgmtAdd, totalDelta);
+    emit Settled(totalDelta - mgmtAdd, mgmtAdd, totalDelta);
   }
 
-  /// @dev pay one entry's `gross` three ways (platform / owner / renter) and
-  ///      return the platform cut. split out to bound settle()'s stack depth.
-  function _payEntry(CarryEntry memory e, uint256 gross) internal returns (uint256 cut) {
+  /// @dev Credit one exact gross pool. User claims are senior to management:
+  ///      they remain reserved in owedMusuTotal until the user pulls them.
+  function _creditEntry(CarryEntry memory e, uint256 gross) internal returns (uint256 cut) {
     cut = (gross * mgmtBps) / 10000;
     uint256 net = gross - cut;
     if (e.renter == address(0)) {
-      _payout(e.owner, net);
+      _credit(e.owner, net);
     } else {
       uint256 ownerCut = (net * e.ownerShareBps) / 10000;
-      if (ownerCut > 0) _payout(e.owner, ownerCut);
-      if (net - ownerCut > 0) _payout(e.renter, net - ownerCut);
+      if (ownerCut > 0) _credit(e.owner, ownerCut);
+      if (net - ownerCut > 0) _credit(e.renter, net - ownerCut);
     }
   }
 
@@ -563,10 +571,24 @@ contract KamiLeaseMarket {
     require(amount > TRANSFER_FEE, "LM: nothing claimable");
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), "LM: register an account first");
+    require(LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) >= amount, "LM: not backed yet");
     owedMusu[msg.sender] = 0;
     owedMusuTotal -= amount; // release the reservation as the funds leave
     _transferMusu(target, amount - TRANSFER_FEE);
     emit OwedClaimed(msg.sender, amount);
+  }
+
+  /// @notice Withdraw accrued platform fees only from inventory above all user
+  ///         claims. Pod sweep fees and any temporary shortfall therefore come
+  ///         out of management, never from owners or renters.
+  function claimMgmt() external onlyAdmin nonReentrant {
+    require(mgmtAccID != 0, "LM: mgmt account unset");
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    uint256 surplus = bal > owedMusuTotal ? bal - owedMusuTotal : 0;
+    uint256 amount = mgmtAccrued < surplus ? mgmtAccrued : surplus;
+    require(amount > TRANSFER_FEE, "LM: nothing claimable");
+    mgmtAccrued -= amount;
+    _transferMusu(mgmtAccID, amount - TRANSFER_FEE);
   }
 
   ///////////////////
@@ -584,10 +606,6 @@ contract KamiLeaseMarket {
     return LibAccount.getOperator(_comps(), accID);
   }
 
-  function numCarries() external view returns (uint256) {
-    return carries.length;
-  }
-
   function pendingXpDelta(uint32 tokenIndex) public view returns (uint256) {
     Listing memory l = listings[tokenIndex];
     if (!l.staked) return 0;
@@ -597,6 +615,14 @@ contract KamiLeaseMarket {
 
   function musuBalance() external view returns (uint256) {
     return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+  }
+
+  /// @notice Difference between all recorded claims and current hub inventory.
+  ///         User claims are still senior because claimMgmt can use only surplus.
+  function backingShortfall() external view returns (uint256) {
+    uint256 promised = owedMusuTotal + mgmtAccrued;
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+    return promised > bal ? promised - bal : 0;
   }
 
   /// @notice has this kami arrived in the market's game account? (UI helper for the
@@ -609,30 +635,24 @@ contract KamiLeaseMarket {
   ///////////////////
   // INTERNALS
 
-  /// @dev snapshot a kami's un-settled delta into the carry list at current terms
-  function _carryPending(uint32 tokenIndex) internal {
+  /// @dev Credit a kami's current delta immediately at its current terms. Used at
+  ///      lease/listing boundaries so attribution cannot race a later daily settle.
+  function _creditPending(uint32 tokenIndex) internal {
     Listing storage l = listings[tokenIndex];
     if (!l.staked) return;
     uint256 xp = LibExperience.get(_comps(), l.kamiID);
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
-    if (delta > 0) carries.push(CarryEntry(l.owner, l.renter, l.ownerShareBps, delta));
+    if (delta == 0) return;
+    uint256 cut = _creditEntry(CarryEntry(l.owner, l.renter, l.ownerShareBps, delta), delta);
+    mgmtAccrued += cut;
+    emit Settled(delta - cut, cut, delta);
   }
 
-  /// @dev pay a lease participant; the in-world transfer fee comes out of their
-  ///      amount (their pool pays their costs — nothing is ever socialized).
-  ///      amounts too small to cover the fee are held until they grow (owedMusu).
-  function _payout(address to, uint256 amount) internal returns (uint256) {
-    uint256 target = uint256(uint160(to));
-    if (amount > TRANSFER_FEE && _isAccount(target)) {
-      _transferMusu(target, amount - TRANSFER_FEE);
-      emit Payout(to, amount, false);
-    } else {
-      owedMusu[to] += amount;
-      owedMusuTotal += amount; // reserve it — this MUSU is now spoken for
-      emit Payout(to, amount, true);
-    }
-    return amount;
+  function _credit(address to, uint256 amount) internal {
+    owedMusu[to] += amount;
+    owedMusuTotal += amount;
+    emit Payout(to, amount, true);
   }
 
   function _transferMusu(uint256 targetAccID, uint256 amount) internal {

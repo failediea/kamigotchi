@@ -7,6 +7,16 @@ quarantine-keys.json
 ops-state.json
 live-status.json
 ops-bot.log
+ops-bot-v11.log
+ops-bot-v12.log
+dev-v12.log
+migration-v9-watcher.log
 THEFT-ALARM.txt
 walk*.json
+migration-v*-secrets.json
+migration-v*-deployment.json
+migration-v*-cutover.json
+migration-v*-credentials-*.json
+migration-backups/
+migration-snapshots/
 node_modules/

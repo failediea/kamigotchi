@@ -40,6 +40,7 @@ contract RoomPodTest is SetupTemplate {
 
     market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
     market.initialize(marketOperator, "leasemkt");
+    market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);
 
     registry = new LeasePodRegistry(address(market));
@@ -161,7 +162,14 @@ contract RoomPodTest is SetupTemplate {
     uint256 gross = market.pendingXpDelta(tokenIndex);
     assertTrue(gross >= 100_000, "xp attribution follows the kami");
 
-    // sweep: pod -> hub (one-way, anyone can call)
+    // accounting is pull-based and can run before the pod sweep. The claim is
+    // recorded exactly, but cannot leave until the hub has the MUSU backing.
+    market.settle();
+    vm.prank(alice.owner);
+    vm.expectRevert("LM: not backed yet");
+    market.claimOwed();
+
+    // sweep: pod -> hub (one-way, anyone can call), then users pull their shares.
     uint256 hubBefore = market.musuBalance();
     uint256 swept = pod.sweepMusu();
     assertEq(market.musuBalance() - hubBefore, swept, "sweep reached the hub");
@@ -173,7 +181,10 @@ contract RoomPodTest is SetupTemplate {
     uint256 ownerCut = (net * OWNER_BPS) / 10000;
     uint256 aBefore = _accountMusu(alice);
     uint256 bBefore = _accountMusu(bob);
-    market.settle();
+    vm.prank(alice.owner);
+    market.claimOwed();
+    vm.prank(bob.owner);
+    market.claimOwed();
     assertEq(_accountMusu(alice) - aBefore, ownerCut - TRANSFER_FEE, "owner share");
     assertEq(_accountMusu(bob) - bBefore, (net - ownerCut) - TRANSFER_FEE, "renter share");
   }
@@ -187,6 +198,8 @@ contract RoomPodTest is SetupTemplate {
 
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    pod.sweepMusu();
+    market.finalizeLease(tokenIndex);
 
     // ops return leg 1: pod -> hub (kami is resting after harvest stop)
     _fastForward(_idleRequirement);

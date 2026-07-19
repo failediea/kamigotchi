@@ -31,6 +31,7 @@ interface IHubListings {
       uint128 minGasWei,
       bool staked,
       bool returning,
+      bool ending,
       address renter,
       uint256 gasBudget
     );
@@ -103,6 +104,7 @@ contract HarvestGuard {
   /// @notice start harvesting YOUR leased kami on this pod's tile
   function start(uint32 tokenIndex) external returns (uint256 harvestID) {
     _verifyRenter(tokenIndex);
+    require(!endingOf(tokenIndex), "Guard: lease ending");
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
     require(LibKami.getAccount(_comps(), kamiID) == pod.accID(), "Guard: kami not in this pod");
 
@@ -138,8 +140,8 @@ contract HarvestGuard {
   /// @notice stop an abandoned harvest once the lease is over (renter gone or
   ///         owner recalling) so the kami can rest and ship
   function keeperStop(uint32 tokenIndex) external onlyKeeper {
-    (, , , , , , bool returning, address renter, ) = hub.listings(tokenIndex);
-    require(renter == address(0) || returning, "Guard: lease active");
+    (, , , , , , bool returning, bool ending, address renter, ) = hub.listings(tokenIndex);
+    require(renter == address(0) || returning || ending, "Guard: lease active");
     _stop(tokenIndex);
   }
 
@@ -147,7 +149,7 @@ contract HarvestGuard {
   ///         the destination is verified on-chain against the target operator's
   ///         resolved account; arbitrary destinations are impossible.
   function ship(uint32 tokenIndex, address targetOperator) external onlyKeeper {
-    (address owner_, , , , , , , , ) = hub.listings(tokenIndex);
+    (address owner_, , , , , , , , , ) = hub.listings(tokenIndex);
     require(owner_ != address(0), "Guard: not listed");
     uint256 targetAcc = LibAccount.getByOperator(_comps(), targetOperator);
     require(
@@ -162,7 +164,11 @@ contract HarvestGuard {
   // VIEWS
 
   function renterOf(uint32 tokenIndex) public view returns (address renter) {
-    (, , , , , , , renter, ) = hub.listings(tokenIndex);
+    (, , , , , , , , renter, ) = hub.listings(tokenIndex);
+  }
+
+  function endingOf(uint32 tokenIndex) public view returns (bool ending) {
+    (, , , , , , , ending, , ) = hub.listings(tokenIndex);
   }
 
   ///////////////////

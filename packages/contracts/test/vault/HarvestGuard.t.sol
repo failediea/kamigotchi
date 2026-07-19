@@ -36,6 +36,7 @@ contract HarvestGuardTest is SetupTemplate {
 
     market = new KamiLeaseMarket(world, _Kami721, MGMT_BPS);
     market.initialize(marketOperator, "leasemkt");
+    market.setSettler(address(this));
     market.setMgmtAccount(charlie.id);
 
     guard = new HarvestGuard(world, address(market), keeper);
@@ -120,6 +121,8 @@ contract HarvestGuardTest is SetupTemplate {
     uint256 ownerCut = (net * OWNER_BPS) / 10000;
     uint256 bBefore = _accountMusu(bob);
     market.settle();
+    vm.prank(bob.owner);
+    market.claimOwed();
     assertEq(_accountMusu(bob) - bBefore, (net - ownerCut) - TRANSFER_FEE, "renter cut");
   }
 
@@ -162,6 +165,7 @@ contract HarvestGuardTest is SetupTemplate {
 
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    market.finalizeLease(tokenIndex);
     _fastForward(2 hours);
 
     // renter cannot ship at all
@@ -211,8 +215,25 @@ contract HarvestGuardTest is SetupTemplate {
     // lease over + renter walked away mid-harvest: keeper cleans up
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
+    vm.expectRevert("LM: still harvesting");
+    market.finalizeLease(tokenIndex);
     vm.prank(keeper);
     guard.keeperStop(tokenIndex);
+    market.finalizeLease(tokenIndex);
     assertEq(guard.harvestOf(tokenIndex), 0, "harvest cleared");
+  }
+
+  function testStartBlockedWhileLeaseIsEnding() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _acceptSelf(bob, tokenIndex);
+    _shipToSelfPod(tokenIndex);
+    _fastForward(_idleRequirement);
+
+    vm.prank(alice.owner);
+    market.endLease(tokenIndex);
+    vm.prank(bob.owner);
+    vm.expectRevert("Guard: lease ending");
+    guard.start(tokenIndex);
   }
 }

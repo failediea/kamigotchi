@@ -15,6 +15,7 @@ import { KamiLeaseMarket } from "vault/KamiLeaseMarket.sol";
  * Env:
  *  WORLD_ADDR       — World (Yominet: 0x2729174c265dbBd8416C6449E0E813E88f43D0E7)
  *  MARKET_OPERATOR  — fresh operator EOA (key goes to Kamibots ONLY)
+ *  MARKET_SETTLER   — keeper EOA allowed to account daily + finalize leases
  *  MARKET_NAME      — game account name, <=16 chars, unused
  *  MGMT_BPS         — platform fee bps (max 3000)
  *  KAMI721_ADDR     — optional override; else resolved from on-chain config
@@ -27,6 +28,7 @@ contract DeployKamiLeaseMarket is Script {
   function run() external {
     IWorld world = IWorld(vm.envAddress("WORLD_ADDR"));
     address operator = vm.envAddress("MARKET_OPERATOR");
+    address settler = vm.envAddress("MARKET_SETTLER");
     string memory name = vm.envString("MARKET_NAME");
     uint16 mgmtBps = uint16(vm.envUint("MGMT_BPS"));
 
@@ -40,11 +42,15 @@ contract DeployKamiLeaseMarket is Script {
     vm.startBroadcast();
     KamiLeaseMarket market = new KamiLeaseMarket(world, Kami721(kami721Addr), mgmtBps);
     market.initialize(operator, name);
+    market.setSettler(settler);
+    uint256 mgmtAccID = vm.envOr("MGMT_ACC_ID", uint256(0));
+    if (mgmtAccID != 0) market.setMgmtAccount(mgmtAccID);
     vm.stopBroadcast();
 
     console.log("KamiLeaseMarket:", address(market));
     console.log("game accID:", market.accID());
     console.log("operator:", operator);
+    console.log("daily settler:", settler);
     console.log("kami721:", kami721Addr);
   }
 }
