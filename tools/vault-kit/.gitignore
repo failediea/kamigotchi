@@ -20,3 +20,9 @@ migration-v*-credentials-*.json
 migration-backups/
 migration-snapshots/
 node_modules/
+parked-pod12.json
+tile-expansion-plan.json
+tile-expansion-result.json
+tile-*.log
+conductor-rerun.log
+pod-deploy-debug.log

@@ -57,7 +57,7 @@ cd ~/kamigotchi/packages/contracts
 OUT=$(WORLD_ADDR=0x2729174c265dbBd8416C6449E0E813E88f43D0E7 HUB_ADDR="$HUB" REGISTRY_ADDR="$REG" \
   POD_COUNT=1 POD1_NODE="$NODE_IDX" POD1_LABEL="$LABEL" POD1_OPERATOR="$OP_ADDR" POD1_NAME="$NAME" \
   ~/.foundry/bin/forge script script/DeployLeasePods.s.sol:DeployLeasePods \
-  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 200 2>&1)
+  --rpc-url "$YOMINET_RPC" --broadcast --private-key "$DEPLOYER_KEY" --legacy --optimizer-runs 1 --slow --skip-simulation 2>&1)
 echo "$OUT" | grep -E 'RoomPod:|accID:|Error' || true
 POD_ADDR=$(echo "$OUT" | grep 'RoomPod:' | head -1 | awk '{print $2}')
 [ -n "$POD_ADDR" ] || { echo "deploy failed"; echo "$OUT" | tail -20; exit 1; }
