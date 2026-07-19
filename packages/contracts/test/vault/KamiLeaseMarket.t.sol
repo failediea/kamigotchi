@@ -126,7 +126,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.prank(alice.operator);
     _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
     vm.prank(alice.owner);
-    vm.expectRevert("LM: not rested at full HP");
+    vm.expectRevert(KamiLeaseMarket.NotRestedFull.selector);
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // stop + heal to full -> listable
@@ -245,7 +245,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LM: terms changed");
+    vm.expectRevert(KamiLeaseMarket.TermsChanged.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     vm.prank(bob.owner);
@@ -743,22 +743,22 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = LibKami.getIndex(components, kamiID);
 
     vm.prank(alice.owner);
-    vm.expectRevert("LM: term");
+    vm.expectRevert(KamiLeaseMarket.TermRails.selector);
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, uint32(12 hours), address(0));
 
     vm.prank(alice.owner);
-    vm.expectRevert("LM: term");
+    vm.expectRevert(KamiLeaseMarket.TermRails.selector);
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, uint32(31 days), address(0));
 
     tokenIndex = _listPool(alice, kamiID); // lists with a 7 day cap
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LM: term");
+    vm.expectRevert(KamiLeaseMarket.TermRails.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 8 days);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: term");
+    vm.expectRevert(KamiLeaseMarket.TermRails.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 12 hours);
 
     _accept(bob, tokenIndex); // 1 day term — inside the rails
@@ -775,7 +775,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, tokenIndex);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: min term");
+    vm.expectRevert(KamiLeaseMarket.MinTerm.selector);
     market.endLease(tokenIndex);
 
     // the owner may recall at any time
@@ -795,7 +795,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LM: reserved");
+    vm.expectRevert(KamiLeaseMarket.Reserved.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     vm.deal(vip, 1 ether);
@@ -818,7 +818,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     );
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: term");
+    vm.expectRevert(KamiLeaseMarket.TermRails.selector);
     market.extendLease(tokenIndex, 4 days); // 8 days total > 7 day cap
 
     vm.prank(_getNextUserAddress());
@@ -842,6 +842,29 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertTrue(_endingOf(tokenIndex), "expired lease flipped to ending");
     market.finalizeLease(tokenIndex); // the settler completes it
     assertEq(_renterOf(tokenIndex), address(0), "lease closed");
+  }
+
+  function testAdminHandOffTwoStep() public {
+    address customer = _getNextUserAddress();
+
+    // only the pending admin can accept — a stranger cannot hijack the hand-off
+    market.transferAdmin(customer);
+    vm.prank(_getNextUserAddress());
+    vm.expectRevert(KamiLeaseMarket.NotPendingAdmin.selector);
+    market.acceptAdmin();
+
+    // until acceptance the platform is still admin (can cancel with address(0))
+    assertEq(market.admin(), address(this));
+    vm.prank(customer);
+    market.acceptAdmin();
+    assertEq(market.admin(), customer);
+    assertEq(market.pendingAdmin(), address(0));
+
+    // old admin has lost all power; the customer now holds the kill switch
+    vm.expectRevert(KamiLeaseMarket.NotAdmin.selector);
+    market.setSettler(address(this));
+    vm.prank(customer);
+    market.setSettler(customer);
   }
 
 }

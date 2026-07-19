@@ -77,6 +77,7 @@ contract KamiLeaseMarket {
   ///         so XP-delta attribution stays exact per market.
   uint32 public immutable payItem;
   address public admin;
+  address public pendingAdmin; // two-step admin hand-off (Pools-as-a-Service)
 
   uint256 public accID; // the market's game account
   uint16 public mgmtBps; // platform fee, lower-only
@@ -133,6 +134,12 @@ contract KamiLeaseMarket {
   error NoGas();
   error NoReturnRequested();
   error NotAdmin();
+  error NotPendingAdmin();
+  error TermRails();
+  error MinTerm();
+  error Reserved();
+  error TermsChanged();
+  error NotRestedFull();
   error PayItemZero();
   error NotAnAccount();
   error NotArrived();
@@ -162,6 +169,8 @@ contract KamiLeaseMarket {
 
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
+  event AdminTransferProposed(address indexed from, address indexed to);
+  event AdminTransferred(address indexed from, address indexed to);
   event SettlerSet(address newSettler);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event Delisted(address indexed owner, uint32 indexed tokenIndex);
@@ -230,6 +239,25 @@ contract KamiLeaseMarket {
     emit OperatorRotated(newOperator);
   }
 
+  /// @notice POOLS-AS-A-SERVICE hand-off. Two-step so a pool can never be locked
+  ///         to an address that can't act. The platform provisions the pool
+  ///         (initialize + settler + mgmt while it is admin), then proposes the
+  ///         CUSTOMER as admin; the customer accepts from their own wallet and
+  ///         thereby holds the kill switch — they can rotate operators away from
+  ///         the platform at will. mgmtBps is immutable-down, so the platform's
+  ///         fee can never rise after hand-off.
+  function transferAdmin(address newAdmin) external onlyAdmin {
+    pendingAdmin = newAdmin; // address(0) cancels a pending hand-off
+    emit AdminTransferProposed(admin, newAdmin);
+  }
+
+  function acceptAdmin() external {
+    require(msg.sender == pendingAdmin, NotPendingAdmin());
+    emit AdminTransferred(admin, msg.sender);
+    admin = msg.sender;
+    pendingAdmin = address(0);
+  }
+
   function setSettler(address newSettler) external onlyAdmin {
     require(newSettler != address(0), ZeroSettler());
     settler = newSettler;
@@ -285,7 +313,7 @@ contract KamiLeaseMarket {
   ) external {
     require(accID != 0, NotInit());
     require(ownerShareBps <= 10000, ShareTooHigh());
-    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
+    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
     require(_listings[tokenIndex].owner == address(0), AlreadyListed());
 
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
@@ -294,7 +322,7 @@ contract KamiLeaseMarket {
       LibKami.getAccount(_comps(), kamiID) == uint256(uint160(msg.sender)),
       KamiNotInYourAccount()
     );
-    require(_isRestedFull(kamiID), "LM: not rested at full HP");
+    require(_isRestedFull(kamiID), NotRestedFull());
 
     _newListing(tokenIndex, kamiID, 0, false, ownerShareBps, minGasWei, maxTermSecs, reservedFor);
   }
@@ -315,7 +343,7 @@ contract KamiLeaseMarket {
   ) external nonReentrant {
     require(accID != 0, NotInit());
     require(ownerShareBps <= 10000, ShareTooHigh());
-    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
+    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
     require(_listings[tokenIndex].owner == address(0), AlreadyListed());
 
     kami721.transferFrom(msg.sender, address(this), uint256(tokenIndex));
@@ -324,7 +352,7 @@ contract KamiLeaseMarket {
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
     // same admission rule as the legacy path: a renter must never receive a
     // wounded kami. staking marks it RESTING; require effective full health too.
-    require(_isRestedFull(kamiID), "LM: not rested at full HP");
+    require(_isRestedFull(kamiID), NotRestedFull());
     _newListing(
       tokenIndex,
       kamiID,
@@ -408,7 +436,7 @@ contract KamiLeaseMarket {
     require(l.renter == address(0), Leased());
     require(!l.returning, BeingReturned());
     require(ownerShareBps <= 10000, ShareTooHigh());
-    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
+    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
     l.ownerShareBps = ownerShareBps;
     l.minGasWei = minGasWei;
     l.maxTermSecs = maxTermSecs;
@@ -505,9 +533,9 @@ contract KamiLeaseMarket {
     require(!l.returning, BeingReturned());
     require(l.renter == address(0), AlreadyLeased());
     require(l.owner != msg.sender, OwnKami());
-    require(l.reservedFor == address(0) || l.reservedFor == msg.sender, "LM: reserved");
-    require(l.ownerShareBps == expectedOwnerShareBps, "LM: terms changed");
-    require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, "LM: term");
+    require(l.reservedFor == address(0) || l.reservedFor == msg.sender, Reserved());
+    require(l.ownerShareBps == expectedOwnerShareBps, TermsChanged());
+    require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
     require(msg.value >= l.minGasWei, "LM: gas budget too low");
     require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
 
@@ -544,7 +572,7 @@ contract KamiLeaseMarket {
     require(l.renter == msg.sender, NotRenter());
     require(!l.ending, EndingNow());
     uint64 newEnd = l.leaseEnd + extraSecs;
-    require(uint256(newEnd) - l.leaseStart <= l.maxTermSecs, "LM: term");
+    require(uint256(newEnd) - l.leaseStart <= l.maxTermSecs, TermRails());
     l.leaseEnd = newEnd;
     emit LeaseExtended(tokenIndex, newEnd);
   }
@@ -561,7 +589,7 @@ contract KamiLeaseMarket {
       require(msg.sender == renter || msg.sender == l.owner, NotParty());
       // the renter committed for at least MIN_TERM; the owner may recall anytime
       if (msg.sender == renter)
-        require(block.timestamp >= uint256(l.leaseStart) + MIN_TERM, "LM: min term");
+        require(block.timestamp >= uint256(l.leaseStart) + MIN_TERM, MinTerm());
     } // past leaseEnd the lease is EXPIRED: anyone (the keeper) may flip it
 
     l.ending = true;
