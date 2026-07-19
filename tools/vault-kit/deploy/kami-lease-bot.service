@@ -1,0 +1,19 @@
+[Unit]
+Description=Kami Lease Market - ops keeper bot (v12)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/kamigotchi/tools/vault-kit
+ExecStart=/root/.nvm/versions/node/v20.20.0/bin/node ops-bot.mjs
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kami-lease-bot
+Environment=NODE_ENV=production
+Environment=PATH=/root/.nvm/versions/node/v20.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

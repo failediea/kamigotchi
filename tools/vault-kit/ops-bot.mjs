@@ -609,6 +609,19 @@ async function exportLiveStatus() {
   try {
     writeFileSync(LIVE_STATUS_FILE, JSON.stringify(out));
   } catch {}
+  // production transport: push the same snapshot to the hosted dApp (Vercel
+  // can't read this box's filesystem). Fire-and-forget; file stays the source
+  // of truth for same-box dev.
+  if (process.env.VAULT_STATUS_PUSH_URL && process.env.VAULT_STATUS_SECRET) {
+    fetch(process.env.VAULT_STATUS_PUSH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-vault-secret": process.env.VAULT_STATUS_SECRET,
+      },
+      body: JSON.stringify(out),
+    }).catch(() => {});
+  }
 }
 
 // ---- daily accounting -------------------------------------------------------
