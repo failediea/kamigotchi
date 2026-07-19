@@ -119,14 +119,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     // not yours -> no
     vm.prank(bob.owner);
-    vm.expectRevert("LM: kami not in your account");
+    vm.expectRevert(KamiLeaseMarket.KamiNotInYourAccount.selector);
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // farming -> not resting at full health -> no
     vm.prank(alice.operator);
     _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
     vm.prank(alice.owner);
-    vm.expectRevert("LM: must be resting at full health");
+    vm.expectRevert("LM: not rested at full HP");
     market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // stop + heal to full -> listable
@@ -146,11 +146,11 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // listed but not sent: NOT rentable
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
-    vm.expectRevert("LM: not in pool yet");
+    vm.expectRevert(KamiLeaseMarket.NotInPoolYet.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     // premature confirm fails
-    vm.expectRevert("LM: not arrived");
+    vm.expectRevert(KamiLeaseMarket.NotArrived.selector);
     market.confirmArrival(tokenIndex);
 
     // send in -> pooled: custody is the market's, owner literally cannot use it
@@ -171,7 +171,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _list(alice, kamiID);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: not owner");
+    vm.expectRevert(KamiLeaseMarket.NotOwner.selector);
     market.delist(tokenIndex);
 
     vm.prank(alice.owner);
@@ -182,7 +182,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 kami2 = _mintKami(alice);
     uint32 idx2 = _listPool(alice, kami2);
     vm.prank(alice.owner);
-    vm.expectRevert("LM: in pool - use requestReturn");
+    vm.expectRevert(KamiLeaseMarket.InPoolUseReturn.selector);
     market.delist(idx2);
   }
 
@@ -225,14 +225,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.deal(alice.owner, 1 ether);
     vm.prank(alice.owner);
-    vm.expectRevert("LM: own kami");
+    vm.expectRevert(KamiLeaseMarket.OwnKami.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     _accept(bob, tokenIndex);
 
     vm.deal(charlie.owner, 1 ether);
     vm.prank(charlie.owner);
-    vm.expectRevert("LM: already leased");
+    vm.expectRevert(KamiLeaseMarket.AlreadyLeased.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
   }
 
@@ -278,10 +278,10 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertTrue(_endingOf(tokenIndex), "owner started ending");
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: lease ending");
+    vm.expectRevert(KamiLeaseMarket.EndingNow.selector);
     market.setPrefs(tokenIndex, "{}");
     vm.prank(bob.owner);
-    vm.expectRevert("LM: lease ending");
+    vm.expectRevert(KamiLeaseMarket.EndingNow.selector);
     market.topUpGas{ value: 1 }(tokenIndex);
   }
 
@@ -412,7 +412,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // returning blocks new leases
     vm.deal(dana().owner, 1 ether);
     vm.prank(dana().owner);
-    vm.expectRevert("LM: being returned");
+    vm.expectRevert(KamiLeaseMarket.BeingReturned.selector);
     market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     _fastForward(_idleRequirement);
@@ -433,18 +433,18 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _list(alice, kamiID);
 
     vm.prank(alice.owner);
-    vm.expectRevert("LM: not in pool - use delist");
+    vm.expectRevert(KamiLeaseMarket.NotInPoolUseDelist.selector);
     market.withdrawKami(tokenIndex);
 
     _sendIn(alice, tokenIndex);
     _accept(bob, tokenIndex);
 
     vm.prank(alice.owner);
-    vm.expectRevert("LM: end lease first");
+    vm.expectRevert(KamiLeaseMarket.EndLeaseFirst.selector);
     market.withdrawKami(tokenIndex);
 
     vm.prank(bob.owner);
-    vm.expectRevert("LM: not owner");
+    vm.expectRevert(KamiLeaseMarket.NotOwner.selector);
     market.withdrawKami(tokenIndex);
   }
 
@@ -458,7 +458,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _marketHarvest(kamiID, 50_000);
 
     vm.prank(_getNextUserAddress());
-    vm.expectRevert("LM: not settler");
+    vm.expectRevert(KamiLeaseMarket.NotSettler.selector);
     market.settle();
     market.settle();
     assertGt(market.owedMusu(bob.owner), 0, "keeper credited renter");
@@ -472,7 +472,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     address caller = _getNextUserAddress();
 
     vm.prank(caller);
-    vm.expectRevert("LM: not settler");
+    vm.expectRevert(KamiLeaseMarket.NotSettler.selector);
     market.settle();
 
     _fastForward(3 days + 1);
@@ -490,7 +490,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.settle();
 
     _marketHarvest(kamiID, 50_000);
-    vm.expectRevert("LM: cooldown");
+    vm.expectRevert(KamiLeaseMarket.Cooldown.selector);
     market.settle();
 
     _fastForward(1 days + 1);
@@ -602,7 +602,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     // now cancelReturn MUST revert — re-opening would be a phantom lease
     vm.prank(alice.owner);
-    vm.expectRevert("LM: already sent home - use clearReturned");
+    vm.expectRevert(KamiLeaseMarket.AlreadySentHome.selector);
     market.cancelReturn(idx);
 
     // the correct path clears the listing
@@ -822,7 +822,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.extendLease(tokenIndex, 4 days); // 8 days total > 7 day cap
 
     vm.prank(_getNextUserAddress());
-    vm.expectRevert("LM: not renter");
+    vm.expectRevert(KamiLeaseMarket.NotRenter.selector);
     market.extendLease(tokenIndex, 1 days);
   }
 
@@ -833,7 +833,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     address stranger = _getNextUserAddress();
     vm.prank(stranger);
-    vm.expectRevert("LM: not party");
+    vm.expectRevert(KamiLeaseMarket.NotParty.selector);
     market.endLease(tokenIndex); // not expired yet
 
     _fastForward(1 days + 1);

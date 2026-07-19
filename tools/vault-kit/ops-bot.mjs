@@ -76,7 +76,8 @@ const MARKET_ABI = [
   "function accID() view returns (uint256)",
   "function numListings() view returns (uint256)",
   "function tokenIndices(uint256) view returns (uint32)",
-  "function listings(uint32) view returns (address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, bool ending, address renter, uint256 gasBudget)",
+  "function listings(uint32) view returns (tuple(address owner, uint256 kamiID, uint256 xpBase, uint16 ownerShareBps, uint128 minGasWei, bool staked, bool returning, bool ending, address renter, uint256 gasBudget, uint32 maxTermSecs, uint64 leaseStart, uint64 leaseEnd, address reservedFor))",
+  "function endLease(uint32 tokenIndex)",
   "function clearReturned(uint32 tokenIndex)",
   "function confirmArrival(uint32 tokenIndex)",
   "function finalizeLease(uint32 tokenIndex)",
@@ -307,9 +308,10 @@ const RISK = {
 // food in the pod inventory — the pool never buys anything.
 const FOOD_IDS = new Set([11301, 11302, 11303, 11304, 11311, 11312, 11313, 11314]);
 
-// a running strategy is identified by node + risk + regen(+food) — ANY change
-// must restart the strategy with the new config
-const stratSig = (node, risk, regen = "REST", food = 0) => `${node}:${risk}:${regen}:${food}`;
+// a running strategy is identified by node + risk + regen(+food) + rez — ANY
+// change must restart the strategy with the new config
+const stratSig = (node, risk, regen = "REST", food = 0, rez = 0) =>
+  `${node}:${risk}:${regen}:${food}:${rez ? 1 : 0}`;
 
 function parsePrefs(idx) {
   let risk = "balanced";
@@ -317,6 +319,7 @@ function parsePrefs(idx) {
   let mode = "bot";
   let regen = "REST";
   let food = 0;
+  let rez = 0;
   try {
     const p = JSON.parse(state.prefs[idx] || "{}");
     if (p.mode === "self" && selfPods.has(Number(p.node))) {
@@ -329,12 +332,20 @@ function parsePrefs(idx) {
       regen = "FEED";
       food = Number(p.food);
     }
+    // DEATH PROTECTION: renter ships Red Ribbon Gummies (11001) to the pod and
+    // opts in — the strategy switches to rest_v3, whose runner auto-revives.
+    // rest_v3 has no feed support, so rez forces REST regen.
+    if (p.rez === 1 || p.rez === true) {
+      rez = 1;
+      regen = "REST";
+      food = 0;
+    }
   } catch {}
-  return { risk, node, mode, regen, food };
+  return { risk, node, mode, regen, food, rez };
 }
 
 const warnedPods = new Set();
-async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0) {
+async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0, rez = 0) {
   if (!pod.creds) {
     if (!warnedPods.has(pod.node)) {
       warnedPods.add(pod.node);
@@ -345,34 +356,67 @@ async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0) {
   try {
     // FEED mode: renter supplied food (their items, in the pod inventory) — the
     // kami eats instead of resting for far higher uptime. failsafe rests when
-    // the food runs out. REST mode: classic harvestAndRest.
+    // the food runs out. REST mode: classic harvestAndRest. REZ mode: rest_v3,
+    // the only FREE strategy whose runner auto-revives (reviveOnDeath) — the
+    // renter keeps Red Ribbon Gummies (11001) in the pod inventory for it.
     const base = { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...(RISK[risk] || RISK.balanced) };
-    const body =
-      regen === "FEED" && food
-        ? {
-            strategyType: "harvestAndFeed",
-            kamiId: tokenIndex,
-            nodeId: pod.node,
-            config: {
-              ...base,
-              enableFeedInterval: true,
-              feedInterval: 3600,
-              foodType: food,
-              enableFailsafeRest: true,
-              failsafeRestDuration: 600,
+    let body;
+    if (rez) {
+      body = {
+        strategyType: "rest_v3",
+        kamiId: tokenIndex,
+        nodeId: pod.node,
+        config: {
+          kamiIndices: [tokenIndex],
+          nodeId: pod.node,
+          restV3Preferences: [
+            {
+              kamiIndex: tokenIndex,
+              autoCollect: true,
+              bountyCollectThreshold: 10000,
+              reviveOnDeath: true,
+              safetyMargin: risk === "safe" ? 7 : risk === "aggressive" ? 2 : 5,
             },
-            keyData: { privy_id: pod.creds.privyId },
-          }
-        : {
-            strategyType: "harvestAndRest",
-            kamiId: tokenIndex,
-            nodeId: pod.node,
-            config: base,
-            keyData: { privy_id: pod.creds.privyId },
-          };
-    await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
-    state.strategies[tokenIndex] = stratSig(pod.node, risk, regen, food);
-    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}${regen === "FEED" ? ` · FEED item ${food}` : ""}) via ${pod.label}`);
+          ],
+        },
+        keyData: { privy_id: pod.creds.privyId },
+      };
+    } else if (regen === "FEED" && food) {
+      body = {
+        strategyType: "harvestAndFeed",
+        kamiId: tokenIndex,
+        nodeId: pod.node,
+        config: {
+          ...base,
+          enableFeedInterval: true,
+          feedInterval: 3600,
+          foodType: food,
+          enableFailsafeRest: true,
+          failsafeRestDuration: 600,
+        },
+        keyData: { privy_id: pod.creds.privyId },
+      };
+    } else {
+      body = {
+        strategyType: "harvestAndRest",
+        kamiId: tokenIndex,
+        nodeId: pod.node,
+        config: base,
+        keyData: { privy_id: pod.creds.privyId },
+      };
+    }
+    try {
+      await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
+    } catch (e) {
+      if (!rez) throw e;
+      // rest_v3 rejected (schema drift?) — farm WITHOUT auto-revive rather than
+      // not at all. Sig still records the desired rez so we don't churn restarts.
+      console.error(`🚑 rest_v3 (auto-revive) refused for #${tokenIndex}: ${e.message?.slice(0, 160)} — falling back to harvestAndRest WITHOUT revive`);
+      body = { strategyType: "harvestAndRest", kamiId: tokenIndex, nodeId: pod.node, config: base, keyData: { privy_id: pod.creds.privyId } };
+      await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
+    }
+    state.strategies[tokenIndex] = stratSig(pod.node, risk, regen, food, rez);
+    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}${regen === "FEED" ? ` · FEED item ${food}` : ""}${rez ? " · AUTO-REVIVE" : ""}) via ${pod.label}`);
   } catch (e) {
     console.error(`strategy start failed #${tokenIndex} on pod ${pod.node}: ${e.message}`);
   }
@@ -457,7 +501,7 @@ async function reconcile(idx, l) {
   const actualAcc = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
-  const { risk, node, mode, regen, food } = parsePrefs(idx);
+  const { risk, node, mode, regen, food, rez } = parsePrefs(idx);
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
   const holdingPod = podByAccID(actualAcc);
   const targetPod = leased ? (mode === "self" ? selfPods.get(node) : pods.get(node)) : null;
@@ -491,9 +535,9 @@ async function reconcile(idx, l) {
       return;
     }
     // right tile: the renter's exact strategy (node/risk/regen/food) should run
-    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk, regen, food)) {
+    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk, regen, food, rez)) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
-      await startStrategy(targetPod, idx, risk, regen, food);
+      await startStrategy(targetPod, idx, risk, regen, food, rez);
     }
     return;
   }
@@ -732,6 +776,23 @@ async function tick() {
 
     if (l.ending) {
       await finalizeEnding(idx, l);
+      continue;
+    }
+
+    // auto-expiry: past leaseEnd ANYONE may flip the lease to ending — the keeper
+    // does it, then runs the normal stop -> sweep -> finalize flow immediately.
+    if (
+      l.renter !== "0x0000000000000000000000000000000000000000" &&
+      l.leaseEnd > 0n &&
+      BigInt(Math.floor(Date.now() / 1000)) > l.leaseEnd
+    ) {
+      try {
+        await (await market.connect(operator).endLease(idx)).wait();
+        console.log(`⏰ lease #${idx} expired (term up) — ending flow started`);
+        await finalizeEnding(idx, l);
+      } catch (e) {
+        console.error(`expire #${idx} failed: ${e.message?.slice(0, 120)}`);
+      }
       continue;
     }
 

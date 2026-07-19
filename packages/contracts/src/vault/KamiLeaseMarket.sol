@@ -66,14 +66,6 @@ contract KamiLeaseMarket {
     address reservedFor; // private lease: only this renter may accept (0 = public)
   }
 
-  /// @dev earnings attribution carried across lease/withdraw boundaries until settle
-  struct CarryEntry {
-    address owner;
-    address renter; // 0 = owner-only split
-    uint16 ownerShareBps;
-    uint256 delta;
-  }
-
 
   ///////////////////
   // STATE
@@ -111,6 +103,55 @@ contract KamiLeaseMarket {
 
   uint256 private locked = 1;
 
+  // compact custom errors (EIP-170 headroom) — user-facing rails keep strings
+  error AlreadyEnding();
+  error AlreadyInPool();
+  error AlreadyLeased();
+  error AlreadyListed();
+  error AlreadyReturning();
+  error AlreadySentHome();
+  error BeingReturned();
+  error BudgetTooLow();
+  error CanOnlyLower();
+  error ClaimFailed();
+  error Cooldown();
+  error CooldownTooLong();
+  error DripFailed();
+  error EndLeaseFirst();
+  error FeeTooHigh();
+  error InPoolUseReturn();
+  error AlreadyInit();
+  error KamiNotHomeYet();
+  error KamiNotInYourAccount();
+  error EndingNow();
+  error Leased();
+  error MgmtAccountUnset();
+  error NoGas();
+  error NoReturnRequested();
+  error NotAdmin();
+  error NotAnAccount();
+  error NotArrived();
+  error NotEnding();
+  error NotFinalizer();
+  error NotInMarket();
+  error NotInPoolUseDelist();
+  error NotInPoolYet();
+  error NotInit();
+  error NotLeased();
+  error NotListed();
+  error NotOwner();
+  error NotParty();
+  error NotRenter();
+  error NotReturning();
+  error NotSettler();
+  error NothingClaimable();
+  error NothingOwed();
+  error OwnKami();
+  error Reentrancy();
+  error RegisterAnAccountFirst();
+  error ShareTooHigh();
+  error ZeroSettler();
+
   ///////////////////
   // EVENTS
 
@@ -143,12 +184,12 @@ contract KamiLeaseMarket {
   // MODIFIERS
 
   modifier onlyAdmin() {
-    require(msg.sender == admin, "LM: not admin");
+    require(msg.sender == admin, NotAdmin());
     _;
   }
 
   modifier nonReentrant() {
-    require(locked == 1, "LM: reentrancy");
+    require(locked == 1, Reentrancy());
     locked = 2;
     _;
     locked = 1;
@@ -158,7 +199,7 @@ contract KamiLeaseMarket {
   // SETUP / ADMIN
 
   constructor(IWorld _world, Kami721 _kami721, uint16 _mgmtBps) {
-    require(_mgmtBps <= 3000, "LM: fee > 30%");
+    require(_mgmtBps <= 3000, FeeTooHigh());
     world = _world;
     kami721 = _kami721;
     admin = msg.sender;
@@ -166,7 +207,7 @@ contract KamiLeaseMarket {
   }
 
   function initialize(address operator, string calldata name) external onlyAdmin {
-    require(accID == 0, "LM: initialized");
+    require(accID == 0, AlreadyInit());
     bytes memory result = AccountRegisterSystem(_sys(AccountRegisterSystemID)).executeTyped(
       operator,
       name
@@ -183,25 +224,25 @@ contract KamiLeaseMarket {
   }
 
   function setSettler(address newSettler) external onlyAdmin {
-    require(newSettler != address(0), "LM: zero settler");
+    require(newSettler != address(0), ZeroSettler());
     settler = newSettler;
     emit SettlerSet(newSettler);
   }
 
   function lowerMgmtBps(uint16 newBps) external onlyAdmin {
-    require(newBps < mgmtBps, "LM: can only lower");
+    require(newBps < mgmtBps, CanOnlyLower());
     mgmtBps = newBps;
     emit MgmtBpsLowered(newBps);
   }
 
   function setMgmtAccount(uint256 _mgmtAccID) external onlyAdmin {
-    require(_isAccount(_mgmtAccID), "LM: not an account");
+    require(_isAccount(_mgmtAccID), NotAnAccount());
     mgmtAccID = _mgmtAccID;
   }
 
   /// @notice settle spam guard, capped at 7 days so payouts can't be locked up
   function setSettleCooldown(uint64 secs) external onlyAdmin {
-    require(secs <= 7 days, "LM: cooldown too long");
+    require(secs <= 7 days, CooldownTooLong());
     settleCooldown = secs;
     emit SettleCooldownSet(secs);
   }
@@ -210,12 +251,12 @@ contract KamiLeaseMarket {
   ///         but funds can ONLY go to the current account operator.
   function dripGas(uint32 tokenIndex, uint256 amount) external onlyAdmin {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter != address(0), "LM: not leased");
-    require(l.gasBudget >= amount, "LM: budget too low");
+    require(l.renter != address(0), NotLeased());
+    require(l.gasBudget >= amount, BudgetTooLow());
     l.gasBudget -= amount;
     address operator = LibAccount.getOperator(_comps(), accID);
     (bool ok, ) = operator.call{ value: amount }("");
-    require(ok, "LM: drip failed");
+    require(ok, DripFailed());
     emit GasDripped(tokenIndex, operator, amount);
   }
 
@@ -235,40 +276,20 @@ contract KamiLeaseMarket {
     uint32 maxTermSecs,
     address reservedFor
   ) external {
-    require(accID != 0, "LM: not initialized");
-    require(ownerShareBps <= 10000, "LM: share > 100%");
+    require(accID != 0, NotInit());
+    require(ownerShareBps <= 10000, ShareTooHigh());
     require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
-    require(_listings[tokenIndex].owner == address(0), "LM: already listed");
+    require(_listings[tokenIndex].owner == address(0), AlreadyListed());
 
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
     // the caller's game account IS uint160(caller) — verify current in-game ownership
     require(
       LibKami.getAccount(_comps(), kamiID) == uint256(uint160(msg.sender)),
-      "LM: kami not in your account"
+      KamiNotInYourAccount()
     );
-    require(_isRestedFull(kamiID), "LM: must be resting at full health");
+    require(_isRestedFull(kamiID), "LM: not rested at full HP");
 
-    _listings[tokenIndex] = Listing({
-      owner: msg.sender,
-      kamiID: kamiID,
-      xpBase: 0,
-      ownerShareBps: ownerShareBps,
-      minGasWei: minGasWei,
-      staked: false, // becomes true when the kami arrives in the pool
-      returning: false,
-      ending: false,
-      renter: address(0),
-      gasBudget: 0,
-      maxTermSecs: maxTermSecs,
-      leaseStart: 0,
-      leaseEnd: 0,
-      reservedFor: reservedFor
-    });
-    tokenIndices.push(tokenIndex);
-    tokenPos[tokenIndex] = tokenIndices.length;
-    participations[msg.sender]++;
-
-    emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
+    _newListing(tokenIndex, kamiID, 0, false, ownerShareBps, minGasWei, maxTermSecs, reservedFor);
   }
 
   /// @notice ONE-TX LISTING for a kami held as an NFT in your wallet: approve
@@ -285,10 +306,10 @@ contract KamiLeaseMarket {
     uint32 maxTermSecs,
     address reservedFor
   ) external nonReentrant {
-    require(accID != 0, "LM: not initialized");
-    require(ownerShareBps <= 10000, "LM: share > 100%");
+    require(accID != 0, NotInit());
+    require(ownerShareBps <= 10000, ShareTooHigh());
     require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
-    require(_listings[tokenIndex].owner == address(0), "LM: already listed");
+    require(_listings[tokenIndex].owner == address(0), AlreadyListed());
 
     kami721.transferFrom(msg.sender, address(this), uint256(tokenIndex));
     Kami721StakeSystem(_sys(Kami721StakeSystemID)).executeTyped(tokenIndex);
@@ -296,14 +317,38 @@ contract KamiLeaseMarket {
     uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
     // same admission rule as the legacy path: a renter must never receive a
     // wounded kami. staking marks it RESTING; require effective full health too.
-    require(_isRestedFull(kamiID), "LM: must be resting at full health");
+    require(_isRestedFull(kamiID), "LM: not rested at full HP");
+    _newListing(
+      tokenIndex,
+      kamiID,
+      LibExperience.get(_comps(), kamiID),
+      true, // in the pool from this very transaction
+      ownerShareBps,
+      minGasWei,
+      maxTermSecs,
+      reservedFor
+    );
+    emit Arrived(msg.sender, tokenIndex);
+  }
+
+  /// @dev shared listing constructor for both listing paths
+  function _newListing(
+    uint32 tokenIndex,
+    uint256 kamiID,
+    uint256 xpBase,
+    bool staked,
+    uint16 ownerShareBps,
+    uint128 minGasWei,
+    uint32 maxTermSecs,
+    address reservedFor
+  ) internal {
     _listings[tokenIndex] = Listing({
       owner: msg.sender,
       kamiID: kamiID,
-      xpBase: LibExperience.get(_comps(), kamiID),
+      xpBase: xpBase,
       ownerShareBps: ownerShareBps,
       minGasWei: minGasWei,
-      staked: true, // in the pool from this very transaction
+      staked: staked,
       returning: false,
       ending: false,
       renter: address(0),
@@ -316,18 +361,16 @@ contract KamiLeaseMarket {
     tokenIndices.push(tokenIndex);
     tokenPos[tokenIndex] = tokenIndices.length;
     participations[msg.sender]++;
-
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
-    emit Arrived(msg.sender, tokenIndex);
   }
 
   /// @notice STEP 3: confirm the kami arrived in the pool (anyone/keeper). only now
   ///         is it rentable. it sits UNFARMED until someone rents it.
   function confirmArrival(uint32 tokenIndex) external nonReentrant {
     Listing storage l = _listings[tokenIndex];
-    require(l.owner != address(0), "LM: not listed");
-    require(!l.staked, "LM: already in pool");
-    require(LibKami.getAccount(_comps(), l.kamiID) == accID, "LM: not arrived");
+    require(l.owner != address(0), NotListed());
+    require(!l.staked, AlreadyInPool());
+    require(LibKami.getAccount(_comps(), l.kamiID) == accID, NotArrived());
 
     l.staked = true;
     l.xpBase = LibExperience.get(_comps(), l.kamiID);
@@ -337,9 +380,9 @@ contract KamiLeaseMarket {
   /// @notice cancel a listing whose kami was never sent (nothing to return)
   function delist(uint32 tokenIndex) external {
     Listing memory l = _listings[tokenIndex];
-    require(l.owner == msg.sender, "LM: not owner");
-    require(l.renter == address(0), "LM: leased");
-    require(!l.staked, "LM: in pool - use requestReturn");
+    require(l.owner == msg.sender, NotOwner());
+    require(l.renter == address(0), Leased());
+    require(!l.staked, InPoolUseReturn());
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     emit Delisted(msg.sender, tokenIndex);
@@ -354,10 +397,10 @@ contract KamiLeaseMarket {
     address reservedFor
   ) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.owner == msg.sender, "LM: not owner");
-    require(l.renter == address(0), "LM: leased");
-    require(!l.returning, "LM: being returned");
-    require(ownerShareBps <= 10000, "LM: share > 100%");
+    require(l.owner == msg.sender, NotOwner());
+    require(l.renter == address(0), Leased());
+    require(!l.returning, BeingReturned());
+    require(ownerShareBps <= 10000, ShareTooHigh());
     require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, "LM: term");
     l.ownerShareBps = ownerShareBps;
     l.minGasWei = minGasWei;
@@ -370,9 +413,9 @@ contract KamiLeaseMarket {
   ///         the recorded owner. un-settled earnings are carried to the next settle.
   function withdrawKami(uint32 tokenIndex) external nonReentrant {
     Listing memory l = _listings[tokenIndex];
-    require(l.owner == msg.sender, "LM: not owner");
-    require(l.renter == address(0), "LM: end lease first");
-    require(l.staked, "LM: not in pool - use delist");
+    require(l.owner == msg.sender, NotOwner());
+    require(l.renter == address(0), EndLeaseFirst());
+    require(l.staked, NotInPoolUseDelist());
 
     _creditPending(tokenIndex);
     Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
@@ -387,10 +430,10 @@ contract KamiLeaseMarket {
   ///         bridge room, works from anywhere (1h in-game cooldown applies).
   function requestReturn(uint32 tokenIndex) external nonReentrant {
     Listing storage l = _listings[tokenIndex];
-    require(l.owner == msg.sender, "LM: not owner");
-    require(l.renter == address(0), "LM: end lease first");
-    require(l.staked, "LM: not in market");
-    require(!l.returning, "LM: already returning");
+    require(l.owner == msg.sender, NotOwner());
+    require(l.renter == address(0), EndLeaseFirst());
+    require(l.staked, NotInMarket());
+    require(!l.returning, AlreadyReturning());
 
     _creditPending(tokenIndex); // freeze attribution at request time
     l.returning = true;
@@ -404,11 +447,11 @@ contract KamiLeaseMarket {
   ///         (that would be a phantom lease over an asset that isn't in custody).
   function cancelReturn(uint32 tokenIndex) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.owner == msg.sender, "LM: not owner");
-    require(l.returning, "LM: not returning");
+    require(l.owner == msg.sender, NotOwner());
+    require(l.returning, NotReturning());
     require(
       LibKami.getAccount(_comps(), l.kamiID) == accID,
-      "LM: already sent home - use clearReturned"
+      AlreadySentHome()
     );
     l.returning = false;
     emit Listed(l.owner, tokenIndex, l.ownerShareBps, l.minGasWei);
@@ -418,11 +461,11 @@ contract KamiLeaseMarket {
   ///         callable by anyone; only clears if the kami actually went home.
   function clearReturned(uint32 tokenIndex) external nonReentrant {
     Listing memory l = _listings[tokenIndex];
-    require(l.owner != address(0), "LM: not listed");
-    require(l.returning, "LM: no return requested");
+    require(l.owner != address(0), NotListed());
+    require(l.returning, NoReturnRequested());
     require(
       LibKami.getAccount(_comps(), l.kamiID) == uint256(uint160(l.owner)),
-      "LM: kami not home yet"
+      KamiNotHomeYet()
     );
     // carry any earnings accrued AFTER requestReturn's snapshot (e.g. a harvest
     // the automation hadn't stopped yet) before the listing is deleted, so the
@@ -450,11 +493,11 @@ contract KamiLeaseMarket {
     uint32 termSecs
   ) external payable nonReentrant {
     Listing storage l = _listings[tokenIndex];
-    require(l.owner != address(0), "LM: not listed");
-    require(l.staked, "LM: not in pool yet");
-    require(!l.returning, "LM: being returned");
-    require(l.renter == address(0), "LM: already leased");
-    require(l.owner != msg.sender, "LM: own kami");
+    require(l.owner != address(0), NotListed());
+    require(l.staked, NotInPoolYet());
+    require(!l.returning, BeingReturned());
+    require(l.renter == address(0), AlreadyLeased());
+    require(l.owner != msg.sender, OwnKami());
     require(l.reservedFor == address(0) || l.reservedFor == msg.sender, "LM: reserved");
     require(l.ownerShareBps == expectedOwnerShareBps, "LM: terms changed");
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, "LM: term");
@@ -474,15 +517,15 @@ contract KamiLeaseMarket {
   /// @notice update strategy preferences (relayed off-chain to the automation)
   function setPrefs(uint32 tokenIndex, string calldata prefs) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, "LM: not renter");
-    require(!l.ending, "LM: lease ending");
+    require(l.renter == msg.sender, NotRenter());
+    require(!l.ending, EndingNow());
     emit PrefsUpdated(tokenIndex, msg.sender, prefs);
   }
 
   function topUpGas(uint32 tokenIndex) external payable {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, "LM: not renter");
-    require(!l.ending, "LM: lease ending");
+    require(l.renter == msg.sender, NotRenter());
+    require(!l.ending, EndingNow());
     l.gasBudget += msg.value;
     emit GasToppedUp(tokenIndex, msg.value);
   }
@@ -491,8 +534,8 @@ contract KamiLeaseMarket {
   ///         The total term stays within the owner's maxTermSecs.
   function extendLease(uint32 tokenIndex, uint32 extraSecs) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, "LM: not renter");
-    require(!l.ending, "LM: lease ending");
+    require(l.renter == msg.sender, NotRenter());
+    require(!l.ending, EndingNow());
     uint64 newEnd = l.leaseEnd + extraSecs;
     require(uint256(newEnd) - l.leaseStart <= l.maxTermSecs, "LM: term");
     l.leaseEnd = newEnd;
@@ -505,10 +548,10 @@ contract KamiLeaseMarket {
   function endLease(uint32 tokenIndex) external nonReentrant {
     Listing storage l = _listings[tokenIndex];
     address renter = l.renter;
-    require(renter != address(0), "LM: not leased");
-    require(!l.ending, "LM: already ending");
+    require(renter != address(0), NotLeased());
+    require(!l.ending, AlreadyEnding());
     if (block.timestamp <= uint256(l.leaseEnd)) {
-      require(msg.sender == renter || msg.sender == l.owner, "LM: not party");
+      require(msg.sender == renter || msg.sender == l.owner, NotParty());
       // the renter committed for at least MIN_TERM; the owner may recall anytime
       if (msg.sender == renter)
         require(block.timestamp >= uint256(l.leaseStart) + MIN_TERM, "LM: min term");
@@ -524,12 +567,12 @@ contract KamiLeaseMarket {
   function finalizeLease(uint32 tokenIndex) external nonReentrant {
     Listing storage l = _listings[tokenIndex];
     address renter = l.renter;
-    require(renter != address(0), "LM: not leased");
-    require(l.ending, "LM: not ending");
+    require(renter != address(0), NotLeased());
+    require(l.ending, NotEnding());
     bool timedOut = block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE;
     require(
       msg.sender == settler || (timedOut && (msg.sender == renter || msg.sender == l.owner)),
-      "LM: not finalizer"
+      NotFinalizer()
     );
     require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), "LM: still harvesting");
 
@@ -553,10 +596,10 @@ contract KamiLeaseMarket {
   ///         kami remains harvesting. Final accounting can complete later.
   function reclaimEndingGas(uint32 tokenIndex) external nonReentrant {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, "LM: not renter");
+    require(l.renter == msg.sender, NotRenter());
     require(l.ending && block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE, "LM: grace");
     uint256 refund = l.gasBudget;
-    require(refund > 0, "LM: no gas");
+    require(refund > 0, NoGas());
     l.gasBudget = 0;
     _sendEthOrOwe(msg.sender, refund);
     emit EndingGasReclaimed(tokenIndex, msg.sender, refund);
@@ -565,10 +608,10 @@ contract KamiLeaseMarket {
   /// @notice claim ETH refunds that could not be pushed
   function claimEth() external nonReentrant {
     uint256 amount = owedEth[msg.sender];
-    require(amount > 0, "LM: nothing owed");
+    require(amount > 0, NothingOwed());
     owedEth[msg.sender] = 0;
     (bool ok, ) = msg.sender.call{ value: amount }("");
-    require(ok, "LM: claim failed");
+    require(ok, ClaimFailed());
     emit EthClaimed(msg.sender, amount);
   }
 
@@ -579,19 +622,17 @@ contract KamiLeaseMarket {
   ///         no transfers happen here, so one settlement cannot burn several
   ///         transfer fees or fail because a recipient has not registered yet.
   function settle() external nonReentrant {
-    require(accID != 0, "LM: not initialized");
+    require(accID != 0, NotInit());
     uint256 base = lastSettleAt == 0 ? initializedAt : lastSettleAt;
-    require(msg.sender == settler || block.timestamp >= base + SETTLER_STALE, "LM: not settler");
+    require(msg.sender == settler || block.timestamp >= base + SETTLER_STALE, NotSettler());
     require(
       lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
-      "LM: cooldown"
+      Cooldown()
     );
     IUintComp comps = _comps();
     uint256 n = tokenIndices.length;
-    CarryEntry[] memory entries = new CarryEntry[](n);
-    uint256 count;
     uint256 totalDelta;
-
+    uint256 mgmtAdd;
     for (uint256 i; i < n; i++) {
       Listing storage l = _listings[tokenIndices[i]];
       if (!l.staked) continue;
@@ -599,11 +640,9 @@ contract KamiLeaseMarket {
       uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
       l.xpBase = xp;
       if (delta == 0) continue;
-      entries[count++] = CarryEntry(l.owner, l.renter, l.ownerShareBps, delta);
       totalDelta += delta;
+      mgmtAdd += _creditSplit(l.owner, l.renter, l.ownerShareBps, delta);
     }
-    uint256 mgmtAdd;
-    for (uint256 i; i < count; i++) mgmtAdd += _creditEntry(entries[i], entries[i].delta);
     mgmtAccrued += mgmtAdd;
     lastSettleAt = uint64(block.timestamp);
     emit Settled(totalDelta - mgmtAdd, mgmtAdd, totalDelta);
@@ -611,15 +650,20 @@ contract KamiLeaseMarket {
 
   /// @dev Credit one exact gross pool. User claims are senior to management:
   ///      they remain reserved in owedMusuTotal until the user pulls them.
-  function _creditEntry(CarryEntry memory e, uint256 gross) internal returns (uint256 cut) {
+  function _creditSplit(
+    address owner_,
+    address renter_,
+    uint16 shareBps,
+    uint256 gross
+  ) internal returns (uint256 cut) {
     cut = (gross * mgmtBps) / 10000;
     uint256 net = gross - cut;
-    if (e.renter == address(0)) {
-      _credit(e.owner, net);
+    if (renter_ == address(0)) {
+      _credit(owner_, net);
     } else {
-      uint256 ownerCut = (net * e.ownerShareBps) / 10000;
-      if (ownerCut > 0) _credit(e.owner, ownerCut);
-      if (net - ownerCut > 0) _credit(e.renter, net - ownerCut);
+      uint256 ownerCut = (net * shareBps) / 10000;
+      if (ownerCut > 0) _credit(owner_, ownerCut);
+      if (net - ownerCut > 0) _credit(renter_, net - ownerCut);
     }
   }
 
@@ -627,9 +671,9 @@ contract KamiLeaseMarket {
   ///         transfer fee). the fee comes out of the claimed amount.
   function claimOwed() external nonReentrant {
     uint256 amount = owedMusu[msg.sender];
-    require(amount > TRANSFER_FEE, "LM: nothing claimable");
+    require(amount > TRANSFER_FEE, NothingClaimable());
     uint256 target = uint256(uint160(msg.sender));
-    require(_isAccount(target), "LM: register an account first");
+    require(_isAccount(target), RegisterAnAccountFirst());
     require(LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) >= amount, "LM: not backed yet");
     owedMusu[msg.sender] = 0;
     owedMusuTotal -= amount; // release the reservation as the funds leave
@@ -641,11 +685,11 @@ contract KamiLeaseMarket {
   ///         claims. Pod sweep fees and any temporary shortfall therefore come
   ///         out of management, never from owners or renters.
   function claimMgmt() external onlyAdmin nonReentrant {
-    require(mgmtAccID != 0, "LM: mgmt account unset");
+    require(mgmtAccID != 0, MgmtAccountUnset());
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
     uint256 surplus = bal > owedMusuTotal ? bal - owedMusuTotal : 0;
     uint256 amount = mgmtAccrued < surplus ? mgmtAccrued : surplus;
-    require(amount > TRANSFER_FEE, "LM: nothing claimable");
+    require(amount > TRANSFER_FEE, NothingClaimable());
     mgmtAccrued -= amount;
     _transferMusu(mgmtAccID, amount - TRANSFER_FEE);
   }
@@ -708,7 +752,7 @@ contract KamiLeaseMarket {
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
     if (delta == 0) return;
-    uint256 cut = _creditEntry(CarryEntry(l.owner, l.renter, l.ownerShareBps, delta), delta);
+    uint256 cut = _creditSplit(l.owner, l.renter, l.ownerShareBps, delta);
     mgmtAccrued += cut;
     emit Settled(delta - cut, cut, delta);
   }
