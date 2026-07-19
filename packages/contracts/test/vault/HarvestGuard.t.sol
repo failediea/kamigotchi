@@ -57,7 +57,7 @@ contract HarvestGuardTest is SetupTemplate {
   function _listPool(PlayerAccount memory acc, uint256 kamiID) internal returns (uint32 tokenIndex) {
     tokenIndex = LibKami.getIndex(components, kamiID);
     vm.prank(acc.owner);
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
     vm.prank(acc.operator);
     _KamiSendSystem.executeTyped(tokenIndex, marketOperator);
     market.confirmArrival(tokenIndex);
@@ -70,7 +70,8 @@ contract HarvestGuardTest is SetupTemplate {
     market.acceptLease{ value: MIN_GAS }(
       tokenIndex,
       '{"mode":"self","node":1}',
-      OWNER_BPS
+      OWNER_BPS,
+      1 days
     );
   }
 
@@ -147,7 +148,7 @@ contract HarvestGuardTest is SetupTemplate {
     PlayerAccount memory dana = _getPlayerAccount(3);
     vm.deal(dana.owner, 1 ether);
     vm.prank(dana.owner);
-    market.acceptLease{ value: MIN_GAS }(idx2, '{"mode":"self","node":1}', OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(idx2, '{"mode":"self","node":1}', OWNER_BPS, 1 days);
     vm.prank(marketOperator);
     _KamiSendSystem.executeTyped(idx2, address(guard));
     _fastForward(2 hours);
@@ -163,6 +164,7 @@ contract HarvestGuardTest is SetupTemplate {
     _acceptSelf(bob, tokenIndex);
     _shipToSelfPod(tokenIndex);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     market.finalizeLease(tokenIndex);
@@ -212,8 +214,9 @@ contract HarvestGuardTest is SetupTemplate {
     vm.expectRevert("Guard: lease active");
     guard.keeperStop(tokenIndex);
 
-    // lease over + renter walked away mid-harvest: keeper cleans up
-    vm.prank(bob.owner);
+    // lease over (owner recall — exempt from the renter min-term commitment)
+    // + renter walked away mid-harvest: keeper cleans up
+    vm.prank(alice.owner);
     market.endLease(tokenIndex);
     vm.expectRevert("LM: still harvesting");
     market.finalizeLease(tokenIndex);

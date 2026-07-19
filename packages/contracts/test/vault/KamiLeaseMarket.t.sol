@@ -49,7 +49,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
   function _list(PlayerAccount memory acc, uint256 kamiID) internal returns (uint32 tokenIndex) {
     tokenIndex = LibKami.getIndex(components, kamiID);
     vm.prank(acc.owner);
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
   }
 
   /// @dev owner's operator sends the kami into the pool; anyone confirms
@@ -71,7 +71,8 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.acceptLease{ value: MIN_GAS }(
       tokenIndex,
       '{"node":1,"risk":"balanced","regen":"REST"}',
-      OWNER_BPS
+      OWNER_BPS,
+      1 days
     );
   }
 
@@ -93,11 +94,11 @@ contract KamiLeaseMarketTest is SetupTemplate {
   }
 
   function _renterOf(uint32 tokenIndex) internal view returns (address renter) {
-    (, , , , , , , , renter, ) = market.listings(tokenIndex);
+    renter = market.listings(tokenIndex).renter;
   }
 
   function _endingOf(uint32 tokenIndex) internal view returns (bool ending) {
-    (, , , , , , , ending, , ) = market.listings(tokenIndex);
+    ending = market.listings(tokenIndex).ending;
   }
 
   function _finishLease(uint32 tokenIndex) internal {
@@ -119,14 +120,14 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // not yours -> no
     vm.prank(bob.owner);
     vm.expectRevert("LM: kami not in your account");
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // farming -> not resting at full health -> no
     vm.prank(alice.operator);
     _HarvestStartSystem.executeTyped(kamiID, 1, 0, 0);
     vm.prank(alice.owner);
     vm.expectRevert("LM: must be resting at full health");
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // stop + heal to full -> listable
     _fastForward(_idleRequirement);
@@ -135,7 +136,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _HarvestStopSystem.executeTyped(prodID);
     _healKami(kamiID, type(int32).max / 2);
     vm.prank(alice.owner);
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
   }
 
   function testPoolCustody() public {
@@ -146,7 +147,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
     vm.expectRevert("LM: not in pool yet");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     // premature confirm fails
     vm.expectRevert("LM: not arrived");
@@ -155,7 +156,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // send in -> pooled: custody is the market's, owner literally cannot use it
     _sendIn(alice, tokenIndex);
     assertEq(LibKami.getAccount(components, kamiID), market.accID(), "custody");
-    (, , , , , bool staked, , , , ) = market.listings(tokenIndex);
+    bool staked = market.listings(tokenIndex).staked;
     assertTrue(staked, "pooled");
 
     // owner's operator can no longer act on it (it's not in alice's account)
@@ -204,7 +205,8 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.acceptLease{ value: MIN_GAS }(
       tokenIndex,
       '{"node":3,"risk":"aggressive","regen":"FEED"}', // THE RENTER's tile + strategy
-      OWNER_BPS
+      OWNER_BPS,
+      1 days
     );
 
     assertEq(_renterOf(tokenIndex), bob.owner, "lease live immediately");
@@ -219,19 +221,19 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
     vm.expectRevert("LM: gas budget too low");
-    market.acceptLease{ value: MIN_GAS - 1 }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS - 1 }(tokenIndex, "", OWNER_BPS, 1 days);
 
     vm.deal(alice.owner, 1 ether);
     vm.prank(alice.owner);
     vm.expectRevert("LM: own kami");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     _accept(bob, tokenIndex);
 
     vm.deal(charlie.owner, 1 ether);
     vm.prank(charlie.owner);
     vm.expectRevert("LM: already leased");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
   }
 
   function testAcceptRevertsIfTermsChanged() public {
@@ -239,15 +241,15 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _listPool(alice, kamiID);
 
     vm.prank(alice.owner);
-    market.updateTerms(tokenIndex, 5000, MIN_GAS);
+    market.updateTerms(tokenIndex, 5000, MIN_GAS, 7 days, address(0));
 
     vm.deal(bob.owner, 1 ether);
     vm.prank(bob.owner);
     vm.expectRevert("LM: terms changed");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     vm.prank(bob.owner);
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", 5000);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", 5000, 1 days);
   }
 
   function testEndLeaseRefundsGas() public {
@@ -256,6 +258,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, tokenIndex);
 
     uint256 balBefore = bob.owner.balance;
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     assertEq(_renterOf(tokenIndex), bob.owner, "keeper has not finalized");
@@ -287,6 +290,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     vm.prank(bob.owner);
@@ -374,6 +378,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     _marketHarvest(kamiID, 100_000);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     uint256 gross = market.pendingXpDelta(tokenIndex);
@@ -396,6 +401,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, tokenIndex);
     _marketHarvest(kamiID, 60_000);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     _finishLease(tokenIndex);
@@ -407,7 +413,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(dana().owner, 1 ether);
     vm.prank(dana().owner);
     vm.expectRevert("LM: being returned");
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
 
     _fastForward(_idleRequirement);
     vm.prank(marketOperator);
@@ -531,7 +537,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
   function _acceptAs(address renter, uint32 tokenIndex) internal {
     vm.deal(renter, 1 ether);
     vm.prank(renter);
-    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
   }
 
   /// @dev the renter's pre-transfer-fee share of a kami's gross earnings
@@ -583,7 +589,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     market.requestReturn(idx);
     vm.prank(alice.owner);
     market.cancelReturn(idx);
-    (, , , , , , bool returning, , , ) = market.listings(idx);
+    bool returning = market.listings(idx).returning;
     assertFalse(returning, "reopened while still in the pool");
 
     // request again, then the automation actually sends it home
@@ -615,6 +621,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     _accept(bob, idx);
     _marketHarvest(LibKami.getByIndex(components, idx), 100_000);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(idx);
     _finishLease(idx);
@@ -644,6 +651,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     uint256 kamiID = LibKami.getByIndex(components, idx);
     _accept(bob, idx);
     _marketHarvest(kamiID, 100_000);
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(idx);
     _finishLease(idx);
@@ -684,10 +692,10 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // approve + list = pooled + rentable IN THE SAME TX. no send, no operator.
     vm.startPrank(alice.owner);
     _Kami721.approve(address(market), uint256(tokenIndex));
-    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
     vm.stopPrank();
 
-    (, , , , , bool staked, , , , ) = market.listings(tokenIndex);
+    bool staked = market.listings(tokenIndex).staked;
     assertTrue(staked, "pooled in the listing tx");
     assertEq(LibKami.getAccount(components, kamiID), market.accID(), "custody: hub");
 
@@ -696,6 +704,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertEq(_renterOf(tokenIndex), bob.owner, "instantly rentable");
 
     // full circle: lease ends -> NFT withdraw -> relist is one tx forever after
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     _finishLease(tokenIndex);
@@ -705,7 +714,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     vm.startPrank(alice.owner);
     _Kami721.approve(address(market), uint256(tokenIndex));
-    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
     vm.stopPrank();
     assertEq(market.numListings(), 1, "relisted in one tx");
   }
@@ -719,19 +728,128 @@ contract KamiLeaseMarketTest is SetupTemplate {
     // not yours -> the 721 transfer itself refuses
     vm.prank(bob.owner);
     vm.expectRevert();
-    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
 
     // no approval -> refuses
     vm.prank(alice.owner);
     vm.expectRevert();
-    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami721(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
   }
+  /////////////////
+  // TERM RAILS + PRIVATE LEASES
+
+  function testTermRails() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    vm.prank(alice.owner);
+    vm.expectRevert("LM: term");
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, uint32(12 hours), address(0));
+
+    vm.prank(alice.owner);
+    vm.expectRevert("LM: term");
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, uint32(31 days), address(0));
+
+    tokenIndex = _listPool(alice, kamiID); // lists with a 7 day cap
+
+    vm.deal(bob.owner, 1 ether);
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: term");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 8 days);
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: term");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 12 hours);
+
+    _accept(bob, tokenIndex); // 1 day term — inside the rails
+    assertEq(
+      market.listings(tokenIndex).leaseEnd,
+      uint64(block.timestamp + 1 days),
+      "leaseEnd stamped"
+    );
+  }
+
+  function testRenterMinTermCommitmentOwnerExempt() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex);
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: min term");
+    market.endLease(tokenIndex);
+
+    // the owner may recall at any time
+    vm.prank(alice.owner);
+    market.endLease(tokenIndex);
+    assertTrue(_endingOf(tokenIndex), "owner end is immediate");
+  }
+
+  function testPrivateLeaseReservedRenterOnly() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+    address vip = _getNextUserAddress();
+    vm.prank(alice.owner);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, vip);
+    _sendIn(alice, tokenIndex);
+    _fastForward(2 hours);
+
+    vm.deal(bob.owner, 1 ether);
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: reserved");
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
+
+    vm.deal(vip, 1 ether);
+    vm.prank(vip);
+    market.acceptLease{ value: MIN_GAS }(tokenIndex, "", OWNER_BPS, 1 days);
+    assertEq(_renterOf(tokenIndex), vip, "reserved renter leases");
+  }
+
+  function testExtendLeaseWithinOwnerCap() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex); // 1 day term, 7 day cap
+
+    vm.prank(bob.owner);
+    market.extendLease(tokenIndex, 3 days);
+    assertEq(
+      market.listings(tokenIndex).leaseEnd,
+      uint64(block.timestamp + 4 days),
+      "extended in place"
+    );
+
+    vm.prank(bob.owner);
+    vm.expectRevert("LM: term");
+    market.extendLease(tokenIndex, 4 days); // 8 days total > 7 day cap
+
+    vm.prank(_getNextUserAddress());
+    vm.expectRevert("LM: not renter");
+    market.extendLease(tokenIndex, 1 days);
+  }
+
+  function testExpiredLeaseAnyoneCanEnd() public {
+    uint256 kamiID = _mintKami(alice);
+    uint32 tokenIndex = _listPool(alice, kamiID);
+    _accept(bob, tokenIndex); // 1 day term
+
+    address stranger = _getNextUserAddress();
+    vm.prank(stranger);
+    vm.expectRevert("LM: not party");
+    market.endLease(tokenIndex); // not expired yet
+
+    _fastForward(1 days + 1);
+    vm.prank(stranger);
+    market.endLease(tokenIndex); // expired: anyone (the keeper) may flip it
+    assertTrue(_endingOf(tokenIndex), "expired lease flipped to ending");
+    market.finalizeLease(tokenIndex); // the settler completes it
+    assertEq(_renterOf(tokenIndex), address(0), "lease closed");
+  }
+
 }
 
 /// @dev renter contract that rejects ETH — proves termination can't be held hostage
 contract RevertingRenter {
   function doAccept(KamiLeaseMarket m, uint32 idx, uint16 bps) external payable {
-    m.acceptLease{ value: msg.value }(idx, "", bps);
+    m.acceptLease{ value: msg.value }(idx, "", bps, 1 days);
   }
 
   receive() external payable {

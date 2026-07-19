@@ -61,7 +61,7 @@ contract RoomPodTest is SetupTemplate {
   function _listPool(PlayerAccount memory acc, uint256 kamiID) internal returns (uint32 tokenIndex) {
     tokenIndex = LibKami.getIndex(components, kamiID);
     vm.prank(acc.owner);
-    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS);
+    market.listKami(tokenIndex, OWNER_BPS, MIN_GAS, 7 days, address(0));
     vm.prank(acc.operator);
     _KamiSendSystem.executeTyped(tokenIndex, marketOperator);
     market.confirmArrival(tokenIndex);
@@ -74,7 +74,8 @@ contract RoomPodTest is SetupTemplate {
     market.acceptLease{ value: MIN_GAS }(
       tokenIndex,
       '{"node":1,"risk":"balanced","regen":"REST"}',
-      OWNER_BPS
+      OWNER_BPS,
+      1 days
     );
   }
 
@@ -196,6 +197,7 @@ contract RoomPodTest is SetupTemplate {
     _shipToPod(tokenIndex);
     _podHarvest(kamiID, 50_000);
 
+    _fastForward(1 days + 1 hours); // renter is committed for MIN_TERM
     vm.prank(bob.owner);
     market.endLease(tokenIndex);
     pod.sweepMusu();
