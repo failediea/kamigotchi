@@ -247,4 +247,32 @@ contract RoomPodTest is SetupTemplate {
   function testSweepBelowFeeIsNoop() public {
     assertEq(pod.sweepMusu(), 0, "nothing to sweep");
   }
+
+  function testVippSweepTransfersAllVippAndPaysFeeInMusu() public {
+    uint32 vippIndex = 2;
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
+    vippMarket.initialize(_getNextUserAddress(), "vipphub");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
+    vippPod.initialize(_getNextUserAddress(), "vipppod");
+    LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, TRANSFER_FEE);
+
+    uint256 swept = vippPod.sweepMusu();
+    assertEq(swept, 1_000, "VIPP proceeds are not reduced by a MUSU-denominated fee");
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), vippIndex), 0);
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), vippIndex), 1_000);
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), MUSU_INDEX), 0);
+  }
+
+  function testVippSweepWaitsForMusuFeeBalance() public {
+    uint32 vippIndex = 2;
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
+    vippMarket.initialize(_getNextUserAddress(), "vipphub2");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
+    vippPod.initialize(_getNextUserAddress(), "vipppod2");
+    LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
+
+    assertEq(vippPod.sweepMusu(), 0, "cannot pay the game's MUSU transfer fee");
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), vippIndex), 1_000);
+  }
 }

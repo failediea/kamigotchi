@@ -80,11 +80,16 @@ contract RoomPod {
 
   /// @notice push ALL farmed MUSU to the hub for settlement. anyone may call;
   ///         the destination is hard-wired to the hub's game account. the
-  ///         in-world transfer fee comes out of the swept amount.
+  ///         in-world fee is always charged in MUSU, even for another pay item.
   function sweepMusu() external returns (uint256 swept) {
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
-    if (bal <= TRANSFER_FEE) return 0;
-    swept = bal - TRANSFER_FEE;
+    uint256 feeFromProceeds = payItem == MUSU_INDEX ? TRANSFER_FEE : 0;
+    if (bal <= feeFromProceeds) return 0;
+    if (
+      payItem != MUSU_INDEX
+        && LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) < TRANSFER_FEE
+    ) return 0;
+    swept = bal - feeFromProceeds;
 
     uint32[] memory indices = new uint32[](1);
     uint256[] memory amts = new uint256[](1);
