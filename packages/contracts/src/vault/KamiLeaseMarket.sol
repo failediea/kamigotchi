@@ -6,9 +6,6 @@ import { IUint256Component as IUintComp } from "solecs/interfaces/IUint256Compon
 import { getAddrByID } from "solecs/utils.sol";
 
 import { AccountRegisterSystem, ID as AccountRegisterSystemID } from "systems/AccountRegisterSystem.sol";
-import { AccountSetOperatorSystem, ID as AccountSetOperatorSystemID } from "systems/AccountSetOperatorSystem.sol";
-import { Kami721StakeSystem, ID as Kami721StakeSystemID } from "systems/Kami721StakeSystem.sol";
-import { Kami721UnstakeSystem, ID as Kami721UnstakeSystemID } from "systems/Kami721UnstakeSystem.sol";
 import { ItemTransferSystem, ID as ItemTransferSystemID } from "systems/ItemTransferSystem.sol";
 
 import { LibAccount } from "libraries/LibAccount.sol";
@@ -21,18 +18,30 @@ import { LibEntityType } from "libraries/utils/LibEntityType.sol";
 
 import { Kami721 } from "tokens/Kami721.sol";
 
+interface IPersonalRentalCustody {
+  function vaultOwner() external view returns (address);
+  function accID() external view returns (uint256);
+  function releaseToMarket(uint32 tokenIndex) external;
+}
+
+interface IRenterRoomPod {
+  function hub() external view returns (address);
+  function accID() external view returns (uint256);
+  function nodeIndex() external view returns (uint32);
+  function payItem() external view returns (uint32);
+}
+
 /**
  * @title KamiLeaseMarket
  * @notice Managed-only kami lease marketplace on Yominet.
  *
  * Model:
- *  - OWNERS list kamis: the ERC721 is custodied by this contract, staked into the
- *    market's own game account. Owners set their share of earnings (bps).
- *  - RENTERS accept a lease by funding a GAS BUDGET (ETH) that pays for the farming
- *    transactions, and may attach strategy preferences (relayed to the automation).
- *  - Farming is performed by the platform's automation (Kamibots) via the single
- *    account operator key. NO key is ever given to owners or renters — a renter
- *    cannot send, sacrifice, or sell a kami. Custody is contract-enforced.
+ *  - OWNERS publish through immutable Personal Rental Pools. Idle Kamis remain
+ *    in the owner's own pool, never in a shared platform custody account.
+ *  - RENTERS choose a tile/strategy/term. Their single checkout transaction
+ *    deploys that lease's RoomPod and funds its setup plus farming gas.
+ *  - Kamibots operates only that dedicated pod. No owner/renter uploads a key,
+ *    and the platform does not pre-fund pods or keep an emergency admin.
  *  - settle() splits each kami's earnings (attributed by XP delta, which increments
  *    1:1 with collected harvest output) three ways:
  *        platform fee (mgmtBps, can only be lowered)
@@ -40,10 +49,8 @@ import { Kami721 } from "tokens/Kami721.sol";
  *    Earnings of an unleased-but-farmed kami go fully to the owner (minus fee).
  *  - withdrawKami() returns the NFT ONLY to the recorded owner, and only when the
  *    kami is not under an active lease. The admin cannot redirect assets; ETH gas
- *    budgets can only flow to the account operator or back to their renter.
- *
- * Residual risks (documented): the automation provider holds the operator key
- * (rotateOperator() is the kill switch); a DEAD kami blocks withdrawal until revived.
+ *    budgets live in the immutable renter factory and can flow only to that
+ *    lease's verified operators or back to its renter.
  */
 contract KamiLeaseMarket {
   ///////////////////
@@ -54,30 +61,28 @@ contract KamiLeaseMarket {
     uint256 kamiID; // ECS entity
     uint256 xpBase; // attribution baseline (reset on settle / lease boundaries)
     uint16 ownerShareBps; // owner's share of post-fee earnings while leased
-    uint128 minGasWei; // minimum gas budget to accept the lease
+    uint128 minGasWei; // deprecated v13 ABI slot; personal pools always store zero
     bool staked; // true = IN THE POOL (market account custody); false = send pending
     bool returning; // owner requested an in-game send-back (blocks new leases)
     bool ending; // a party requested lease end; keeper must stop/sweep/finalize
     address renter; // active renter (0 = waiting in the pool)
-    uint256 gasBudget; // renter's remaining ETH for farming gas
+    uint256 gasBudget; // deprecated v13 ABI slot; renter ETH stays in the factory
     uint32 maxTermSecs; // owner's ceiling for one lease term (MIN_TERM..MAX_TERM)
     uint64 leaseStart; // set at accept
     uint64 leaseEnd; // leaseStart + the renter's chosen term; past it ANYONE may end
     address reservedFor; // private lease: only this renter may accept (0 = public)
   }
 
-
   ///////////////////
   // STATE
 
   IWorld public immutable world;
-  Kami721 public immutable kami721;
   /// @notice the ONE item this market settles in (1 = MUSU, 2 = VIPP, …).
   ///         Every pod of this market sits on a node yielding exactly this item,
   ///         so XP-delta attribution stays exact per market.
   uint32 public immutable payItem;
   address public admin;
-  address public pendingAdmin; // two-step admin hand-off (Pools-as-a-Service)
+  address public leaseFactory; // fixed before seal; permissionless renter-funded pod deployer
 
   uint256 public accID; // the market's game account
   uint16 public mgmtBps; // platform fee, lower-only
@@ -91,9 +96,13 @@ contract KamiLeaseMarket {
 
   mapping(address => uint256) public owedMusu; // held payouts (no game account yet)
   uint256 public owedMusuTotal; // sum of owedMusu: RESERVED, never re-distributed
-  mapping(address => uint256) public owedEth; // gas refunds that failed to send (pull)
+  mapping(address => uint256) public owedEth; // deprecated ABI compatibility; always zero in v14
   mapping(address => uint256) public participations; // active listings + leases per address
   mapping(uint32 => uint64) internal endingAt; // timeout clock for user recovery
+  // Minimal reservation state only. Pod provisioning, preferences and renter
+  // ETH stay in the separate factory so this market remains deployable.
+  mapping(uint32 => address) public pendingRenter;
+  mapping(uint32 => address) public pendingPod;
 
   uint64 public lastSettleAt;
   uint64 public settleCooldown = 1 days; // daily accounting cadence; admin-tunable, capped
@@ -117,24 +126,20 @@ contract KamiLeaseMarket {
   error AlreadySentHome();
   error BeingReturned();
   error BudgetTooLow();
-  error CanOnlyLower();
-  error ClaimFailed();
   error Cooldown();
-  error CooldownTooLong();
-  error DripFailed();
   error EndLeaseFirst();
   error FeeTooHigh();
   error InPoolUseReturn();
   error AlreadyInit();
+  error AdminAlreadySealed();
   error KamiNotHomeYet();
   error KamiNotInYourAccount();
   error EndingNow();
   error Leased();
   error MgmtAccountUnset();
-  error NoGas();
   error NoReturnRequested();
   error NotAdmin();
-  error NotPendingAdmin();
+  error NotFactory();
   error TermRails();
   error MinTerm();
   error Reserved();
@@ -157,48 +162,58 @@ contract KamiLeaseMarket {
   error NotReturning();
   error NotSettler();
   error NothingClaimable();
-  error NothingOwed();
   error OwnKami();
   error Reentrancy();
   error RegisterAnAccountFirst();
   error ShareTooHigh();
   error ZeroSettler();
+  error PendingLeaseExists();
+  error NoPendingLease();
+  error ProvisioningRequired();
 
   ///////////////////
   // EVENTS
 
   event Initialized(uint256 accID, address operator, string name);
-  event OperatorRotated(address newOperator);
-  event AdminTransferProposed(address indexed from, address indexed to);
-  event AdminTransferred(address indexed from, address indexed to);
+  event AdminSealed(address indexed formerAdmin);
   event SettlerSet(address newSettler);
+  event LeaseFactorySet(address indexed leaseFactory);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event Delisted(address indexed owner, uint32 indexed tokenIndex);
   event Arrived(address indexed owner, uint32 indexed tokenIndex); // kami joined the pool
   event ReturnRequested(address indexed owner, uint32 indexed tokenIndex); // ops bot: KamiSend it home
   event ReturnCleared(address indexed owner, uint32 indexed tokenIndex);
-  event EthOwed(address indexed to, uint256 amount);
-  event EthClaimed(address indexed to, uint256 amount);
-  event SettleCooldownSet(uint64 secs);
+  event PoolRestored(address indexed owner, uint32 indexed tokenIndex);
   event LeaseAccepted(address indexed renter, uint32 indexed tokenIndex, uint256 gasBudget, string prefs);
+  event LeaseProvisionRequested(
+    address indexed renter,
+    uint32 indexed tokenIndex,
+    address indexed pod,
+    uint32 nodeIndex,
+    uint256 gasBudget,
+    uint32 termSecs,
+    string prefs
+  );
+  event LeasePreparing(uint32 indexed tokenIndex, address indexed pod);
+  event PreparingLeaseCancelled(uint32 indexed tokenIndex, address indexed renter);
   event LeaseEnded(uint32 indexed tokenIndex, address indexed renter, uint256 gasRefund);
   event PrefsUpdated(uint32 indexed tokenIndex, address indexed renter, string prefs);
-  event GasToppedUp(uint32 indexed tokenIndex, uint256 amount);
-  event GasDripped(uint32 indexed tokenIndex, address operator, uint256 amount);
   event LeaseEnding(uint32 indexed tokenIndex, address indexed renter, address indexed requestedBy);
   event LeaseExtended(uint32 indexed tokenIndex, uint64 leaseEnd);
-  event EndingGasReclaimed(uint32 indexed tokenIndex, address indexed renter, uint256 amount);
-  event KamiWithdrawn(address indexed owner, uint32 indexed tokenIndex);
   event Settled(uint256 distributed, uint256 mgmtCut, uint256 totalDelta);
   event Payout(address indexed to, uint256 amount, bool held);
   event OwedClaimed(address indexed to, uint256 amount);
-  event MgmtBpsLowered(uint16 newBps);
 
   ///////////////////
   // MODIFIERS
 
   modifier onlyAdmin() {
     require(msg.sender == admin, NotAdmin());
+    _;
+  }
+
+  modifier onlySettler() {
+    require(msg.sender == settler, NotSettler());
     _;
   }
 
@@ -212,11 +227,10 @@ contract KamiLeaseMarket {
   ///////////////////
   // SETUP / ADMIN
 
-  constructor(IWorld _world, Kami721 _kami721, uint16 _mgmtBps, uint32 _payItem) {
+  constructor(IWorld _world, Kami721, uint16 _mgmtBps, uint32 _payItem) {
     require(_mgmtBps <= 3000, FeeTooHigh());
     require(_payItem != 0, PayItemZero());
     world = _world;
-    kami721 = _kami721;
     admin = msg.sender;
     mgmtBps = _mgmtBps;
     payItem = _payItem;
@@ -233,29 +247,19 @@ contract KamiLeaseMarket {
     emit Initialized(accID, operator, name);
   }
 
-  /// @notice kill switch: cut the automation off instantly
-  function rotateOperator(address newOperator) external onlyAdmin {
-    AccountSetOperatorSystem(_sys(AccountSetOperatorSystemID)).executeTyped(newOperator);
-    emit OperatorRotated(newOperator);
-  }
-
-  /// @notice POOLS-AS-A-SERVICE hand-off. Two-step so a pool can never be locked
-  ///         to an address that can't act. The platform provisions the pool
-  ///         (initialize + settler + mgmt while it is admin), then proposes the
-  ///         CUSTOMER as admin; the customer accepts from their own wallet and
-  ///         thereby holds the kill switch — they can rotate operators away from
-  ///         the platform at will. mgmtBps is immutable-down, so the platform's
-  ///         fee can never rise after hand-off.
-  function transferAdmin(address newAdmin) external onlyAdmin {
-    pendingAdmin = newAdmin; // address(0) cancels a pending hand-off
-    emit AdminTransferProposed(admin, newAdmin);
-  }
-
-  function acceptAdmin() external {
-    require(msg.sender == pendingAdmin, NotPendingAdmin());
-    emit AdminTransferred(admin, msg.sender);
-    admin = msg.sender;
-    pendingAdmin = address(0);
+  /// @notice Permanently destroys every admin/configuration power. This cannot
+  ///         be reversed. Deployments must set the operator, settler, management
+  ///         account, fee and cooldown first, then seal before the factory accepts
+  ///         this market.
+  function sealAdmin() external onlyAdmin {
+    require(admin != address(0), AdminAlreadySealed());
+    require(accID != 0, NotInit());
+    require(settler != address(0), ZeroSettler());
+    require(mgmtAccID != 0, MgmtAccountUnset());
+    require(leaseFactory != address(0), NotFactory());
+    address formerAdmin = admin;
+    admin = address(0);
+    emit AdminSealed(formerAdmin);
   }
 
   function setSettler(address newSettler) external onlyAdmin {
@@ -264,10 +268,11 @@ contract KamiLeaseMarket {
     emit SettlerSet(newSettler);
   }
 
-  function lowerMgmtBps(uint16 newBps) external onlyAdmin {
-    require(newBps < mgmtBps, CanOnlyLower());
-    mgmtBps = newBps;
-    emit MgmtBpsLowered(newBps);
+  /// @notice Set exactly once during atomic deployment, before admin sealing.
+  function setLeaseFactory(address newFactory) external onlyAdmin {
+    require(leaseFactory == address(0) && newFactory.code.length != 0, NotFactory());
+    leaseFactory = newFactory;
+    emit LeaseFactorySet(newFactory);
   }
 
   function setMgmtAccount(uint256 _mgmtAccID) external onlyAdmin {
@@ -275,27 +280,20 @@ contract KamiLeaseMarket {
     mgmtAccID = _mgmtAccID;
   }
 
-  /// @notice settle spam guard, capped at 7 days so payouts can't be locked up
-  function setSettleCooldown(uint64 secs) external onlyAdmin {
-    require(secs <= 7 days, CooldownTooLong());
-    settleCooldown = secs;
-    emit SettleCooldownSet(secs);
+  // Deprecated v13 entrypoints retained only so downstream ABIs fail with a
+  // clear error during migration. v14 accepts Personal Rental Pool listings
+  // exclusively through the renter-funded provisioning factory.
+  function confirmArrival(uint32) external pure { revert ProvisioningRequired(); }
+  function listKami721(uint32, uint16, uint128, uint32, address) external pure {
+    revert ProvisioningRequired();
   }
-
-  /// @notice pull gas from a lease's budget to the operator wallet. admin-triggered,
-  ///         but funds can ONLY go to the current account operator.
-  function dripGas(uint32 tokenIndex, uint256 amount) external onlyAdmin {
-    Listing storage l = _listings[tokenIndex];
-    require(l.renter != address(0), NotLeased());
-    require(l.gasBudget >= amount, BudgetTooLow());
-    l.gasBudget -= amount;
-    address operator = LibAccount.getOperator(_comps(), accID);
-    (bool ok, ) = operator.call{ value: amount }("");
-    require(ok, DripFailed());
-    emit GasDripped(tokenIndex, operator, amount);
+  function withdrawKami(uint32) external pure { revert ProvisioningRequired(); }
+  function cancelReturn(uint32) external pure { revert ProvisioningRequired(); }
+  function acceptLease(uint32, string calldata, uint16, uint32) external payable {
+    revert ProvisioningRequired();
   }
-
-  receive() external payable {}
+  function topUpGas(uint32) external payable { revert ProvisioningRequired(); }
+  function reclaimEndingGas(uint32) external pure { revert ProvisioningRequired(); }
 
   ///////////////////
   // OWNER SIDE (lessor) — listing SENDS the kami into the pool
@@ -312,6 +310,7 @@ contract KamiLeaseMarket {
     address reservedFor
   ) external {
     require(accID != 0, NotInit());
+    require(msg.sender.code.length != 0, ProvisioningRequired());
     require(ownerShareBps <= 10000, ShareTooHigh());
     require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
     require(_listings[tokenIndex].owner == address(0), AlreadyListed());
@@ -327,46 +326,7 @@ contract KamiLeaseMarket {
     _newListing(tokenIndex, kamiID, 0, false, ownerShareBps, minGasWei, maxTermSecs, reservedFor);
   }
 
-  /// @notice ONE-TX LISTING for a kami held as an NFT in your wallet: approve
-  ///         (or setApprovalForAll once), then this pulls the token and stakes
-  ///         it STRAIGHT INTO THE POOL — the market account lives in the bridge
-  ///         room, so the kami is pooled and rentable in this same transaction.
-  ///         No send, no operator, no waiting. It rests (and heals) unfarmed
-  ///         until rented; withdrawKami returns it as an NFT, so every future
-  ///         listing of this kami is one click too.
-  function listKami721(
-    uint32 tokenIndex,
-    uint16 ownerShareBps,
-    uint128 minGasWei,
-    uint32 maxTermSecs,
-    address reservedFor
-  ) external nonReentrant {
-    require(accID != 0, NotInit());
-    require(ownerShareBps <= 10000, ShareTooHigh());
-    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
-    require(_listings[tokenIndex].owner == address(0), AlreadyListed());
-
-    kami721.transferFrom(msg.sender, address(this), uint256(tokenIndex));
-    Kami721StakeSystem(_sys(Kami721StakeSystemID)).executeTyped(tokenIndex);
-
-    uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
-    // same admission rule as the legacy path: a renter must never receive a
-    // wounded kami. staking marks it RESTING; require effective full health too.
-    require(_isRestedFull(kamiID), NotRestedFull());
-    _newListing(
-      tokenIndex,
-      kamiID,
-      LibExperience.get(_comps(), kamiID),
-      true, // in the pool from this very transaction
-      ownerShareBps,
-      minGasWei,
-      maxTermSecs,
-      reservedFor
-    );
-    emit Arrived(msg.sender, tokenIndex);
-  }
-
-  /// @dev shared listing constructor for both listing paths
+  /// @dev Personal Rental Pool listing constructor.
   function _newListing(
     uint32 tokenIndex,
     uint256 kamiID,
@@ -399,65 +359,22 @@ contract KamiLeaseMarket {
     emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
   }
 
-  /// @notice STEP 3: confirm the kami arrived in the pool (anyone/keeper). only now
-  ///         is it rentable. it sits UNFARMED until someone rents it.
-  function confirmArrival(uint32 tokenIndex) external nonReentrant {
-    Listing storage l = _listings[tokenIndex];
-    require(l.owner != address(0), NotListed());
-    require(!l.staked, AlreadyInPool());
-    require(LibKami.getAccount(_comps(), l.kamiID) == accID, NotArrived());
-
-    l.staked = true;
-    l.xpBase = LibExperience.get(_comps(), l.kamiID);
-    emit Arrived(l.owner, tokenIndex);
-  }
-
   /// @notice cancel a listing whose kami was never sent (nothing to return)
   function delist(uint32 tokenIndex) external {
     Listing memory l = _listings[tokenIndex];
     require(l.owner == msg.sender, NotOwner());
     require(l.renter == address(0), Leased());
+    require(pendingRenter[tokenIndex] == address(0), PendingLeaseExists());
     require(!l.staked, InPoolUseReturn());
     if (participations[l.owner] > 0) participations[l.owner]--;
     _removeListing(tokenIndex);
     emit Delisted(msg.sender, tokenIndex);
   }
 
-  /// @notice update lease terms. only while not leased.
-  function updateTerms(
-    uint32 tokenIndex,
-    uint16 ownerShareBps,
-    uint128 minGasWei,
-    uint32 maxTermSecs,
-    address reservedFor
-  ) external {
-    Listing storage l = _listings[tokenIndex];
-    require(l.owner == msg.sender, NotOwner());
-    require(l.renter == address(0), Leased());
-    require(!l.returning, BeingReturned());
-    require(ownerShareBps <= 10000, ShareTooHigh());
-    require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
-    l.ownerShareBps = ownerShareBps;
-    l.minGasWei = minGasWei;
-    l.maxTermSecs = maxTermSecs;
-    l.reservedFor = reservedFor;
-    emit Listed(msg.sender, tokenIndex, ownerShareBps, minGasWei);
-  }
-
-  /// @notice withdraw a kami. only the owner, only when not leased; NFT goes only to
-  ///         the recorded owner. un-settled earnings are carried to the next settle.
-  function withdrawKami(uint32 tokenIndex) external nonReentrant {
-    Listing memory l = _listings[tokenIndex];
-    require(l.owner == msg.sender, NotOwner());
-    require(l.renter == address(0), EndLeaseFirst());
-    require(l.staked, NotInPoolUseDelist());
-
-    _creditPending(tokenIndex);
-    Kami721UnstakeSystem(_sys(Kami721UnstakeSystemID)).executeTyped(tokenIndex);
-    if (participations[l.owner] > 0) participations[l.owner]--;
-    _removeListing(tokenIndex);
-    kami721.transferFrom(address(this), l.owner, uint256(tokenIndex));
-    emit KamiWithdrawn(l.owner, tokenIndex);
+  // Pool terms are immutable. Owners create a separate terms pool instead of
+  // mutating listings that renters may already be viewing.
+  function updateTerms(uint32, uint16, uint128, uint32, address) external pure {
+    revert ProvisioningRequired();
   }
 
   /// @notice PREFERRED exit: request an in-game send-back. Snapshots earnings, blocks
@@ -467,29 +384,13 @@ contract KamiLeaseMarket {
     Listing storage l = _listings[tokenIndex];
     require(l.owner == msg.sender, NotOwner());
     require(l.renter == address(0), EndLeaseFirst());
+    require(pendingRenter[tokenIndex] == address(0), PendingLeaseExists());
     require(l.staked, NotInMarket());
     require(!l.returning, AlreadyReturning());
 
     _creditPending(tokenIndex); // freeze attribution at request time
     l.returning = true;
     emit ReturnRequested(msg.sender, tokenIndex);
-  }
-
-  /// @notice changed your mind (or the automation is down): re-open the listing.
-  ///         ONLY valid while the kami is still in the pool — if the automation
-  ///         already sent it home, the listing must be cleared (clearReturned),
-  ///         never re-opened as rentable while the owner controls the kami
-  ///         (that would be a phantom lease over an asset that isn't in custody).
-  function cancelReturn(uint32 tokenIndex) external {
-    Listing storage l = _listings[tokenIndex];
-    require(l.owner == msg.sender, NotOwner());
-    require(l.returning, NotReturning());
-    require(
-      LibKami.getAccount(_comps(), l.kamiID) == accID,
-      AlreadySentHome()
-    );
-    l.returning = false;
-    emit Listed(l.owner, tokenIndex, l.ownerShareBps, l.minGasWei);
   }
 
   /// @notice finalize a send-back once the kami is verifiably in the OWNER's account.
@@ -499,7 +400,7 @@ contract KamiLeaseMarket {
     require(l.owner != address(0), NotListed());
     require(l.returning, NoReturnRequested());
     require(
-      LibKami.getAccount(_comps(), l.kamiID) == uint256(uint160(l.owner)),
+      LibKami.getAccount(_comps(), l.kamiID) == IPersonalRentalCustody(l.owner).accID(),
       KamiNotHomeYet()
     );
     // carry any earnings accrued AFTER requestReturn's snapshot (e.g. a harvest
@@ -511,73 +412,154 @@ contract KamiLeaseMarket {
     emit ReturnCleared(l.owner, tokenIndex);
   }
 
+  /// @notice After a normal lease, automation returns the idle Kami to its
+  /// immutable Personal Rental Pool. Anyone may confirm, but only that exact
+  /// on-chain destination can satisfy the check. The listing stays published
+  /// and becomes rentable again without any owner transaction.
+  function confirmReturnedToPool(uint32 tokenIndex) external {
+    Listing storage l = _listings[tokenIndex];
+    require(l.owner.code.length != 0, NotOwner());
+    require(l.renter == address(0) && pendingRenter[tokenIndex] == address(0), Leased());
+    require(l.staked, NotInMarket());
+    require(LibKami.getAccount(_comps(), l.kamiID) == IPersonalRentalCustody(l.owner).accID(), KamiNotHomeYet());
+    l.staked = false;
+    l.xpBase = LibExperience.get(_comps(), l.kamiID);
+    emit PoolRestored(l.owner, tokenIndex);
+  }
+
   ///////////////////
   // RENTER SIDE
 
-  /// @notice accept a lease: fund the gas budget (msg.value) and set strategy prefs.
-  ///         attribution baseline resets so pre-lease earnings stay with the owner.
-  /// @param expectedOwnerShareBps the terms the renter agreed to — reverts if the
-  ///        listing's terms changed since they read them (frontrun guard)
-  /// @notice rent a pooled kami — INSTANT, it's already here. the renter assumes
-  ///         control: `prefs` carries THEIR choice of node (tile) and harvesting
-  ///         strategy, which the automation executes for the lease's duration.
-  function acceptLease(
+  /// @notice Reserve a personal-pool listing for a renter-funded RoomPod. The
+  /// factory holds every wei and all setup metadata; this market stores only
+  /// the two addresses needed to block conflicting owner/renter actions.
+  function reserveProvisionedLease(
+    address renter,
     uint32 tokenIndex,
+    address pod,
     string calldata prefs,
     uint16 expectedOwnerShareBps,
     uint32 termSecs
-  ) external payable nonReentrant {
+  ) external nonReentrant {
+    require(msg.sender == leaseFactory, NotFactory());
     Listing storage l = _listings[tokenIndex];
     require(l.owner != address(0), NotListed());
-    require(l.staked, NotInPoolYet());
+    require(l.owner.code.length != 0 && !l.staked, ProvisioningRequired());
     require(!l.returning, BeingReturned());
     require(l.renter == address(0), AlreadyLeased());
-    require(l.owner != msg.sender, OwnKami());
-    require(l.reservedFor == address(0) || l.reservedFor == msg.sender, Reserved());
+    require(pendingRenter[tokenIndex] == address(0), PendingLeaseExists());
+    require(l.owner != renter, OwnKami());
+    require(l.reservedFor == address(0) || l.reservedFor == renter, Reserved());
     require(l.ownerShareBps == expectedOwnerShareBps, TermsChanged());
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
-    require(msg.value >= l.minGasWei, "LM: gas budget too low");
     require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
 
-    _creditPending(tokenIndex); // any pre-lease earnings stay with the owner
+    IRenterRoomPod roomPod = IRenterRoomPod(pod);
+    require(address(roomPod.hub()) == address(this), NotFactory());
+    require(roomPod.accID() != 0 && roomPod.payItem() == payItem, NotFactory());
 
-    l.renter = msg.sender;
-    l.gasBudget = msg.value;
+    pendingRenter[tokenIndex] = renter;
+    pendingPod[tokenIndex] = pod;
+    emit LeaseProvisionRequested(
+      renter,
+      tokenIndex,
+      pod,
+      roomPod.nodeIndex(),
+      0,
+      termSecs,
+      prefs
+    );
+  }
+
+  /// @notice The factory calls this only after Kamibots has registered and
+  /// parked the dedicated pod. It moves the Kami from its owner's idle pool to
+  /// the shared hub, without starting the paid lease clock.
+  function prepareProvisionedLease(uint32 tokenIndex) external nonReentrant {
+    require(msg.sender == leaseFactory, NotFactory());
+    Listing storage l = _listings[tokenIndex];
+    require(pendingRenter[tokenIndex] != address(0), NoPendingLease());
+    require(!l.staked, AlreadyInPool());
+    IPersonalRentalCustody(l.owner).releaseToMarket(tokenIndex);
+    require(LibKami.getAccount(_comps(), l.kamiID) == accID, NotArrived());
+    l.staked = true;
+    l.xpBase = LibExperience.get(_comps(), l.kamiID);
+    emit Arrived(l.owner, tokenIndex);
+    emit LeasePreparing(tokenIndex, pendingPod[tokenIndex]);
+  }
+
+  /// @notice Start the paid term only after the dedicated pod actually holds
+  /// the Kami and Kamibots has accepted the renter's selected strategy.
+  function activateProvisionedLease(
+    uint32 tokenIndex,
+    string calldata prefs,
+    uint32 termSecs
+  ) external nonReentrant {
+    require(msg.sender == leaseFactory, NotFactory());
+    Listing storage l = _listings[tokenIndex];
+    address renter = pendingRenter[tokenIndex];
+    address pod = pendingPod[tokenIndex];
+    require(renter != address(0), NoPendingLease());
+    require(l.staked, NotInPoolYet());
+    require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
+    require(LibKami.getAccount(_comps(), l.kamiID) == IRenterRoomPod(pod).accID(), NotArrived());
+    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
+
+    _creditPending(tokenIndex); // setup-time XP remains the owner's
+    l.renter = renter;
+    l.gasBudget = 0; // renter ETH remains in the dedicated factory escrow
     l.leaseStart = uint64(block.timestamp);
     l.leaseEnd = uint64(block.timestamp) + termSecs;
-    participations[msg.sender]++;
-    emit LeaseAccepted(msg.sender, tokenIndex, msg.value, prefs);
+    participations[renter]++;
+    delete pendingRenter[tokenIndex];
+    delete pendingPod[tokenIndex];
+    emit LeaseAccepted(renter, tokenIndex, 0, prefs);
+  }
+
+  /// @notice Clear a factory reservation. If custody was dispatched, the
+  /// factory can clear it only after the Kami is provably back in its immutable
+  /// owner's Personal Rental Pool.
+  function cancelProvisionedLease(uint32 tokenIndex) external nonReentrant {
+    require(msg.sender == leaseFactory, NotFactory());
+    Listing storage l = _listings[tokenIndex];
+    address renter = pendingRenter[tokenIndex];
+    require(renter != address(0), NoPendingLease());
+    if (l.staked) {
+      require(
+        LibKami.getAccount(_comps(), l.kamiID) == IPersonalRentalCustody(l.owner).accID(),
+        KamiNotHomeYet()
+      );
+      l.staked = false;
+      l.xpBase = LibExperience.get(_comps(), l.kamiID);
+    }
+    delete pendingRenter[tokenIndex];
+    delete pendingPod[tokenIndex];
+    emit PreparingLeaseCancelled(tokenIndex, renter);
   }
 
   /// @notice update strategy preferences (relayed off-chain to the automation)
   function setPrefs(uint32 tokenIndex, string calldata prefs) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, NotRenter());
+    require(l.renter != address(0) && (msg.sender == l.renter || msg.sender == leaseFactory), NotRenter());
     require(!l.ending, EndingNow());
-    emit PrefsUpdated(tokenIndex, msg.sender, prefs);
-  }
-
-  function topUpGas(uint32 tokenIndex) external payable {
-    Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, NotRenter());
-    require(!l.ending, EndingNow());
-    l.gasBudget += msg.value;
-    emit GasToppedUp(tokenIndex, msg.value);
+    emit PrefsUpdated(tokenIndex, l.renter, prefs);
   }
 
   /// @notice extend a running lease in place — no re-accept, no send cooldown.
   ///         The total term stays within the owner's maxTermSecs.
   function extendLease(uint32 tokenIndex, uint32 extraSecs) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, NotRenter());
+    require(l.renter != address(0) && (msg.sender == l.renter || msg.sender == leaseFactory), NotRenter());
     require(!l.ending, EndingNow());
+    require(extraSecs != 0, TermRails());
     uint64 newEnd = l.leaseEnd + extraSecs;
     require(uint256(newEnd) - l.leaseStart <= l.maxTermSecs, TermRails());
     l.leaseEnd = newEnd;
     emit LeaseExtended(tokenIndex, newEnd);
   }
 
-  /// @notice Request lease end. The renter or owner may request it, but accounting
+  /// @notice Request lease end. The renter may request it after the minimum term,
+  ///         and after expiry anyone may request it. The owner cannot cancel a
+  ///         renter's already-paid term early. Accounting
   ///         is finalized only after the keeper has stopped the active harvest and
   ///         swept its pod. This prevents the final harvest from being orphaned.
   function endLease(uint32 tokenIndex) external nonReentrant {
@@ -586,10 +568,8 @@ contract KamiLeaseMarket {
     require(renter != address(0), NotLeased());
     require(!l.ending, AlreadyEnding());
     if (block.timestamp <= uint256(l.leaseEnd)) {
-      require(msg.sender == renter || msg.sender == l.owner, NotParty());
-      // the renter committed for at least MIN_TERM; the owner may recall anytime
-      if (msg.sender == renter)
-        require(block.timestamp >= uint256(l.leaseStart) + MIN_TERM, MinTerm());
+      require(msg.sender == renter, NotRenter());
+      require(block.timestamp >= uint256(l.leaseStart) + MIN_TERM, MinTerm());
     } // past leaseEnd the lease is EXPIRED: anyone (the keeper) may flip it
 
     l.ending = true;
@@ -606,48 +586,21 @@ contract KamiLeaseMarket {
     require(l.ending, NotEnding());
     bool timedOut = block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE;
     require(
-      msg.sender == settler || (timedOut && (msg.sender == renter || msg.sender == l.owner)),
+      msg.sender == settler || msg.sender == leaseFactory
+        || (timedOut && (msg.sender == renter || msg.sender == l.owner)),
       NotFinalizer()
     );
     require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), "LM: still harvesting");
 
     _creditPending(tokenIndex); // final split at the lease's terms
 
-    uint256 refund = l.gasBudget;
     l.renter = address(0);
     l.gasBudget = 0;
     l.ending = false;
     delete endingAt[tokenIndex];
     if (participations[renter] > 0) participations[renter]--;
 
-    // pull-pattern fallback: a renter contract that reverts on receive must not be
-    // able to block lease termination
-    if (refund > 0) _sendEthOrOwe(renter, refund);
-    emit LeaseEnded(tokenIndex, renter, refund);
-  }
-
-  /// @notice If automation cannot finish an ending lease, the renter can recover
-  ///         the still-unused gas budget after the grace period even while the
-  ///         kami remains harvesting. Final accounting can complete later.
-  function reclaimEndingGas(uint32 tokenIndex) external nonReentrant {
-    Listing storage l = _listings[tokenIndex];
-    require(l.renter == msg.sender, NotRenter());
-    require(l.ending && block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE, "LM: grace");
-    uint256 refund = l.gasBudget;
-    require(refund > 0, NoGas());
-    l.gasBudget = 0;
-    _sendEthOrOwe(msg.sender, refund);
-    emit EndingGasReclaimed(tokenIndex, msg.sender, refund);
-  }
-
-  /// @notice claim ETH refunds that could not be pushed
-  function claimEth() external nonReentrant {
-    uint256 amount = owedEth[msg.sender];
-    require(amount > 0, NothingOwed());
-    owedEth[msg.sender] = 0;
-    (bool ok, ) = msg.sender.call{ value: amount }("");
-    require(ok, ClaimFailed());
-    emit EthClaimed(msg.sender, amount);
+    emit LeaseEnded(tokenIndex, renter, 0);
   }
 
   ///////////////////
@@ -676,7 +629,7 @@ contract KamiLeaseMarket {
       l.xpBase = xp;
       if (delta == 0) continue;
       totalDelta += delta;
-      mgmtAdd += _creditSplit(l.owner, l.renter, l.ownerShareBps, delta);
+      mgmtAdd += _creditSplit(_beneficiary(l.owner), l.renter, l.ownerShareBps, delta);
     }
     mgmtAccrued += mgmtAdd;
     lastSettleAt = uint64(block.timestamp);
@@ -719,7 +672,7 @@ contract KamiLeaseMarket {
   /// @notice Withdraw accrued platform fees only from inventory above all user
   ///         claims. Pod sweep fees and any temporary shortfall therefore come
   ///         out of management, never from owners or renters.
-  function claimMgmt() external onlyAdmin nonReentrant {
+  function claimMgmt() external nonReentrant {
     require(mgmtAccID != 0, MgmtAccountUnset());
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 surplus = bal > owedMusuTotal ? bal - owedMusuTotal : 0;
@@ -748,6 +701,17 @@ contract KamiLeaseMarket {
     return _listings[tokenIndex];
   }
 
+  function leaseRenter(uint32 tokenIndex) external view returns (address) {
+    return _listings[tokenIndex].renter;
+  }
+
+  /// @notice The economic owner shown by the marketplace. For a Personal
+  /// Rental Pool this is the pool's immutable owner; for legacy listings it is
+  /// the listing owner itself.
+  function listingBeneficiary(uint32 tokenIndex) external view returns (address) {
+    return _beneficiary(_listings[tokenIndex].owner);
+  }
+
   /// @notice the market account's CURRENT operator — the KamiSend destination.
   ///         the dApp resolves the send target from THIS on-chain (not a
   ///         hardcoded constant), so a redeploy can never leave a user sending
@@ -755,6 +719,7 @@ contract KamiLeaseMarket {
   function operatorAddr() external view returns (address) {
     return LibAccount.getOperator(_comps(), accID);
   }
+
 
   function pendingXpDelta(uint32 tokenIndex) public view returns (uint256) {
     Listing memory l = _listings[tokenIndex];
@@ -794,7 +759,7 @@ contract KamiLeaseMarket {
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
     if (delta == 0) return;
-    uint256 cut = _creditSplit(l.owner, l.renter, l.ownerShareBps, delta);
+    uint256 cut = _creditSplit(_beneficiary(l.owner), l.renter, l.ownerShareBps, delta);
     mgmtAccrued += cut;
     emit Settled(delta - cut, cut, delta);
   }
@@ -813,15 +778,6 @@ contract KamiLeaseMarket {
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, targetAccID);
   }
 
-  /// @dev push ETH; on failure record it as claimable instead of reverting
-  function _sendEthOrOwe(address to, uint256 amount) internal {
-    (bool ok, ) = to.call{ value: amount, gas: 50_000 }("");
-    if (!ok) {
-      owedEth[to] += amount;
-      emit EthOwed(to, amount);
-    }
-  }
-
   function _removeListing(uint32 tokenIndex) internal {
     uint256 pos = tokenPos[tokenIndex];
     uint256 last = tokenIndices.length;
@@ -832,7 +788,18 @@ contract KamiLeaseMarket {
     }
     tokenIndices.pop();
     delete tokenPos[tokenIndex];
+    delete pendingRenter[tokenIndex];
+    delete pendingPod[tokenIndex];
     delete _listings[tokenIndex];
+  }
+
+  function _beneficiary(address listingOwner_) internal view returns (address) {
+    if (listingOwner_ == address(0) || listingOwner_.code.length == 0) return listingOwner_;
+    try IPersonalRentalCustody(listingOwner_).vaultOwner() returns (address owner_) {
+      return owner_ == address(0) ? listingOwner_ : owner_;
+    } catch {
+      return listingOwner_;
+    }
   }
 
   /// @dev the marketplace-readiness rule: RESTING and effectively at FULL HEALTH

@@ -1,0 +1,18 @@
+{
+  "version": 14,
+  "stackId": "v14-personal-rental-vault-factory",
+  "deployedAt": "2026-07-21T02:59:31.035Z",
+  "factoryAddress": "0x053813B60399d4993E1320c778A261d4fdD97950",
+  "poolImplementation": "0x6a1252BeFaade0442E5D6Eed7d9B20e86A460ed4",
+  "poolImplementationTx": "0x607bbaa3a0d2b45ecf022198ce3fca907c7fe59cfa0b09366972444f5515fe07",
+  "factoryTx": "0xb8feb305695d316741f89497f632e696e1a70c7119b819ab169ab03d80795ae4",
+  "blockNumber": 31166168,
+  "verification": {
+    "world": "0x2729174c265dbBd8416C6449E0E813E88f43D0E7",
+    "poolImplementation": "0x6a1252BeFaade0442E5D6Eed7d9B20e86A460ed4",
+    "musuMarket": "0x6018f945561590e8EF5b4E35Ef3cCA63496486c5",
+    "vippMarket": "0x0000000000000000000000000000000000000000",
+    "platformAccID": "756360582917686076792667387455343056142985847610",
+    "platformFeeBps": 1000
+  }
+}

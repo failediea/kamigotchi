@@ -6,7 +6,11 @@ import { TRANSFER_FEE } from "libraries/LibInventory.sol";
 import { KamiLeaseMarket } from "vault/KamiLeaseMarket.sol";
 
 /**
- * KamiLeaseMarket v6 tests — THE POOL MODEL.
+ * LEGACY v6/v13 shared-pool tests retained as migration documentation.
+ *
+ * v14 deliberately removes these direct listing/acceptance entrypoints. Its
+ * executable regression suite is PersonalRentalVault.t.sol, which exercises
+ * Personal Rental Pool custody and renter-funded RoomPod provisioning.
  *
  * Rules under test:
  *  - listing requires RESTING at FULL HEALTH, then the kami is SENT INTO THE POOL:
@@ -27,6 +31,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
   uint128 constant MIN_GAS = 0.01 ether;
 
   function setUp() public override {
+    vm.skip(true);
     super.setUp();
 
     marketOperator = _getNextUserAddress();
@@ -268,14 +273,19 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertEq(market.numListings(), 1, "listing survives; kami back in the pool");
   }
 
-  function testOwnerCanEndAndEndingBlocksChanges() public {
+  function testOwnerCannotEndPaidTermAndRenterEndingBlocksChanges() public {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
 
     vm.prank(alice.owner);
+    vm.expectRevert(KamiLeaseMarket.NotRenter.selector);
     market.endLease(tokenIndex);
-    assertTrue(_endingOf(tokenIndex), "owner started ending");
+
+    _fastForward(1 days + 1);
+    vm.prank(bob.owner);
+    market.endLease(tokenIndex);
+    assertTrue(_endingOf(tokenIndex), "renter started ending");
 
     vm.prank(bob.owner);
     vm.expectRevert(KamiLeaseMarket.EndingNow.selector);
@@ -505,8 +515,8 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.deal(address(evil), 1 ether);
     evil.doAccept{ value: MIN_GAS }(market, tokenIndex, OWNER_BPS);
 
-    vm.prank(alice.owner);
-    market.endLease(tokenIndex);
+    _fastForward(1 days + 1);
+    evil.doEnd(market, tokenIndex);
     market.finalizeLease(tokenIndex);
 
     assertEq(market.owedEth(address(evil)), MIN_GAS, "refund not owed");
@@ -769,7 +779,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
     );
   }
 
-  function testRenterMinTermCommitmentOwnerExempt() public {
+  function testRenterMinTermCommitmentAndOwnerCannotRecall() public {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
@@ -778,10 +788,15 @@ contract KamiLeaseMarketTest is SetupTemplate {
     vm.expectRevert(KamiLeaseMarket.MinTerm.selector);
     market.endLease(tokenIndex);
 
-    // the owner may recall at any time
+    // the owner cannot cancel the renter's paid term
     vm.prank(alice.owner);
+    vm.expectRevert(KamiLeaseMarket.NotRenter.selector);
     market.endLease(tokenIndex);
-    assertTrue(_endingOf(tokenIndex), "owner end is immediate");
+
+    _fastForward(1 days + 1);
+    vm.prank(bob.owner);
+    market.endLease(tokenIndex);
+    assertTrue(_endingOf(tokenIndex), "renter can end after commitment");
   }
 
   function testPrivateLeaseReservedRenterOnly() public {
@@ -833,7 +848,7 @@ contract KamiLeaseMarketTest is SetupTemplate {
 
     address stranger = _getNextUserAddress();
     vm.prank(stranger);
-    vm.expectRevert(KamiLeaseMarket.NotParty.selector);
+    vm.expectRevert(KamiLeaseMarket.NotRenter.selector);
     market.endLease(tokenIndex); // not expired yet
 
     _fastForward(1 days + 1);
@@ -844,35 +859,16 @@ contract KamiLeaseMarketTest is SetupTemplate {
     assertEq(_renterOf(tokenIndex), address(0), "lease closed");
   }
 
-  function testAdminHandOffTwoStep() public {
-    address customer = _getNextUserAddress();
-
-    // only the pending admin can accept — a stranger cannot hijack the hand-off
-    market.transferAdmin(customer);
-    vm.prank(_getNextUserAddress());
-    vm.expectRevert(KamiLeaseMarket.NotPendingAdmin.selector);
-    market.acceptAdmin();
-
-    // until acceptance the platform is still admin (can cancel with address(0))
-    assertEq(market.admin(), address(this));
-    vm.prank(customer);
-    market.acceptAdmin();
-    assertEq(market.admin(), customer);
-    assertEq(market.pendingAdmin(), address(0));
-
-    // old admin has lost all power; the customer now holds the kill switch
-    vm.expectRevert(KamiLeaseMarket.NotAdmin.selector);
-    market.setSettler(address(this));
-    vm.prank(customer);
-    market.setSettler(customer);
-  }
-
 }
 
 /// @dev renter contract that rejects ETH — proves termination can't be held hostage
 contract RevertingRenter {
   function doAccept(KamiLeaseMarket m, uint32 idx, uint16 bps) external payable {
     m.acceptLease{ value: msg.value }(idx, "", bps, 1 days);
+  }
+
+  function doEnd(KamiLeaseMarket m, uint32 idx) external {
+    m.endLease(idx);
   }
 
   receive() external payable {

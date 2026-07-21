@@ -16,3 +16,11 @@ optimizer = false
 
 [profile.build.fuzz]
 runs = 128
+
+# The v14 renter-funded market must compile through IR to stay below the
+# EIP-170 runtime bytecode limit. This matches the production deployment.
+[profile.v14]
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+out = "out-v14"

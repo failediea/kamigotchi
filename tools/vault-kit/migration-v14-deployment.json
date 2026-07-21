@@ -1,0 +1,25 @@
+{
+  "version": 14,
+  "stackId": "v14-musu-renter-funded",
+  "currency": "MUSU",
+  "deployedAt": "2026-07-21T02:48:56.379Z",
+  "chainId": "428962654539583",
+  "transactionHash": "0xd1d60b3a302429b7fc5da67f5e951ede817e26f2a768561dfe81a0f3fa2f2fee",
+  "blockNumber": 31165970,
+  "deploymentWrapper": "0x2a314348C689f6Cd068dE453472A130eBD58E7c5",
+  "marketAddress": "0x6018f945561590e8EF5b4E35Ef3cCA63496486c5",
+  "renterPodFactory": "0xa60B20382b2751D4E309c5AA9E3FFB040664c2BB",
+  "kami721": "0x5d4376b62fa8AC16dFabe6a9861E11c33A48C677",
+  "world": "0x2729174c265dbBd8416C6449E0E813E88f43D0E7",
+  "verification": {
+    "admin": "0x0000000000000000000000000000000000000000",
+    "mgmtBps": 1000,
+    "payItem": 1,
+    "operator": "0xD8A64a5cf338480B2EAf77955979cF163716957c",
+    "settler": "0xD8A64a5cf338480B2EAf77955979cF163716957c",
+    "leaseFactory": "0xa60B20382b2751D4E309c5AA9E3FFB040664c2BB",
+    "accID": "548620046436959240121473582367156032605903947461",
+    "provisioningSigner": "0xD8A64a5cf338480B2EAf77955979cF163716957c",
+    "factoryMarket": "0x6018f945561590e8EF5b4E35Ef3cCA63496486c5"
+  }
+}

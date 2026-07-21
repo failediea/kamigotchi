@@ -8,7 +8,8 @@ import { RoomPod } from "vault/RoomPod.sol";
 import { HarvestGuard } from "vault/HarvestGuard.sol";
 
 /**
- * HarvestGuard tests — SELF-FARM LEASE MODE.
+ * LEGACY self-farm tests retained as migration documentation. v14 is
+ * Kamibots-only and provisions a renter-funded dedicated RoomPod per lease.
  *
  * The guard contract is the pod's account OPERATOR and exposes exactly three
  * renter actions: start / collect / stop, gated live to hub.listings.renter.
@@ -29,6 +30,7 @@ contract HarvestGuardTest is SetupTemplate {
   uint32 constant POD_NODE = 1;
 
   function setUp() public override {
+    vm.skip(true);
     super.setUp();
 
     marketOperator = _getNextUserAddress();

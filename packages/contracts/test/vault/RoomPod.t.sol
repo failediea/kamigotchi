@@ -8,7 +8,7 @@ import { RoomPod } from "vault/RoomPod.sol";
 import { LeasePodRegistry } from "vault/LeasePodRegistry.sol";
 
 /**
- * RoomPod + LeasePodRegistry tests — THE MULTI-ACCOUNT TILE MODEL.
+ * RoomPod + LeasePodRegistry tests — legacy pre-deployed tile model.
  *
  * One parked account per tile. Idle kamis pool in the HUB; a leased kami is
  * KamiSent to the pod of the renter's chosen tile and farmed there. Accounts
@@ -147,6 +147,7 @@ contract RoomPodTest is SetupTemplate {
   // THE FULL POD LEASE CYCLE
 
   function testLeaseFarmedInPodSettlesExactly() public {
+    vm.skip(true); // v14 lease integration lives in PersonalRentalVault.t.sol
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
@@ -191,6 +192,7 @@ contract RoomPodTest is SetupTemplate {
   }
 
   function testKamiReturnsPodToHubToOwner() public {
+    vm.skip(true); // v14 returns directly to the immutable Personal Rental Pool
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
@@ -224,6 +226,7 @@ contract RoomPodTest is SetupTemplate {
   // MONEY IS ONE-WAY
 
   function testPodOperatorCannotMoveFunds() public {
+    vm.skip(true); // covered through the v14 renter-funded pod regression suite
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
