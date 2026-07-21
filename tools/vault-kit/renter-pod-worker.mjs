@@ -24,6 +24,7 @@ import {
   kamibotsStrategySignature,
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
+import { StageZeroAction, stageZeroAction } from "./renter-pod-recovery.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envPath = join(here, ".env");
@@ -373,22 +374,34 @@ async function processJob(job) {
     return;
   }
 
-  // The request is gone after finalization/refund. Return the idle Kami to the
-  // immutable owner pool, then keep the listing published for the next renter.
-  if (stage === 0 && job.finalized && !job.returned) {
-    if (actualAccID === podAccID) {
+  // A deleted request is durable proof that finalization or cancellation has
+  // happened. Rebuild the remaining return work from on-chain custody instead
+  // of trusting local flags that disappear when the worker state file is lost.
+  if (stage === 0 && !job.returned) {
+    job.finalized = true;
+    const action = stageZeroAction({
+      actualAccID,
+      podAccID,
+      ownerAccID: BigInt(listing.owner),
+      staked: Boolean(listing.staked),
+      returning: Boolean(listing.returning),
+    });
+    if (action === StageZeroAction.RETURN_FROM_POD) {
+      await stopStrategy(job);
       await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
+      save();
       return;
     }
-    if (actualAccID === BigInt(listing.owner)) {
-      if (listing.returning) await (await market.connect(operator).clearReturned(job.tokenIndex)).wait();
-      else await (await market.connect(operator).confirmReturnedToPool(job.tokenIndex)).wait();
-      job.returned = true;
+    if (action === StageZeroAction.CLEAR_OWNER_RETURN) {
+      await (await market.connect(operator).clearReturned(job.tokenIndex)).wait();
+    } else if (action === StageZeroAction.CONFIRM_POOL_RETURN) {
+      await (await market.connect(operator).confirmReturnedToPool(job.tokenIndex)).wait();
+    } else if (action === StageZeroAction.WAIT) {
       save();
+      return;
     }
-  } else if (stage === 0 && !job.finalized) {
-    // Renter cancelled before custody moved; nothing else is authorized.
     job.returned = true;
+    save();
   }
 }
 
