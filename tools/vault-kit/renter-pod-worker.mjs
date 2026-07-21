@@ -11,11 +11,14 @@
  * Required env:
  *   YOMINET_RPC, WORLD_ADDR, MARKET_ADDRESS, RENTER_POD_FACTORY
  *   PROVISIONING_PRIVATE_KEY  (must equal market operator + factory signer)
- *   PROVISIONING_OPERATOR_SEED (same server-only seed used by quote API)
- * Optional: KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE
+ *   OPERATOR_RESERVATION_TOKEN (shared only with the quote API, 32+ chars)
+ * Optional: LEGACY_PROVISIONING_OPERATOR_SEED (migration only),
+ *   OPERATOR_RESERVATION_HOST, OPERATOR_RESERVATION_PORT,
+ *   KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE
  */
-import { createHmac } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Contract, JsonRpcProvider, Wallet, id as keccakId } from "ethers";
@@ -25,6 +28,15 @@ import {
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
 import { StageZeroAction, stageZeroAction } from "./renter-pod-recovery.mjs";
+import {
+  claimOperatorReservation,
+  initializeOperatorKeyState,
+  migrateLegacyJobKeys,
+  operatorWalletForJob,
+  purgeReturnedJobSecrets,
+  removeExpiredUnclaimedReservations,
+  reserveRandomOperator,
+} from "./renter-pod-keys.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envPath = join(here, ".env");
@@ -46,11 +58,15 @@ const WORLD = required("WORLD_ADDR");
 const MARKET = required("MARKET_ADDRESS");
 const FACTORY = required("RENTER_POD_FACTORY");
 const PROVISIONER_KEY = required("PROVISIONING_PRIVATE_KEY");
-const OPERATOR_SEED = required("PROVISIONING_OPERATOR_SEED");
+const RESERVATION_TOKEN = required("OPERATOR_RESERVATION_TOKEN");
+if (RESERVATION_TOKEN.length < 32) throw new Error("OPERATOR_RESERVATION_TOKEN must be at least 32 characters");
+const LEGACY_OPERATOR_SEED = process.env.LEGACY_PROVISIONING_OPERATOR_SEED || "";
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const KAMISTATS = process.env.KAMISTATS_URL || "https://kamistats.com";
 const POLL_MS = Number(process.env.POLL_MS || 30_000);
 const STATE_FILE = process.env.WORKER_STATE_FILE || join(here, "renter-pod-worker-state.json");
+const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
+const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
 const ZERO = "0x0000000000000000000000000000000000000000";
 
 const provider = new JsonRpcProvider(RPC);
@@ -94,8 +110,15 @@ const POD_ABI = [
 const state = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
   : { lastBlock: Number(process.env.START_BLOCK || 0), jobs: {} };
-state.jobs ??= {};
-const save = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+initializeOperatorKeyState(state);
+const save = () => {
+  const temp = `${STATE_FILE}.tmp`;
+  writeFileSync(temp, JSON.stringify(state, null, 2), { mode: 0o600 });
+  chmodSync(temp, 0o600);
+  renameSync(temp, STATE_FILE);
+};
+const migratedLegacyJobs = migrateLegacyJobKeys(state, LEGACY_OPERATOR_SEED);
+if (migratedLegacyJobs) save();
 
 let idOwnsKami;
 let roomComponent;
@@ -103,14 +126,62 @@ let moveSystem;
 let sendSystem;
 let marketAccID;
 
-function operatorWallet(nonce) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const key = createHmac("sha256", OPERATOR_SEED).update(`${nonce}:${attempt}`).digest("hex");
-    try {
-      return new Wallet(`0x${key}`, provider);
-    } catch {}
+function authorizedReservationRequest(header) {
+  const prefix = "Bearer ";
+  if (!header?.startsWith(prefix)) return false;
+  const supplied = Buffer.from(header.slice(prefix.length));
+  const expected = Buffer.from(RESERVATION_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+async function readReservationBody(request) {
+  let body = "";
+  for await (const chunk of request) {
+    body += chunk;
+    if (Buffer.byteLength(body) > 4_096) throw new Error("reservation body too large");
   }
-  throw new Error("could not derive operator key");
+  return JSON.parse(body || "{}");
+}
+
+function writeJson(response, status, body) {
+  response.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  });
+  response.end(JSON.stringify(body));
+}
+
+function startReservationServer() {
+  const server = createServer(async (request, response) => {
+    try {
+      if (request.method !== "POST" || request.url !== "/v1/operator-reservations") {
+        writeJson(response, 404, { error: "not found" });
+        return;
+      }
+      if (!authorizedReservationRequest(request.headers.authorization)) {
+        writeJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      const body = await readReservationBody(request);
+      if (String(body.market).toLowerCase() !== MARKET.toLowerCase() || String(body.factory).toLowerCase() !== FACTORY.toLowerCase()) {
+        writeJson(response, 400, { error: "wrong market or factory" });
+        return;
+      }
+      const reservation = reserveRandomOperator(state, String(body.nonce));
+      save();
+      writeJson(response, 201, { operator: reservation.operator });
+    } catch (error) {
+      console.error("operator reservation failed:", error instanceof Error ? error.message : error);
+      writeJson(response, 400, { error: "operator reservation failed" });
+    }
+  });
+  server.requestTimeout = 5_000;
+  server.headersTimeout = 6_000;
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(RESERVATION_PORT, RESERVATION_HOST, () => resolve(server));
+  });
 }
 
 async function registryAddress(registry, name) {
@@ -230,21 +301,32 @@ async function ingestEvents() {
   for (const event of events) {
     const args = event.args;
     const tokenIndex = Number(args.tokenIndex);
-    state.jobs[tokenIndex] ??= {
-      tokenIndex,
-      renter: String(args.renter),
-      node: Number(args.nodeIndex),
-      pod: String(args.pod),
-      operator: String(args.operator),
-      nonce: String(args.nonce),
-      creds: null,
-      strategyStarted: false,
-      finalized: false,
-      returned: false,
-      eventBlock: event.blockNumber,
-    };
+    const eventNonce = String(args.nonce);
+    const existing = state.jobs[tokenIndex];
+    if (!existing || String(existing.nonce).toLowerCase() !== eventNonce.toLowerCase()) {
+      if (existing && !existing.returned) {
+        throw new Error(`received a second active RoomPod event for Kami #${tokenIndex}`);
+      }
+      state.jobs[tokenIndex] = {
+        tokenIndex,
+        renter: String(args.renter),
+        node: Number(args.nodeIndex),
+        pod: String(args.pod),
+        operator: String(args.operator),
+        operatorKey: claimOperatorReservation(state, eventNonce, String(args.operator)),
+        nonce: eventNonce,
+        creds: null,
+        strategyStarted: false,
+        finalized: false,
+        returned: false,
+        eventBlock: event.blockNumber,
+      };
+    }
   }
   state.lastBlock = latest + 1;
+  // Events are ingested before cleanup, so a valid on-chain request always
+  // claims its key even if the worker was offline past the quote deadline.
+  removeExpiredUnclaimedReservations(state);
   save();
 }
 
@@ -303,10 +385,7 @@ async function reconcileStrategy(job) {
 }
 
 async function processJob(job) {
-  const operator = operatorWallet(job.nonce);
-  if (operator.address.toLowerCase() !== job.operator.toLowerCase()) {
-    throw new Error("derived operator does not match the renter-signed quote");
-  }
+  const operator = operatorWalletForJob(job, provider);
   const pod = new Contract(job.pod, POD_ABI, provider);
   const [request, listing, podAccID] = await Promise.all([
     factory.requests(job.tokenIndex),
@@ -369,6 +448,7 @@ async function processJob(job) {
     if (actualAccID === BigInt(listing.owner)) {
       await (await factory.connect(operator).finalizePreparingCancellation(job.tokenIndex)).wait();
       job.returned = true;
+      purgeReturnedJobSecrets(job);
       save();
     }
     return;
@@ -401,6 +481,7 @@ async function processJob(job) {
       return;
     }
     job.returned = true;
+    purgeReturnedJobSecrets(job);
     save();
   }
 }
@@ -408,6 +489,7 @@ async function processJob(job) {
 async function tick() {
   await ingestEvents();
   for (const job of Object.values(state.jobs)) {
+    if (job.returned) continue;
     try {
       await processJob(job);
       job.error = null;
@@ -420,6 +502,8 @@ async function tick() {
 }
 
 await wire();
+await startReservationServer();
+console.log(`operator reservations listening on http://${RESERVATION_HOST}:${RESERVATION_PORT}`);
 console.log(`renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, operator ${provisioner.address}`);
 for (;;) {
   const started = Date.now();
