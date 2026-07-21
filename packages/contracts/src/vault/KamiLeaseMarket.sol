@@ -106,10 +106,13 @@ contract KamiLeaseMarket {
 
   uint64 public lastSettleAt;
   uint64 public settleCooldown = 1 days; // daily accounting cadence; admin-tunable, capped
+  uint256 public settleCursor;
+  bool public settlementInProgress;
   uint64 internal initializedAt;
 
   uint64 internal constant ENDING_GRACE = 2 days;
   uint64 internal constant SETTLER_STALE = 3 days;
+  uint256 public constant MAX_SETTLE_BATCH = 50;
   // lease term rails: every lease commits for >= MIN_TERM (each cycle costs ~2h of
   // send cooldowns — sub-day rentals are all overhead) and expires by leaseEnd.
   uint64 public constant MIN_TERM = 1 days;
@@ -125,6 +128,7 @@ contract KamiLeaseMarket {
   error AlreadyReturning();
   error AlreadySentHome();
   error BeingReturned();
+  error BadBatch();
   error BudgetTooLow();
   error Cooldown();
   error EndLeaseFirst();
@@ -201,6 +205,7 @@ contract KamiLeaseMarket {
   event LeaseEnding(uint32 indexed tokenIndex, address indexed renter, address indexed requestedBy);
   event LeaseExtended(uint32 indexed tokenIndex, uint64 leaseEnd);
   event Settled(uint256 distributed, uint256 mgmtCut, uint256 totalDelta);
+  event SettlementBatch(uint256 indexed from, uint256 indexed to, bool complete);
   event Payout(address indexed to, uint256 amount, bool held);
   event OwedClaimed(address indexed to, uint256 amount);
 
@@ -606,22 +611,42 @@ contract KamiLeaseMarket {
   ///////////////////
   // SETTLEMENT
 
-  /// @notice Daily keeper accounting. XP deltas are converted into exact claims;
-  ///         no transfers happen here, so one settlement cannot burn several
-  ///         transfer fees or fail because a recipient has not registered yet.
+  /// @notice Compatibility entry point. One call accounts for at most
+  /// MAX_SETTLE_BATCH listings; anyone may continue an open cycle.
   function settle() external nonReentrant {
+    _settleBatch(MAX_SETTLE_BATCH);
+  }
+
+  /// @notice Bounded daily accounting. Starting a cycle preserves the existing
+  /// settler/cooldown rules; continuation is permissionless so a crashed keeper
+  /// cannot strand a partially-accounted market.
+  function settleBatch(uint256 maxItems) external nonReentrant {
+    if (maxItems == 0 || maxItems > MAX_SETTLE_BATCH) revert BadBatch();
+    _settleBatch(maxItems);
+  }
+
+  function _settleBatch(uint256 maxItems) internal {
     require(accID != 0, NotInit());
-    uint256 base = lastSettleAt == 0 ? initializedAt : lastSettleAt;
-    require(msg.sender == settler || block.timestamp >= base + SETTLER_STALE, NotSettler());
-    require(
-      lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
-      Cooldown()
-    );
+    if (!settlementInProgress) {
+      uint256 base = lastSettleAt == 0 ? initializedAt : lastSettleAt;
+      require(msg.sender == settler || block.timestamp >= base + SETTLER_STALE, NotSettler());
+      require(
+        lastSettleAt == 0 || block.timestamp >= uint256(lastSettleAt) + settleCooldown,
+        Cooldown()
+      );
+      settlementInProgress = true;
+      settleCursor = 0;
+      lastSettleAt = uint64(block.timestamp);
+    }
+
     IUintComp comps = _comps();
     uint256 n = tokenIndices.length;
+    uint256 start = settleCursor;
+    uint256 end = start + maxItems;
+    if (end > n) end = n;
     uint256 totalDelta;
     uint256 mgmtAdd;
-    for (uint256 i; i < n; i++) {
+    for (uint256 i = start; i < end; i++) {
       Listing storage l = _listings[tokenIndices[i]];
       if (!l.staked) continue;
       uint256 xp = LibExperience.get(comps, l.kamiID);
@@ -632,8 +657,14 @@ contract KamiLeaseMarket {
       mgmtAdd += _creditSplit(_beneficiary(l.owner), l.renter, l.ownerShareBps, delta);
     }
     mgmtAccrued += mgmtAdd;
-    lastSettleAt = uint64(block.timestamp);
+    settleCursor = end;
+    bool complete = end >= tokenIndices.length;
+    if (complete) {
+      settlementInProgress = false;
+      settleCursor = 0;
+    }
     emit Settled(totalDelta - mgmtAdd, mgmtAdd, totalDelta);
+    emit SettlementBatch(start, end, complete);
   }
 
   /// @dev Credit one exact gross pool. User claims are senior to management:
@@ -781,9 +812,10 @@ contract KamiLeaseMarket {
   function _removeListing(uint32 tokenIndex) internal {
     uint256 pos = tokenPos[tokenIndex];
     uint256 last = tokenIndices.length;
+    uint256 removedIndex = pos - 1;
     if (pos != last) {
       uint32 moved = tokenIndices[last - 1];
-      tokenIndices[pos - 1] = moved;
+      tokenIndices[removedIndex] = moved;
       tokenPos[moved] = pos;
     }
     tokenIndices.pop();
@@ -791,6 +823,9 @@ contract KamiLeaseMarket {
     delete pendingRenter[tokenIndex];
     delete pendingPod[tokenIndex];
     delete _listings[tokenIndex];
+    // A tail listing can be swapped into an already-processed slot. Rewind to
+    // that slot; repeat visits are safe because settlement advances xpBase.
+    if (settlementInProgress && removedIndex < settleCursor) settleCursor = removedIndex;
   }
 
   function _beneficiary(address listingOwner_) internal view returns (address) {

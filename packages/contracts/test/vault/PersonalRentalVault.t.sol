@@ -401,6 +401,30 @@ contract PersonalRentalVaultTest is SetupTemplate {
         );
     }
 
+    function testSettlementRunsInBoundedPermissionlessContinuationBatches() public {
+        _listAndPublish();
+        _listAndPublish();
+
+        market.settleBatch(1);
+        assertTrue(market.settlementInProgress(), "first bounded batch leaves cycle open");
+        assertEq(market.settleCursor(), 1);
+
+        vm.prank(bob.owner);
+        market.settleBatch(1);
+        assertFalse(market.settlementInProgress(), "anyone can finish a started cycle");
+        assertEq(market.settleCursor(), 0);
+
+        vm.expectRevert(KamiLeaseMarket.Cooldown.selector);
+        market.settleBatch(1);
+    }
+
+    function testSettlementRejectsUnboundedCallerInput() public {
+        vm.expectRevert(KamiLeaseMarket.BadBatch.selector);
+        market.settleBatch(0);
+        vm.expectRevert(KamiLeaseMarket.BadBatch.selector);
+        market.settleBatch(market.MAX_SETTLE_BATCH() + 1);
+    }
+
     function testReturnGoesToPersonalPoolThenOwnerCanWithdraw() public {
         (uint256 kamiID, uint32 tokenIndex) = _listAndPublish();
         _accept(tokenIndex);
