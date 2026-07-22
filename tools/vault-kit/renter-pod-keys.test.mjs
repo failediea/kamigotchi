@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 import { Wallet } from "ethers";
 import {
+  bindOperatorReservationQuote,
   claimOperatorReservation,
   migrateLegacyJobKeys,
   operatorWalletForJob,
@@ -42,6 +43,28 @@ test("a mismatched on-chain operator cannot consume a reservation", () => {
   reserveRandomOperator(state, nonce(5));
   assert.throws(() => claimOperatorReservation(state, nonce(5), Wallet.createRandom().address), /does not match/);
   assert.ok(state.reservations[nonce(5)]);
+});
+
+test("a reservation nonce binds to exactly one quote digest", () => {
+  const state = {};
+  const reserved = reserveRandomOperator(state, nonce(8));
+  const firstDigest = `0x${"11".repeat(32)}`;
+  assert.equal(
+    bindOperatorReservationQuote(state, nonce(8), reserved.operator, firstDigest),
+    firstDigest
+  );
+  assert.equal(
+    bindOperatorReservationQuote(state, nonce(8), reserved.operator, firstDigest),
+    firstDigest
+  );
+  assert.throws(
+    () => bindOperatorReservationQuote(state, nonce(8), reserved.operator, `0x${"22".repeat(32)}`),
+    /already bound/
+  );
+  assert.throws(
+    () => bindOperatorReservationQuote(state, nonce(8), Wallet.createRandom().address, firstDigest),
+    /does not match/
+  );
 });
 
 test("expired unused quotes are removable after the event scan", () => {

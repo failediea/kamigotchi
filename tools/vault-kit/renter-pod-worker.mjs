@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * v14 renter-funded RoomPod worker.
+ * v15 renter-funded RoomPod worker.
  *
  * The renter's factory transaction already deployed the pod and funded every
  * automation wallet. This worker contributes no ETH and has no admin path. It
@@ -10,7 +10,7 @@
  *
  * Required env:
  *   YOMINET_RPC, WORLD_ADDR, MARKET_ADDRESS, RENTER_POD_FACTORY
- *   PROVISIONING_PRIVATE_KEY  (must equal market operator + factory signer)
+ *   KEEPER_PRIVATE_KEY        (must equal the factory's immutable keeper)
  *   OPERATOR_RESERVATION_TOKEN (shared only with the quote API, 32+ chars)
  * Optional: LEGACY_PROVISIONING_OPERATOR_SEED (migration only),
  *   OPERATOR_RESERVATION_HOST, OPERATOR_RESERVATION_PORT,
@@ -29,6 +29,7 @@ import {
 } from "./kamibots-rental-config.mjs";
 import { StageZeroAction, stageZeroAction } from "./renter-pod-recovery.mjs";
 import {
+  bindOperatorReservationQuote,
   claimOperatorReservation,
   initializeOperatorKeyState,
   migrateLegacyJobKeys,
@@ -57,7 +58,7 @@ const RPC = required("YOMINET_RPC");
 const WORLD = required("WORLD_ADDR");
 const MARKET = required("MARKET_ADDRESS");
 const FACTORY = required("RENTER_POD_FACTORY");
-const PROVISIONER_KEY = required("PROVISIONING_PRIVATE_KEY");
+const KEEPER_KEY = required("KEEPER_PRIVATE_KEY");
 const RESERVATION_TOKEN = required("OPERATOR_RESERVATION_TOKEN");
 if (RESERVATION_TOKEN.length < 32) throw new Error("OPERATOR_RESERVATION_TOKEN must be at least 32 characters");
 const LEGACY_OPERATOR_SEED = process.env.LEGACY_PROVISIONING_OPERATOR_SEED || "";
@@ -70,7 +71,7 @@ const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
 const ZERO = "0x0000000000000000000000000000000000000000";
 
 const provider = new JsonRpcProvider(RPC);
-const provisioner = new Wallet(PROVISIONER_KEY, provider);
+const keeper = new Wallet(KEEPER_KEY, provider);
 const world = new Contract(
   WORLD,
   ["function components() view returns (address)", "function systems() view returns (address)"],
@@ -92,12 +93,17 @@ const factory = new Contract(
   FACTORY,
   [
     "function requests(uint32) view returns (address renter,address pod,uint256 gasBudget,uint32 termSecs,uint64 requestedAt,uint8 stage)",
+    "function keeper() view returns (address)",
+    "function quoteDigest((address renter,uint32 tokenIndex,uint32 nodeIndex,address operator,uint16 expectedOwnerShareBps,uint32 termSecs,uint128 setupGasWei,uint128 hubGasWei,uint128 operatingGasWei,uint64 deadline,bytes32 nonce,string label,string accountName,string prefs)) view returns (bytes32)",
     "function prefs(uint32) view returns (string)",
     "function markLeasePreparing(uint32)",
+    "function routePreparedKami(uint32)",
     "function activateProvisionedLease(uint32)",
     "function pullGas(uint32,uint256)",
     "function finalizeMarketLease(uint32)",
+    "function finalizeGasRefund(uint32)",
     "function finalizePreparingCancellation(uint32)",
+    "function recoverPreparingFromHub(uint32)",
     "event RenterPodCreated(address indexed renter,uint32 indexed tokenIndex,uint32 indexed nodeIndex,address pod,address operator,uint256 setupGasWei,uint256 hubGasWei,uint256 operatingGasWei,bytes32 nonce)",
   ],
   provider
@@ -138,7 +144,7 @@ async function readReservationBody(request) {
   let body = "";
   for await (const chunk of request) {
     body += chunk;
-    if (Buffer.byteLength(body) > 4_096) throw new Error("reservation body too large");
+    if (Buffer.byteLength(body) > 16_384) throw new Error("reservation body too large");
   }
   return JSON.parse(body || "{}");
 }
@@ -155,7 +161,11 @@ function writeJson(response, status, body) {
 function startReservationServer() {
   const server = createServer(async (request, response) => {
     try {
-      if (request.method !== "POST" || request.url !== "/v1/operator-reservations") {
+      if (
+        request.method !== "POST"
+          || (request.url !== "/v1/operator-reservations"
+            && request.url !== "/v1/operator-reservations/attest")
+      ) {
         writeJson(response, 404, { error: "not found" });
         return;
       }
@@ -168,9 +178,24 @@ function startReservationServer() {
         writeJson(response, 400, { error: "wrong market or factory" });
         return;
       }
-      const reservation = reserveRandomOperator(state, String(body.nonce));
+      if (request.url === "/v1/operator-reservations") {
+        const reservation = reserveRandomOperator(state, String(body.nonce));
+        save();
+        writeJson(response, 201, { operator: reservation.operator });
+        return;
+      }
+
+      const quote = body.quote;
+      const nonce = String(quote?.nonce ?? "").toLowerCase();
+      const reservation = state.reservations?.[nonce];
+      if (!quote || !reservation) {
+        throw new Error("operator attestation does not match a live reservation");
+      }
+      const digest = await factory.quoteDigest(quote);
+      bindOperatorReservationQuote(state, nonce, quote.operator, digest);
       save();
-      writeJson(response, 201, { operator: reservation.operator });
+      const signature = keeper.signingKey.sign(digest).serialized;
+      writeJson(response, 200, { keeperSignature: signature });
     } catch (error) {
       console.error("operator reservation failed:", error instanceof Error ? error.message : error);
       writeJson(response, 400, { error: "operator reservation failed" });
@@ -191,13 +216,13 @@ async function registryAddress(registry, name) {
 }
 
 async function wire() {
-  const [componentsAddress, systemsAddress, onChainOperator] = await Promise.all([
+  const [componentsAddress, systemsAddress, onChainKeeper] = await Promise.all([
     world.components(),
     world.systems(),
-    market.operatorAddr(),
+    factory.keeper(),
   ]);
-  if (String(onChainOperator).toLowerCase() !== provisioner.address.toLowerCase()) {
-    throw new Error(`PROVISIONING_PRIVATE_KEY is not market operator ${onChainOperator}`);
+  if (String(onChainKeeper).toLowerCase() !== keeper.address.toLowerCase()) {
+    throw new Error(`KEEPER_PRIVATE_KEY is not factory keeper ${onChainKeeper}`);
   }
   const registryAbi = ["function getEntitiesWithValue(uint256) view returns (uint256[])"];
   const components = new Contract(componentsAddress, registryAbi, provider);
@@ -401,19 +426,19 @@ async function processJob(job) {
       save();
     }
     await walk(job, operator, podAccID);
-    await (await factory.connect(provisioner).markLeasePreparing(job.tokenIndex)).wait();
+    await (await factory.connect(keeper).markLeasePreparing(job.tokenIndex)).wait();
     return;
   }
 
   if (stage === 2) {
     if (actualAccID === marketAccID) {
-      await (await sendSystem.connect(provisioner).executeTyped(job.tokenIndex, operator.address)).wait();
+      await (await factory.connect(keeper).routePreparedKami(job.tokenIndex)).wait();
       return;
     }
     if (actualAccID !== podAccID) return;
     await ensureOperatorGas(job.tokenIndex, request, operator);
     await reconcileStrategy(job);
-    await (await factory.connect(provisioner).activateProvisionedLease(job.tokenIndex)).wait();
+    await (await factory.connect(keeper).activateProvisionedLease(job.tokenIndex)).wait();
     return;
   }
 
@@ -442,11 +467,26 @@ async function processJob(job) {
       return;
     }
     if (actualAccID === marketAccID) {
-      await (await sendSystem.connect(provisioner).executeTyped(job.tokenIndex, listing.owner)).wait();
+      await (await factory.connect(keeper).recoverPreparingFromHub(job.tokenIndex)).wait();
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
       await (await factory.connect(operator).finalizePreparingCancellation(job.tokenIndex)).wait();
+      job.returned = true;
+      purgeReturnedJobSecrets(job);
+      save();
+    }
+    return;
+  }
+
+  if (stage === 5) {
+    await stopStrategy(job);
+    if (actualAccID === podAccID) {
+      await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
+      return;
+    }
+    if (actualAccID === BigInt(listing.owner)) {
+      await (await factory.connect(keeper).finalizeGasRefund(job.tokenIndex)).wait();
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -504,7 +544,7 @@ async function tick() {
 await wire();
 await startReservationServer();
 console.log(`operator reservations listening on http://${RESERVATION_HOST}:${RESERVATION_PORT}`);
-console.log(`renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, operator ${provisioner.address}`);
+console.log(`renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, keeper ${keeper.address}`);
 for (;;) {
   const started = Date.now();
   await tick().catch((error) => console.error("tick failed:", error.message || error));

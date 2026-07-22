@@ -6,6 +6,8 @@ import {PersonalRentalPool} from "vault/PersonalRentalPool.sol";
 import {PersonalRentalVault} from "vault/PersonalRentalVault.sol";
 import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
 import {KamiLeaseMarket} from "vault/KamiLeaseMarket.sol";
+import {HubGuard} from "vault/HubGuard.sol";
+import {PersonalRentalPoolRegistry} from "vault/PersonalRentalPoolRegistry.sol";
 import {RenterRoomPodFactory} from "vault/RenterRoomPodFactory.sol";
 import {RoomPod} from "vault/RoomPod.sol";
 
@@ -19,11 +21,14 @@ contract PersonalRentalVaultTest is SetupTemplate {
     PersonalRentalVault vault;
     PersonalRentalPool pool;
     RenterRoomPodFactory renterPodFactory;
+    HubGuard hubGuard;
     address marketOperator;
+    address keeper;
     address lastPod;
     address lastPodOperator;
 
     uint256 constant PROVISIONING_SIGNER_KEY = 0xA11CE;
+    uint256 constant KEEPER_KEY = 0xB0B;
     uint128 constant SETUP_GAS = 0.001 ether;
     uint128 constant HUB_GAS = 0.0005 ether;
     uint128 constant OPERATING_GAS = 0.002 ether;
@@ -34,21 +39,27 @@ contract PersonalRentalVaultTest is SetupTemplate {
     function setUp() public override {
         super.setUp();
         marketOperator = vm.addr(PROVISIONING_SIGNER_KEY);
+        keeper = vm.addr(KEEPER_KEY);
 
         market = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, MUSU_INDEX);
+        renterPodFactory = new RenterRoomPodFactory(
+            world, address(market), vm.addr(PROVISIONING_SIGNER_KEY), keeper
+        );
+        hubGuard = new HubGuard(world, address(market), address(renterPodFactory));
+        PersonalRentalPoolRegistry registry = new PersonalRentalPoolRegistry(address(this));
+        marketOperator = address(hubGuard);
         market.initialize(marketOperator, "leasehub");
         market.setSettler(address(this));
         market.setMgmtAccount(charlie.id);
-        renterPodFactory = new RenterRoomPodFactory(
-            world, address(market), vm.addr(PROVISIONING_SIGNER_KEY)
-        );
         market.setLeaseFactory(address(renterPodFactory));
+        market.setPoolRegistry(address(registry));
         market.sealAdmin();
 
         PersonalRentalPool implementation = new PersonalRentalPool();
         factory = new PersonalRentalVaultFactory(
-            world, address(implementation), address(market), address(0)
+            world, address(implementation), address(market), address(0), address(registry)
         );
+        registry.setFactory(address(factory));
 
         vm.prank(alice.owner);
         vault = PersonalRentalVault(factory.createVault("Alice rental vault"));
@@ -106,27 +117,34 @@ contract PersonalRentalVaultTest is SetupTemplate {
         return abi.encodePacked(r, s, v);
     }
 
+    function _signKeeperAttestation(RenterRoomPodFactory.Quote memory quote) internal returns (bytes memory) {
+        bytes32 digest = renterPodFactory.quoteDigest(quote);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(KEEPER_KEY, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
     function _request(uint32 tokenIndex) internal returns (address podAddress) {
         lastPodOperator = _getNextUserAddress();
         RenterRoomPodFactory.Quote memory quote = _quote(tokenIndex, bob.owner, lastPodOperator);
         bytes memory signature = _signQuote(quote);
+        bytes memory keeperSignature = _signKeeperAttestation(quote);
         vm.deal(bob.owner, SETUP_GAS + HUB_GAS + OPERATING_GAS);
         vm.prank(bob.owner);
         podAddress = renterPodFactory.createPodAndRequestLease{
             value: SETUP_GAS + HUB_GAS + OPERATING_GAS
-        }(quote, signature);
+        }(quote, signature, keeperSignature);
         lastPod = podAddress;
     }
 
     function _accept(uint32 tokenIndex) internal {
         _request(tokenIndex);
-        vm.prank(vm.addr(PROVISIONING_SIGNER_KEY));
+        vm.prank(keeper);
         renterPodFactory.markLeasePreparing(tokenIndex);
         _fastForward(2 hours);
-        vm.prank(marketOperator);
-        _KamiSendSystem.executeTyped(tokenIndex, lastPodOperator);
+        vm.prank(keeper);
+        renterPodFactory.routePreparedKami(tokenIndex);
         _fastForward(2 hours);
-        vm.prank(vm.addr(PROVISIONING_SIGNER_KEY));
+        vm.prank(keeper);
         renterPodFactory.activateProvisionedLease(tokenIndex);
     }
 
@@ -151,12 +169,148 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(pool.operatorAddr(), address(pool));
         assertEq(pool.accID(), uint256(uint160(address(pool))));
         assertEq(factory.PLATFORM_FEE_BPS(), PLATFORM_BPS);
+        PersonalRentalPoolRegistry registry = PersonalRentalPoolRegistry(factory.poolRegistry());
+        assertEq(registry.installer(), address(0), "registry installer burned");
+        assertEq(registry.factory(), address(factory), "registry factory immutable");
+        assertTrue(registry.isPool(address(pool)), "pool registered by factory");
+        assertEq(registry.poolOwner(address(pool)), alice.owner, "beneficiary cached in registry");
 
         (bool factoryAdmin,) = address(factory).staticcall(abi.encodeWithSignature("admin()"));
         (bool vaultAdmin,) = address(vault).staticcall(abi.encodeWithSignature("admin()"));
         (bool poolAdmin,) = address(pool).staticcall(abi.encodeWithSignature("admin()"));
         (bool poolKeeper,) = address(pool).staticcall(abi.encodeWithSignature("keeper()"));
         assertFalse(factoryAdmin || vaultAdmin || poolAdmin || poolKeeper, "no hidden authority surface");
+    }
+
+    function testUnregisteredContractCannotPublishListing() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        vm.expectRevert(KamiLeaseMarket.InvalidPool.selector);
+        market.listKami(tokenIndex, OWNER_BPS, 0, 7 days, address(0));
+    }
+
+    function testQuoteSignerAndKeeperCannotOperateHubDirectly() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _request(tokenIndex);
+        vm.prank(keeper);
+        renterPodFactory.markLeasePreparing(tokenIndex);
+
+        vm.prank(vm.addr(PROVISIONING_SIGNER_KEY));
+        vm.expectRevert();
+        _KamiSendSystem.executeTyped(tokenIndex, bob.operator);
+
+        vm.prank(keeper);
+        vm.expectRevert();
+        _KamiSendSystem.executeTyped(tokenIndex, bob.operator);
+
+        vm.prank(bob.owner);
+        vm.expectRevert(HubGuard.NotFactory.selector);
+        hubGuard.routeToPendingPod(tokenIndex, lastPod);
+    }
+
+    function testQuoteSignerAloneCannotAuthorizeAttackerPodOperator() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        address attackerOperator = _getNextUserAddress();
+        RenterRoomPodFactory.Quote memory quote = _quote(tokenIndex, bob.owner, attackerOperator);
+        bytes memory quoteSignature = _signQuote(quote);
+        vm.deal(bob.owner, SETUP_GAS + HUB_GAS + OPERATING_GAS);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.BadQuote.selector);
+        renterPodFactory.createPodAndRequestLease{value: SETUP_GAS + HUB_GAS + OPERATING_GAS}(
+            quote,
+            quoteSignature,
+            quoteSignature
+        );
+    }
+
+    function testProvisioningNonceCannotAuthorizeTwoDifferentQuotes() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _request(tokenIndex);
+        bytes32 usedNonce = _quote(tokenIndex, bob.owner, lastPodOperator).nonce;
+        vm.prank(bob.owner);
+        renterPodFactory.cancelBeforeDispatch(tokenIndex);
+
+        address nextOperator = _getNextUserAddress();
+        RenterRoomPodFactory.Quote memory quote = _quote(tokenIndex, bob.owner, nextOperator);
+        quote.nonce = usedNonce;
+        quote.accountName = "rentertestpod2";
+        bytes memory quoteSignature = _signQuote(quote);
+        bytes memory keeperSignature = _signKeeperAttestation(quote);
+        vm.deal(bob.owner, SETUP_GAS + HUB_GAS + OPERATING_GAS);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.QuoteAlreadyUsed.selector);
+        renterPodFactory.createPodAndRequestLease{value: SETUP_GAS + HUB_GAS + OPERATING_GAS}(
+            quote,
+            quoteSignature,
+            keeperSignature
+        );
+    }
+
+    function testPreparingTimeoutReturnsOnlyToRecordedPool() public {
+        (uint256 kamiID, uint32 tokenIndex) = _listAndPublish();
+        _request(tokenIndex);
+        vm.prank(keeper);
+        renterPodFactory.markLeasePreparing(tokenIndex);
+        _fastForward(2 days + 1);
+
+        vm.prank(alice.owner);
+        renterPodFactory.requestPreparingCancellation(tokenIndex);
+        renterPodFactory.recoverPreparingFromHub(tokenIndex);
+
+        assertEq(LibKami.getAccount(components, kamiID), pool.accID());
+        assertEq(market.pendingRenter(tokenIndex), address(0));
+        (address renter,,,,,) = renterPodFactory.requests(tokenIndex);
+        assertEq(renter, address(0), "request cleared only after verified return");
+    }
+
+    function testAbandonedPreDispatchRequestCannotLockOwnerListingForever() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _request(tokenIndex);
+
+        vm.expectRevert(RenterRoomPodFactory.Grace.selector);
+        vm.prank(alice.owner);
+        renterPodFactory.cancelBeforeDispatch(tokenIndex);
+
+        _fastForward(2 days + 1);
+        uint256 renterBefore = bob.owner.balance;
+        vm.prank(alice.owner);
+        renterPodFactory.cancelBeforeDispatch(tokenIndex);
+
+        assertEq(bob.owner.balance, renterBefore + OPERATING_GAS, "refund remains renter-only");
+        assertEq(market.pendingRenter(tokenIndex), address(0), "listing unlocked");
+    }
+
+    function testActiveTimeoutRotatesToUniquePodRecoveryAndReturns() public {
+        (uint256 kamiID, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        _fastForward(1 days + 1);
+        market.endLease(tokenIndex);
+
+        vm.expectRevert(RenterRoomPodFactory.Grace.selector);
+        renterPodFactory.enterPodRecovery(tokenIndex);
+        _fastForward(2 days + 1);
+        renterPodFactory.enterPodRecovery(tokenIndex);
+
+        assertEq(
+            LibAccount.getOperator(components, RoomPod(lastPod).accID()),
+            lastPod,
+            "pod contract becomes its own unique recovery operator"
+        );
+        assertTrue(RoomPod(lastPod).recoveryMode());
+        assertTrue(renterPodFactory.stopRecoveryHarvest(tokenIndex));
+        renterPodFactory.prepareRecoveryReturn(tokenIndex);
+        renterPodFactory.returnRecoveredKami(tokenIndex);
+
+        assertEq(LibKami.getAccount(components, kamiID), pool.accID());
+        assertEq(market.leaseRenter(tokenIndex), address(0));
+        assertFalse(market.listings(tokenIndex).staked);
+    }
+
+    function testRenterCannotExtendWithoutAtomicGasTopUp() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        vm.prank(bob.owner);
+        vm.expectRevert(KamiLeaseMarket.NotFactory.selector);
+        market.extendLease(tokenIndex, 1 days);
     }
 
     function testFactoryRejectsUnsealedMarket() public {
@@ -166,7 +320,9 @@ contract PersonalRentalVaultTest is SetupTemplate {
         unsealed.setMgmtAccount(charlie.id);
         PersonalRentalPool implementation = new PersonalRentalPool();
         vm.expectRevert(PersonalRentalVaultFactory.MarketNotSealed.selector);
-        new PersonalRentalVaultFactory(world, address(implementation), address(unsealed), address(0));
+        new PersonalRentalVaultFactory(
+            world, address(implementation), address(unsealed), address(0), address(factory.poolRegistry())
+        );
     }
 
     function testFirstVaultAndPoolCanBeCreatedInOneOwnerTransaction() public {
@@ -232,21 +388,21 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(pendingStage, 1);
         assertEq(market.listings(tokenIndex).leaseStart, 0, "setup time is not rental time");
         assertEq(lastPodOperator.balance, SETUP_GAS, "renter funded pod walking gas");
-        assertEq(marketOperator.balance, HUB_GAS, "renter funded the hub shipping transaction");
+        assertEq(keeper.balance, HUB_GAS, "renter funded the constrained keeper transaction");
         assertEq(address(renterPodFactory).balance, OPERATING_GAS, "factory escrows renter farming gas");
         assertEq(address(market).balance, 0, "market never holds renter ETH");
 
-        vm.prank(vm.addr(PROVISIONING_SIGNER_KEY));
+        vm.prank(keeper);
         renterPodFactory.markLeasePreparing(tokenIndex);
         assertEq(LibKami.getAccount(components, kamiID), market.accID(), "preparing Kami reached hub");
         assertEq(market.listings(tokenIndex).leaseStart, 0, "clock remains stopped in transit");
 
         _fastForward(2 hours);
-        vm.prank(marketOperator);
-        _KamiSendSystem.executeTyped(tokenIndex, lastPodOperator);
+        vm.prank(keeper);
+        renterPodFactory.routePreparedKami(tokenIndex);
         _fastForward(2 hours);
         uint256 activatedAt = block.timestamp;
-        vm.prank(vm.addr(PROVISIONING_SIGNER_KEY));
+        vm.prank(keeper);
         renterPodFactory.activateProvisionedLease(tokenIndex);
 
         assertEq(LibKami.getAccount(components, kamiID), RoomPod(lastPod).accID(), "accepted Kami reached its pod");
@@ -326,6 +482,12 @@ contract PersonalRentalVaultTest is SetupTemplate {
         market.endLease(tokenIndex);
         market.finalizeLease(tokenIndex);
 
+        vm.prank(lastPodOperator);
+        _KamiSendSystem.executeTyped(tokenIndex, address(pool));
+
+        // Permissionless confirmation can be front-run without blocking the
+        // factory's later verified refund path.
+        market.confirmReturnedToPool(tokenIndex);
         uint256 before = bob.owner.balance;
         renterPodFactory.finalizeGasRefund(tokenIndex);
         assertEq(bob.owner.balance, before + OPERATING_GAS);
@@ -343,11 +505,12 @@ contract PersonalRentalVaultTest is SetupTemplate {
         uint256 renterBefore = bob.owner.balance;
         vm.prank(lastPodOperator);
         renterPodFactory.finalizeMarketLease(tokenIndex);
-        assertEq(bob.owner.balance, renterBefore + OPERATING_GAS, "unused operating gas returned");
+        assertEq(bob.owner.balance, renterBefore, "refund waits for verified pool return");
 
         vm.prank(lastPodOperator);
         _KamiSendSystem.executeTyped(tokenIndex, address(pool));
-        market.confirmReturnedToPool(tokenIndex);
+        renterPodFactory.finalizeGasRefund(tokenIndex);
+        assertEq(bob.owner.balance, renterBefore + OPERATING_GAS, "unused operating gas returned");
 
         KamiLeaseMarket.Listing memory listing = market.listings(tokenIndex);
         assertEq(LibKami.getAccount(components, kamiID), pool.accID());

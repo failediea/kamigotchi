@@ -19,9 +19,13 @@ import { LibEntityType } from "libraries/utils/LibEntityType.sol";
 import { Kami721 } from "tokens/Kami721.sol";
 
 interface IPersonalRentalCustody {
-  function vaultOwner() external view returns (address);
   function accID() external view returns (uint256);
   function releaseToMarket(uint32 tokenIndex) external;
+}
+
+interface IPersonalRentalPoolRegistry {
+  function isPool(address pool) external view returns (bool);
+  function poolOwner(address pool) external view returns (address);
 }
 
 interface IRenterRoomPod {
@@ -83,6 +87,7 @@ contract KamiLeaseMarket {
   uint32 public immutable payItem;
   address public admin;
   address public leaseFactory; // fixed before seal; permissionless renter-funded pod deployer
+  address public poolRegistry; // fixed before seal; append-only approved personal pools
 
   uint256 public accID; // the market's game account
   uint16 public mgmtBps; // platform fee, lower-only
@@ -91,6 +96,7 @@ contract KamiLeaseMarket {
   address public settler; // daily accounting + lease-finalization keeper
 
   mapping(uint32 => Listing) internal _listings; // by ERC721 token index
+  mapping(uint32 => address) internal _listingBeneficiary; // immutable cache; no settlement callbacks
   uint32[] public tokenIndices;
   mapping(uint32 => uint256) internal tokenPos; // tokenIndex => position+1
 
@@ -174,6 +180,7 @@ contract KamiLeaseMarket {
   error PendingLeaseExists();
   error NoPendingLease();
   error ProvisioningRequired();
+  error InvalidPool();
 
   ///////////////////
   // EVENTS
@@ -182,6 +189,7 @@ contract KamiLeaseMarket {
   event AdminSealed(address indexed formerAdmin);
   event SettlerSet(address newSettler);
   event LeaseFactorySet(address indexed leaseFactory);
+  event PoolRegistrySet(address indexed poolRegistry);
   event Listed(address indexed owner, uint32 indexed tokenIndex, uint16 ownerShareBps, uint128 minGasWei);
   event Delisted(address indexed owner, uint32 indexed tokenIndex);
   event Arrived(address indexed owner, uint32 indexed tokenIndex); // kami joined the pool
@@ -262,6 +270,7 @@ contract KamiLeaseMarket {
     require(settler != address(0), ZeroSettler());
     require(mgmtAccID != 0, MgmtAccountUnset());
     require(leaseFactory != address(0), NotFactory());
+    require(poolRegistry != address(0), InvalidPool());
     address formerAdmin = admin;
     admin = address(0);
     emit AdminSealed(formerAdmin);
@@ -278,6 +287,13 @@ contract KamiLeaseMarket {
     require(leaseFactory == address(0) && newFactory.code.length != 0, NotFactory());
     leaseFactory = newFactory;
     emit LeaseFactorySet(newFactory);
+  }
+
+  /// @notice Set exactly once during atomic deployment, before admin sealing.
+  function setPoolRegistry(address newRegistry) external onlyAdmin {
+    require(poolRegistry == address(0) && newRegistry.code.length != 0, InvalidPool());
+    poolRegistry = newRegistry;
+    emit PoolRegistrySet(newRegistry);
   }
 
   function setMgmtAccount(uint256 _mgmtAccID) external onlyAdmin {
@@ -315,7 +331,10 @@ contract KamiLeaseMarket {
     address reservedFor
   ) external {
     require(accID != 0, NotInit());
-    require(msg.sender.code.length != 0, ProvisioningRequired());
+    require(
+      poolRegistry != address(0) && IPersonalRentalPoolRegistry(poolRegistry).isPool(msg.sender),
+      InvalidPool()
+    );
     require(ownerShareBps <= 10000, ShareTooHigh());
     require(maxTermSecs >= MIN_TERM && maxTermSecs <= MAX_TERM, TermRails());
     require(_listings[tokenIndex].owner == address(0), AlreadyListed());
@@ -328,6 +347,9 @@ contract KamiLeaseMarket {
     );
     require(_isRestedFull(kamiID), NotRestedFull());
 
+    address beneficiary = IPersonalRentalPoolRegistry(poolRegistry).poolOwner(msg.sender);
+    require(beneficiary != address(0), InvalidPool());
+    _listingBeneficiary[tokenIndex] = beneficiary;
     _newListing(tokenIndex, kamiID, 0, false, ownerShareBps, minGasWei, maxTermSecs, reservedFor);
   }
 
@@ -425,8 +447,11 @@ contract KamiLeaseMarket {
     Listing storage l = _listings[tokenIndex];
     require(l.owner.code.length != 0, NotOwner());
     require(l.renter == address(0) && pendingRenter[tokenIndex] == address(0), Leased());
-    require(l.staked, NotInMarket());
     require(LibKami.getAccount(_comps(), l.kamiID) == IPersonalRentalCustody(l.owner).accID(), KamiNotHomeYet());
+    // Idempotent by design: this function is permissionless, so an unrelated
+    // caller must not be able to front-run the factory and wedge the renter's
+    // verified gas refund after the first successful confirmation.
+    if (!l.staked) return;
     l.staked = false;
     l.xpBase = LibExperience.get(_comps(), l.kamiID);
     emit PoolRestored(l.owner, tokenIndex);
@@ -553,7 +578,8 @@ contract KamiLeaseMarket {
   ///         The total term stays within the owner's maxTermSecs.
   function extendLease(uint32 tokenIndex, uint32 extraSecs) external {
     Listing storage l = _listings[tokenIndex];
-    require(l.renter != address(0) && (msg.sender == l.renter || msg.sender == leaseFactory), NotRenter());
+    require(msg.sender == leaseFactory, NotFactory());
+    require(l.renter != address(0), NotLeased());
     require(!l.ending, EndingNow());
     require(extraSecs != 0, TermRails());
     uint64 newEnd = l.leaseEnd + extraSecs;
@@ -654,7 +680,7 @@ contract KamiLeaseMarket {
       l.xpBase = xp;
       if (delta == 0) continue;
       totalDelta += delta;
-      mgmtAdd += _creditSplit(_beneficiary(l.owner), l.renter, l.ownerShareBps, delta);
+      mgmtAdd += _creditSplit(_listingBeneficiary[tokenIndices[i]], l.renter, l.ownerShareBps, delta);
     }
     mgmtAccrued += mgmtAdd;
     settleCursor = end;
@@ -740,7 +766,29 @@ contract KamiLeaseMarket {
   /// Rental Pool this is the pool's immutable owner; for legacy listings it is
   /// the listing owner itself.
   function listingBeneficiary(uint32 tokenIndex) external view returns (address) {
-    return _beneficiary(_listings[tokenIndex].owner);
+    return _listingBeneficiary[tokenIndex];
+  }
+
+  /// @notice Immutable Personal Rental Pool destination for custody recovery.
+  function listingPool(uint32 tokenIndex) external view returns (address) {
+    return _listings[tokenIndex].owner;
+  }
+
+  function listingKamiID(uint32 tokenIndex) external view returns (uint256) {
+    return _listings[tokenIndex].kamiID;
+  }
+
+  function listingKamiAccount(uint32 tokenIndex) external view returns (uint256) {
+    return LibKami.getAccount(_comps(), _listings[tokenIndex].kamiID);
+  }
+
+  /// @notice True only after an ending lease has exceeded its immutable grace
+  /// period. The renter factory uses this proof before destroying a live pod
+  /// operator and entering destination-constrained recovery mode.
+  function recoveryReady(uint32 tokenIndex) external view returns (bool) {
+    Listing storage l = _listings[tokenIndex];
+    return l.renter != address(0) && l.ending && endingAt[tokenIndex] != 0
+      && block.timestamp >= uint256(endingAt[tokenIndex]) + ENDING_GRACE;
   }
 
   /// @notice the market account's CURRENT operator — the KamiSend destination.
@@ -790,7 +838,7 @@ contract KamiLeaseMarket {
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
     if (delta == 0) return;
-    uint256 cut = _creditSplit(_beneficiary(l.owner), l.renter, l.ownerShareBps, delta);
+    uint256 cut = _creditSplit(_listingBeneficiary[tokenIndex], l.renter, l.ownerShareBps, delta);
     mgmtAccrued += cut;
     emit Settled(delta - cut, cut, delta);
   }
@@ -822,19 +870,11 @@ contract KamiLeaseMarket {
     delete tokenPos[tokenIndex];
     delete pendingRenter[tokenIndex];
     delete pendingPod[tokenIndex];
+    delete _listingBeneficiary[tokenIndex];
     delete _listings[tokenIndex];
     // A tail listing can be swapped into an already-processed slot. Rewind to
     // that slot; repeat visits are safe because settlement advances xpBase.
     if (settlementInProgress && removedIndex < settleCursor) settleCursor = removedIndex;
-  }
-
-  function _beneficiary(address listingOwner_) internal view returns (address) {
-    if (listingOwner_ == address(0) || listingOwner_.code.length == 0) return listingOwner_;
-    try IPersonalRentalCustody(listingOwner_).vaultOwner() returns (address owner_) {
-      return owner_ == address(0) ? listingOwner_ : owner_;
-    } catch {
-      return listingOwner_;
-    }
   }
 
   /// @dev the marketplace-readiness rule: RESTING and effectively at FULL HEALTH

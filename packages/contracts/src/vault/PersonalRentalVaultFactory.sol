@@ -7,6 +7,10 @@ import {LibClone} from "solady/utils/LibClone.sol";
 import {PersonalRentalPool} from "./PersonalRentalPool.sol";
 import {PersonalRentalVault} from "./PersonalRentalVault.sol";
 
+interface IPersonalRentalPoolRegistryWriter {
+    function registerPool(address pool, address owner) external;
+}
+
 interface ISealedRentalMarket {
     function world() external view returns (IWorld);
     function payItem() external view returns (uint32);
@@ -14,6 +18,7 @@ interface ISealedRentalMarket {
     function mgmtAccID() external view returns (uint256);
     function admin() external view returns (address);
     function leaseFactory() external view returns (address);
+    function poolRegistry() external view returns (address);
 }
 
 /**
@@ -34,6 +39,7 @@ contract PersonalRentalVaultFactory {
     address public immutable musuMarket;
     address public immutable vippMarket;
     uint256 public immutable platformAccID;
+    address public immutable poolRegistry;
 
     mapping(address => address) public vaultOf;
     mapping(address => bool) public isVault;
@@ -54,16 +60,23 @@ contract PersonalRentalVaultFactory {
         address indexed vault, address indexed pool, address indexed market, uint16 ownerShareBps, uint32 maxTermSecs
     );
 
-    constructor(IWorld _world, address _poolImplementation, address _musuMarket, address _vippMarket) {
+    constructor(
+        IWorld _world,
+        address _poolImplementation,
+        address _musuMarket,
+        address _vippMarket,
+        address _poolRegistry
+    ) {
         if (_poolImplementation.code.length == 0) revert InvalidImplementation();
         if (_musuMarket == address(0) && _vippMarket == address(0)) revert InvalidMarket();
+        if (_poolRegistry.code.length == 0) revert InvalidMarket();
 
         uint256 platform;
         if (_musuMarket != address(0)) {
-            platform = _validateMarket(_world, _musuMarket, MUSU_ITEM, 0);
+            platform = _validateMarket(_world, _musuMarket, MUSU_ITEM, 0, _poolRegistry);
         }
         if (_vippMarket != address(0)) {
-            platform = _validateMarket(_world, _vippMarket, VIPP_ITEM, platform);
+            platform = _validateMarket(_world, _vippMarket, VIPP_ITEM, platform, _poolRegistry);
         }
 
         world = _world;
@@ -71,6 +84,7 @@ contract PersonalRentalVaultFactory {
         musuMarket = _musuMarket;
         vippMarket = _vippMarket;
         platformAccID = platform;
+        poolRegistry = _poolRegistry;
     }
 
     function createVault(string calldata label) external returns (address vault) {
@@ -160,12 +174,19 @@ contract PersonalRentalVaultFactory {
             })
             );
         isPool[pool] = true;
+        IPersonalRentalPoolRegistryWriter(poolRegistry).registerPool(pool, vaultOwner);
         _pools.push(pool);
         PersonalRentalVault(vault).registerPoolFromFactory(pool, market, ownerShareBps, maxTermSecs);
         emit PoolDeployed(vault, pool, market, ownerShareBps, maxTermSecs);
     }
 
-    function _validateMarket(IWorld expectedWorld, address market, uint32 expectedItem, uint256 expectedPlatform)
+    function _validateMarket(
+        IWorld expectedWorld,
+        address market,
+        uint32 expectedItem,
+        uint256 expectedPlatform,
+        address expectedRegistry
+    )
         internal
         view
         returns (uint256 platform)
@@ -178,6 +199,7 @@ contract PersonalRentalVaultFactory {
         }
         if (candidate.admin() != address(0)) revert MarketNotSealed();
         if (candidate.leaseFactory().code.length == 0) revert InvalidMarket();
+        if (candidate.poolRegistry() != expectedRegistry) revert InvalidMarket();
         platform = candidate.mgmtAccID();
         if (platform == 0) revert PlatformMismatch();
         if (expectedPlatform != 0 && platform != expectedPlatform) revert PlatformMismatch();

@@ -56,6 +56,23 @@ export function claimOperatorReservation(state, nonce, expectedOperator) {
   return wallet.privateKey;
 }
 
+export function bindOperatorReservationQuote(state, nonce, expectedOperator, digest) {
+  initializeOperatorKeyState(state);
+  const key = requireNonce(nonce);
+  const reservation = state.reservations[key];
+  if (!reservation) throw new Error("RoomPod operator reservation is missing");
+  if (String(reservation.operator).toLowerCase() !== String(expectedOperator).toLowerCase()) {
+    throw new Error("operator attestation does not match the reservation");
+  }
+  const normalizedDigest = String(digest).toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(normalizedDigest)) throw new Error("invalid quote digest");
+  if (reservation.attestedDigest && reservation.attestedDigest !== normalizedDigest) {
+    throw new Error("reservation nonce is already bound to a different quote");
+  }
+  reservation.attestedDigest = normalizedDigest;
+  return normalizedDigest;
+}
+
 export function removeExpiredUnclaimedReservations(state, now = Date.now(), maxAgeMs = 24 * 60 * 60_000) {
   initializeOperatorKeyState(state);
   let removed = 0;

@@ -4,6 +4,7 @@ pragma solidity >=0.8.28;
 import {Script, console} from "forge-std/Script.sol";
 import {IWorld} from "solecs/interfaces/IWorld.sol";
 import {PersonalRentalPool} from "vault/PersonalRentalPool.sol";
+import {PersonalRentalPoolRegistry} from "vault/PersonalRentalPoolRegistry.sol";
 import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
 
 /**
@@ -14,6 +15,7 @@ import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
  *  WORLD_ADDR   Yominet World
  *  MUSU_MARKET  sealed KamiLeaseMarket with payItem=1 and mgmtBps=1000
  *  VIPP_MARKET  sealed KamiLeaseMarket with payItem=2 and mgmtBps=1000
+ *  POOL_REGISTRY sealed market registry whose installer is this deployment
  *
  * The deployer receives no role. Owners pay their own vault/pool deployment gas.
  */
@@ -22,11 +24,15 @@ contract DeployPersonalRentalVaultFactory is Script {
         IWorld world = IWorld(vm.envAddress("WORLD_ADDR"));
         address musuMarket = vm.envAddress("MUSU_MARKET");
         address vippMarket = vm.envAddress("VIPP_MARKET");
+        address poolRegistry = vm.envAddress("POOL_REGISTRY");
 
         vm.startBroadcast();
         PersonalRentalPool poolImplementation = new PersonalRentalPool();
         PersonalRentalVaultFactory factory =
-            new PersonalRentalVaultFactory(world, address(poolImplementation), musuMarket, vippMarket);
+            new PersonalRentalVaultFactory(
+                world, address(poolImplementation), musuMarket, vippMarket, poolRegistry
+            );
+        PersonalRentalPoolRegistry(poolRegistry).setFactory(address(factory));
         vm.stopBroadcast();
 
         console.log("PersonalRentalVaultFactory:", address(factory));

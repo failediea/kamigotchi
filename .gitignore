@@ -3,8 +3,22 @@ dist/
 .parcel-cache
 .eslintcache
 .env
+.env.*
+!.env.example
 .DS_STORE
  
 .claude
 CLAUDE.md
 **/.serena
+
+# Never stage automation custody material or private deployment output. Public
+# address-only manifests must use the explicit *.public.json suffix.
+tools/**/pods.json
+tools/**/*credentials*.json
+tools/**/*secrets*.json
+tools/**/*worker-state*.json
+tools/**/*deployment*.json
+!tools/**/*deployment.public.json
+tools/**/*.pem
+tools/**/*.key
+tools/**/*.log

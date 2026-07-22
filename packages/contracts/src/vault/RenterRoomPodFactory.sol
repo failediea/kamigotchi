@@ -5,11 +5,15 @@ import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
 import {IWorld} from "solecs/interfaces/IWorld.sol";
 
 import {LibAccount} from "libraries/LibAccount.sol";
+import {HubGuard} from "./HubGuard.sol";
 import {RoomPod} from "./RoomPod.sol";
 
 interface IRenterFundedLeaseMarket {
     function payItem() external view returns (uint32);
     function operatorAddr() external view returns (address);
+    function pendingRenter(uint32 tokenIndex) external view returns (address);
+    function listingKamiAccount(uint32 tokenIndex) external view returns (uint256);
+    function recoveryReady(uint32 tokenIndex) external view returns (bool);
     function reserveProvisionedLease(
         address renter,
         uint32 tokenIndex,
@@ -25,6 +29,7 @@ interface IRenterFundedLeaseMarket {
     function setPrefs(uint32 tokenIndex, string calldata prefs) external;
     function extendLease(uint32 tokenIndex, uint32 extraSecs) external;
     function finalizeLease(uint32 tokenIndex) external;
+    function confirmReturnedToPool(uint32 tokenIndex) external;
 }
 
 interface IRenterFundedRoomPod {
@@ -37,13 +42,13 @@ interface IRenterFundedRoomPod {
  *
  * The renter's single checkout transaction deploys the selected RoomPod and
  * supplies both setup gas and a refundable operating budget. The immutable
- * provisioning signer can advance only the constrained setup state machine;
- * it cannot withdraw ETH, redirect a Kami, rotate an operator, change terms,
- * upgrade, pause or administer either this factory or a deployed RoomPod.
+ * quote signer approves terms while the separately hosted immutable keeper
+ * attests the reserved random pod operator and advances the constrained setup
+ * state machine. Neither can redirect a Kami or administer the contracts.
  *
- * The factory is each RoomPod's nominal admin but intentionally exposes no
- * forwarding or rotation function, permanently sealing the operator selected
- * in the renter-signed quote.
+ * The factory is each RoomPod's nominal admin only so a provable timeout can
+ * irreversibly rotate that pod to its own constrained recovery surface. No
+ * arbitrary replacement operator or destination is accepted.
  */
 contract RenterRoomPodFactory {
     using ECDSA for bytes32;
@@ -52,7 +57,12 @@ contract RenterRoomPodFactory {
     uint8 internal constant PREPARING = 2;
     uint8 internal constant ACTIVE = 3;
     uint8 internal constant CANCEL_REQUESTED = 4;
+    uint8 internal constant FINALIZED = 5;
+    uint8 internal constant RECOVERY_PREPARING = 6;
+    uint8 internal constant RECOVERY_ACTIVE = 7;
+    uint8 internal constant RECOVERY_RETURN = 8;
     uint64 public constant PREPARING_GRACE = 2 days;
+    uint64 public constant FINALIZED_GRACE = 2 days;
 
     struct Quote {
         address renter;
@@ -82,9 +92,11 @@ contract RenterRoomPodFactory {
 
     IWorld public immutable world;
     IRenterFundedLeaseMarket public immutable market;
-    address public immutable provisioningSigner;
+    address public immutable quoteSigner;
+    address public immutable keeper;
 
     mapping(bytes32 => bool) public quoteUsed;
+    mapping(bytes32 => bool) public nonceUsed;
     mapping(uint32 => Request) public requests;
     mapping(uint32 => string) internal _prefs;
     mapping(uint32 => address) public latestPodForKami;
@@ -129,9 +141,13 @@ contract RenterRoomPodFactory {
     event GasToppedUp(uint32 indexed tokenIndex, address indexed renter, uint256 amount);
     event GasRefunded(uint32 indexed tokenIndex, address indexed renter, uint256 amount);
     event EthOwed(address indexed renter, uint256 amount);
+    event PreparedKamiRouted(uint32 indexed tokenIndex, address indexed pod);
+    event PodRecoveryEntered(uint32 indexed tokenIndex, address indexed pod, uint8 priorStage);
+    event RecoveryReadyToReturn(uint32 indexed tokenIndex, address indexed pod);
+    event RecoveredKamiReturned(uint32 indexed tokenIndex, address indexed pod);
 
-    modifier onlyProvisioner() {
-        if (msg.sender != provisioningSigner) revert NotProvisioner();
+    modifier onlyKeeper() {
+        if (msg.sender != keeper) revert NotProvisioner();
         _;
     }
 
@@ -142,24 +158,27 @@ contract RenterRoomPodFactory {
         locked = 1;
     }
 
-    constructor(IWorld _world, address _market, address _provisioningSigner) {
-        if (_market.code.length == 0 || _provisioningSigner == address(0)) revert BadQuote();
+    constructor(IWorld _world, address _market, address _quoteSigner, address _keeper) {
+        if (
+            _market.code.length == 0 || _quoteSigner == address(0) || _keeper == address(0)
+                || _quoteSigner == _keeper
+        ) revert BadQuote();
         world = _world;
         market = IRenterFundedLeaseMarket(_market);
-        // The quote signer is also the market's tightly scoped automation EOA.
-        // Renter-paid hubGas therefore funds prepare, one constrained hub send,
-        // and activation without introducing another privileged wallet.
-        if (market.operatorAddr() != _provisioningSigner) revert BadQuote();
-        provisioningSigner = _provisioningSigner;
+        quoteSigner = _quoteSigner;
+        keeper = _keeper;
     }
 
-    function createPodAndRequestLease(Quote calldata quote, bytes calldata signature)
+    function createPodAndRequestLease(
+        Quote calldata quote,
+        bytes calldata quoteSignature,
+        bytes calldata keeperSignature
+    )
         external
         payable
         nonReentrant
         returns (address pod)
     {
-        _clearEndedRequest(quote.tokenIndex);
         if (requests[quote.tokenIndex].renter != address(0)) revert ActiveRequest();
         if (quote.renter != msg.sender || quote.operator == address(0)) revert BadQuote();
         if (block.timestamp > quote.deadline) revert ExpiredQuote();
@@ -169,11 +188,15 @@ contract RenterRoomPodFactory {
         ) revert BadPayment();
 
         bytes32 digest = quoteDigest(quote);
-        if (quoteUsed[digest]) revert QuoteAlreadyUsed();
-        if (digest.recover(signature) != provisioningSigner) revert BadQuote();
+        if (quoteUsed[digest] || nonceUsed[quote.nonce]) revert QuoteAlreadyUsed();
+        if (digest.recover(quoteSignature) != quoteSigner || digest.recover(keeperSignature) != keeper) {
+            revert BadQuote();
+        }
         quoteUsed[digest] = true;
+        nonceUsed[quote.nonce] = true;
 
         RoomPod created = new RoomPod(world, address(market), quote.nodeIndex, quote.label, market.payItem());
+        created.bindLease(quote.tokenIndex);
         created.initialize(quote.operator, quote.accountName);
         pod = address(created);
 
@@ -194,7 +217,7 @@ contract RenterRoomPodFactory {
             if (!funded) revert OperatorFundingFailed();
         }
         if (quote.hubGasWei != 0) {
-            (bool funded,) = market.operatorAddr().call{value: quote.hubGasWei}("");
+            (bool funded,) = keeper.call{value: quote.hubGasWei}("");
             if (!funded) revert OperatorFundingFailed();
         }
 
@@ -222,7 +245,7 @@ contract RenterRoomPodFactory {
 
     /// @notice Called by the fixed Kamibots provisioner after registration and
     /// walking succeed. Custody moves owner pool -> hub; paid time is still zero.
-    function markLeasePreparing(uint32 tokenIndex) external onlyProvisioner nonReentrant {
+    function markLeasePreparing(uint32 tokenIndex) external onlyKeeper nonReentrant {
         Request storage request = requests[tokenIndex];
         if (request.stage != REQUESTED) revert BadStage();
         market.prepareProvisionedLease(tokenIndex);
@@ -230,10 +253,19 @@ contract RenterRoomPodFactory {
         emit LeasePreparing(tokenIndex, request.pod);
     }
 
+    /// @notice After the pool-to-hub send cooldown, the keeper asks the sealed
+    /// HubGuard to route only to this request's exact RoomPod.
+    function routePreparedKami(uint32 tokenIndex) external onlyKeeper nonReentrant {
+        Request storage request = requests[tokenIndex];
+        if (request.stage != PREPARING) revert BadStage();
+        HubGuard(market.operatorAddr()).routeToPendingPod(tokenIndex, request.pod);
+        emit PreparedKamiRouted(tokenIndex, request.pod);
+    }
+
     /// @notice Called only after the Kami is in this request's exact RoomPod and
     /// Kamibots is ready. The market independently verifies arrival, then starts
     /// the paid term.
-    function activateProvisionedLease(uint32 tokenIndex) external onlyProvisioner nonReentrant {
+    function activateProvisionedLease(uint32 tokenIndex) external onlyKeeper nonReentrant {
         Request storage request = requests[tokenIndex];
         if (request.stage != PREPARING) revert BadStage();
         market.activateProvisionedLease(tokenIndex, _prefs[tokenIndex], request.termSecs);
@@ -241,12 +273,17 @@ contract RenterRoomPodFactory {
         emit LeaseActivated(tokenIndex, request.renter, request.pod);
     }
 
-    /// @notice Before custody moves, the renter can cancel and recover every
-    /// unused operating-gas wei. Deployment/setup gas was already consumed.
+    /// @notice Before custody moves, the renter can cancel immediately. After
+    /// the setup grace, anyone can clear an abandoned reservation so a renter
+    /// cannot lock an owner's listing forever. Every unused operating-gas wei
+    /// still refunds only to the recorded renter.
     function cancelBeforeDispatch(uint32 tokenIndex) external nonReentrant {
         Request storage request = requests[tokenIndex];
-        if (request.renter != msg.sender) revert NotRenter();
         if (request.stage != REQUESTED) revert BadStage();
+        if (
+            request.renter != msg.sender
+                && block.timestamp < uint256(request.requestedAt) + PREPARING_GRACE
+        ) revert Grace();
         market.cancelProvisionedLease(tokenIndex);
         _refundAndClear(tokenIndex, false);
     }
@@ -256,7 +293,6 @@ contract RenterRoomPodFactory {
     /// to its recorded Personal Rental Pool; it cannot redirect it.
     function requestPreparingCancellation(uint32 tokenIndex) external {
         Request storage request = requests[tokenIndex];
-        if (request.renter != msg.sender) revert NotRenter();
         if (request.stage != PREPARING) revert BadStage();
         if (block.timestamp < uint256(request.requestedAt) + PREPARING_GRACE) revert Grace();
         request.stage = CANCEL_REQUESTED;
@@ -270,6 +306,76 @@ contract RenterRoomPodFactory {
         if (request.stage != CANCEL_REQUESTED) revert BadStage();
         market.cancelProvisionedLease(tokenIndex);
         _refundAndClear(tokenIndex, false);
+    }
+
+    /// @notice Recover a PREPARING Kami that is still in the sealed hub. The
+    /// destination is read from the market; callers cannot supply one.
+    function recoverPreparingFromHub(uint32 tokenIndex) external nonReentrant {
+        Request storage request = requests[tokenIndex];
+        if (request.stage != CANCEL_REQUESTED) revert BadStage();
+        HubGuard(market.operatorAddr()).returnPendingToPool(tokenIndex);
+        market.cancelProvisionedLease(tokenIndex);
+        _refundAndClear(tokenIndex, false);
+    }
+
+    /// @notice Irreversibly rotate a timed-out pod to its own recovery contract
+    /// address. This destroys the Kamibots EOA's authority for this pod only.
+    function enterPodRecovery(uint32 tokenIndex) external nonReentrant {
+        Request storage request = requests[tokenIndex];
+        uint8 priorStage = request.stage;
+        if (priorStage == CANCEL_REQUESTED) {
+            // The renter already waited PREPARING_GRACE before reaching this stage.
+        } else if (priorStage == ACTIVE) {
+            // If market finalization already happened through its independent
+            // timeout path, pod custody should become recoverable immediately.
+            if (
+                market.leaseRenter(tokenIndex) == request.renter
+                    && !market.recoveryReady(tokenIndex)
+            ) revert Grace();
+        } else if (priorStage == FINALIZED) {
+            if (block.timestamp < uint256(request.requestedAt) + FINALIZED_GRACE) revert Grace();
+        } else {
+            revert BadStage();
+        }
+        if (market.listingKamiAccount(tokenIndex) != IRenterFundedRoomPod(request.pod).accID()) {
+            revert BadStage();
+        }
+        RoomPod(request.pod).enterRecoveryMode();
+        request.stage = priorStage == CANCEL_REQUESTED ? RECOVERY_PREPARING : RECOVERY_ACTIVE;
+        emit PodRecoveryEntered(tokenIndex, request.pod, priorStage);
+    }
+
+    function stopRecoveryHarvest(uint32 tokenIndex) external nonReentrant returns (bool stopped) {
+        Request storage request = requests[tokenIndex];
+        if (request.stage != RECOVERY_PREPARING && request.stage != RECOVERY_ACTIVE) revert BadStage();
+        stopped = RoomPod(request.pod).stopHarvestForRecovery();
+    }
+
+    /// @notice Sweep and finalize accounting before allowing the constrained
+    /// return. If the Kami is still harvesting, market finalization reverts and
+    /// the caller retries stopRecoveryHarvest after its cooldown.
+    function prepareRecoveryReturn(uint32 tokenIndex) external nonReentrant {
+        Request storage request = requests[tokenIndex];
+        if (request.stage != RECOVERY_PREPARING && request.stage != RECOVERY_ACTIVE) revert BadStage();
+        RoomPod(request.pod).sweepMusu();
+        if (request.stage == RECOVERY_ACTIVE && market.leaseRenter(tokenIndex) == request.renter) {
+            market.finalizeLease(tokenIndex);
+        }
+        request.stage = RECOVERY_RETURN;
+        emit RecoveryReadyToReturn(tokenIndex, request.pod);
+    }
+
+    /// @notice Permissionless final recovery step. RoomPod hardcodes the exact
+    /// registered pool; the market then independently verifies arrival.
+    function returnRecoveredKami(uint32 tokenIndex) external nonReentrant {
+        Request storage request = requests[tokenIndex];
+        if (request.stage != RECOVERY_RETURN) revert BadStage();
+        RoomPod(request.pod).returnKamiToPool();
+        if (market.pendingRenter(tokenIndex) != address(0)) market.cancelProvisionedLease(tokenIndex);
+        else market.confirmReturnedToPool(tokenIndex);
+        address pod = request.pod;
+        _refundAndClear(tokenIndex, true);
+        emit RecoveredKamiReturned(tokenIndex, pod);
     }
 
     /// @notice The exact on-chain RoomPod operator may pull only this lease's
@@ -331,7 +437,12 @@ contract RenterRoomPodFactory {
     /// remaining operating-budget refund to the recorded renter.
     function finalizeGasRefund(uint32 tokenIndex) external nonReentrant {
         Request storage request = requests[tokenIndex];
-        if (request.stage != ACTIVE || market.leaseRenter(tokenIndex) == request.renter) revert BadStage();
+        if (request.stage == ACTIVE && market.leaseRenter(tokenIndex) != request.renter) {
+            request.stage = FINALIZED;
+            request.requestedAt = uint64(block.timestamp);
+        }
+        if (request.stage != FINALIZED || market.leaseRenter(tokenIndex) == request.renter) revert BadStage();
+        market.confirmReturnedToPool(tokenIndex);
         _refundAndClear(tokenIndex, true);
     }
 
@@ -342,7 +453,8 @@ contract RenterRoomPodFactory {
         Request storage request = requests[tokenIndex];
         if (request.stage != ACTIVE || msg.sender != _operator(request.pod)) revert NotOperator();
         market.finalizeLease(tokenIndex);
-        _refundAndClear(tokenIndex, true);
+        request.stage = FINALIZED;
+        request.requestedAt = uint64(block.timestamp);
     }
 
     function claimEth() external nonReentrant {
@@ -390,13 +502,6 @@ contract RenterRoomPodFactory {
 
     function numPods() external view returns (uint256) {
         return _pods.length;
-    }
-
-    function _clearEndedRequest(uint32 tokenIndex) internal {
-        Request storage request = requests[tokenIndex];
-        if (request.stage == ACTIVE && market.leaseRenter(tokenIndex) != request.renter) {
-            _refundAndClear(tokenIndex, true);
-        }
     }
 
     function _refundAndClear(uint32 tokenIndex, bool ended) internal {
