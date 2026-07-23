@@ -319,9 +319,11 @@ contract PersonalRentalVaultTest is SetupTemplate {
         unsealed.setSettler(address(this));
         unsealed.setMgmtAccount(charlie.id);
         PersonalRentalPool implementation = new PersonalRentalPool();
+        // resolve the registry BEFORE expectRevert: the staticcall would consume it
+        address poolRegistry = address(factory.poolRegistry());
         vm.expectRevert(PersonalRentalVaultFactory.MarketNotSealed.selector);
         new PersonalRentalVaultFactory(
-            world, address(implementation), address(unsealed), address(0), address(factory.poolRegistry())
+            world, address(implementation), address(unsealed), address(0), poolRegistry
         );
     }
 
@@ -582,10 +584,12 @@ contract PersonalRentalVaultTest is SetupTemplate {
     }
 
     function testSettlementRejectsUnboundedCallerInput() public {
+        // resolve the bound BEFORE expectRevert: the staticcall would consume it
+        uint256 tooMany = market.MAX_SETTLE_BATCH() + 1;
         vm.expectRevert(KamiLeaseMarket.BadBatch.selector);
         market.settleBatch(0);
         vm.expectRevert(KamiLeaseMarket.BadBatch.selector);
-        market.settleBatch(market.MAX_SETTLE_BATCH() + 1);
+        market.settleBatch(tooMany);
     }
 
     function testReturnGoesToPersonalPoolThenOwnerCanWithdraw() public {

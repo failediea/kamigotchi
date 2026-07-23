@@ -7,6 +7,7 @@ import {IUint256Component as IUintComp} from "solecs/interfaces/IUint256Componen
 
 import {LibConfig} from "libraries/LibConfig.sol";
 import {Kami721} from "tokens/Kami721.sol";
+import {BatchLease} from "vault/BatchLease.sol";
 import {HubGuard} from "vault/HubGuard.sol";
 import {KamiLeaseMarket} from "vault/KamiLeaseMarket.sol";
 import {PersonalRentalPool} from "vault/PersonalRentalPool.sol";
@@ -80,6 +81,8 @@ contract DeployDualKamiLeaseMarket is Script {
             address(registry)
         );
         registry.setFactory(address(personalVaultFactory));
+        BatchLease musuBatchLease = new BatchLease(musuRenterFactory);
+        BatchLease vippBatchLease = new BatchLease(vippRenterFactory);
         vm.stopBroadcast();
 
         require(musuMarket.admin() == address(0) && vippMarket.admin() == address(0), "market admin live");
@@ -92,6 +95,8 @@ contract DeployDualKamiLeaseMarket is Script {
         console.log("VIPP HubGuard:", address(vippHubGuard));
         console.log("Pool registry:", address(registry));
         console.log("Personal vault factory:", address(personalVaultFactory));
+        console.log("MUSU BatchLease:", address(musuBatchLease));
+        console.log("VIPP BatchLease:", address(vippBatchLease));
     }
 
     function _configureAndSeal(

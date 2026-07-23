@@ -169,6 +169,11 @@ contract RenterRoomPodFactory {
         keeper = _keeper;
     }
 
+    /// @notice Any submitter may fund a dual-signed quote; pod ownership,
+    /// refunds, cancel rights, and market attribution always follow the signed
+    /// quote.renter, so a batching periphery gains nothing by being msg.sender.
+    /// The zero-renter check preserves requests[].renter as the liveness
+    /// sentinel that ActiveRequest relies on.
     function createPodAndRequestLease(
         Quote calldata quote,
         bytes calldata quoteSignature,
@@ -180,7 +185,7 @@ contract RenterRoomPodFactory {
         returns (address pod)
     {
         if (requests[quote.tokenIndex].renter != address(0)) revert ActiveRequest();
-        if (quote.renter != msg.sender || quote.operator == address(0)) revert BadQuote();
+        if (quote.renter == address(0) || quote.operator == address(0)) revert BadQuote();
         if (block.timestamp > quote.deadline) revert ExpiredQuote();
         if (
             msg.value
@@ -201,7 +206,7 @@ contract RenterRoomPodFactory {
         pod = address(created);
 
         requests[quote.tokenIndex] = Request({
-            renter: msg.sender,
+            renter: quote.renter,
             pod: pod,
             gasBudget: quote.operatingGasWei,
             termSecs: quote.termSecs,
@@ -222,7 +227,7 @@ contract RenterRoomPodFactory {
         }
 
         market.reserveProvisionedLease(
-            msg.sender,
+            quote.renter,
             quote.tokenIndex,
             pod,
             quote.prefs,
@@ -230,8 +235,15 @@ contract RenterRoomPodFactory {
             quote.termSecs
         );
 
+        _emitCreated(quote, pod);
+    }
+
+    /// @dev Hoisted out of createPodAndRequestLease: emitting the 9-field event
+    /// inline exceeds legacy codegen's stack there (the repo's test profile
+    /// compiles without via-IR).
+    function _emitCreated(Quote calldata quote, address pod) private {
         emit RenterPodCreated(
-            msg.sender,
+            quote.renter,
             quote.tokenIndex,
             quote.nodeIndex,
             pod,

@@ -254,8 +254,10 @@ contract RoomPodTest is SetupTemplate {
     vippMarket.initialize(_getNextUserAddress(), "vipphub");
     RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
     vippPod.initialize(_getNextUserAddress(), "vipppod");
+    vm.startPrank(deployer);
     LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
     LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, TRANSFER_FEE);
+    vm.stopPrank();
 
     uint256 swept = vippPod.sweepMusu();
     assertEq(swept, 1_000, "VIPP proceeds are not reduced by a MUSU-denominated fee");
@@ -270,7 +272,9 @@ contract RoomPodTest is SetupTemplate {
     vippMarket.initialize(_getNextUserAddress(), "vipphub2");
     RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
     vippPod.initialize(_getNextUserAddress(), "vipppod2");
+    vm.startPrank(deployer);
     LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
+    vm.stopPrank();
 
     assertEq(vippPod.sweepMusu(), 0, "cannot pay the game's MUSU transfer fee");
     assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), vippIndex), 1_000);
