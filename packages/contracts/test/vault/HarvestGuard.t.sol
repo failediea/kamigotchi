@@ -30,6 +30,8 @@ contract HarvestGuardTest is SetupTemplate {
   uint32 constant POD_NODE = 1;
 
   function setUp() public override {
+    // LEGACY SUITE — v13 direct-listing API (see KamiLeaseMarket.t.sol note).
+    // All 5 tests die on InvalidPool under the v15 pool-registry market.
     vm.skip(true);
     super.setUp();
 

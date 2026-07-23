@@ -31,6 +31,11 @@ contract KamiLeaseMarketTest is SetupTemplate {
   uint128 constant MIN_GAS = 0.01 ether;
 
   function setUp() public override {
+    // LEGACY SUITE — written for the v13 direct-listing API. The v15 market
+    // only accepts listings from registered PersonalRentalPools, so 29/30 of
+    // these tests die on InvalidPool before reaching what they assert.
+    // The live flows are covered by PersonalRentalVault.t.sol (27 tests) and
+    // BatchLease.t.sol; rewriting this suite around pool custody is pending.
     vm.skip(true);
     super.setUp();
 

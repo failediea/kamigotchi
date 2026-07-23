@@ -184,13 +184,54 @@ contract RenterRoomPodFactory {
         nonReentrant
         returns (address pod)
     {
+        if (msg.value != _quoteFunding(quote)) revert BadPayment();
+        pod = _createPodAndRequestLease(quote, quoteSignature, keeperSignature);
+    }
+
+    /// @notice Fund several dual-signed quotes in ONE transaction — native
+    /// batching for wallets without EIP-5792, no periphery contract needed.
+    /// msg.value must equal the sum of every quote's funding; any failure
+    /// reverts the whole batch. The sum is checked before any pod deploys so
+    /// escrowed budgets of other leases can never even transiently back an
+    /// underfunded batch.
+    function createPodsAndRequestLeases(
+        Quote[] calldata quotes,
+        bytes[] calldata quoteSignatures,
+        bytes[] calldata keeperSignatures
+    )
+        external
+        payable
+        nonReentrant
+        returns (address[] memory pods)
+    {
+        uint256 n = quotes.length;
+        if (n == 0 || quoteSignatures.length != n || keeperSignatures.length != n) revert BadQuote();
+        uint256 total;
+        for (uint256 i; i < n; ++i) {
+            total += _quoteFunding(quotes[i]);
+        }
+        if (msg.value != total) revert BadPayment();
+        pods = new address[](n);
+        for (uint256 i; i < n; ++i) {
+            pods[i] = _createPodAndRequestLease(quotes[i], quoteSignatures[i], keeperSignatures[i]);
+        }
+    }
+
+    function _quoteFunding(Quote calldata quote) internal pure returns (uint256) {
+        return uint256(quote.setupGasWei) + uint256(quote.hubGasWei) + uint256(quote.operatingGasWei);
+    }
+
+    function _createPodAndRequestLease(
+        Quote calldata quote,
+        bytes calldata quoteSignature,
+        bytes calldata keeperSignature
+    )
+        internal
+        returns (address pod)
+    {
         if (requests[quote.tokenIndex].renter != address(0)) revert ActiveRequest();
         if (quote.renter == address(0) || quote.operator == address(0)) revert BadQuote();
         if (block.timestamp > quote.deadline) revert ExpiredQuote();
-        if (
-            msg.value
-                != uint256(quote.setupGasWei) + uint256(quote.hubGasWei) + uint256(quote.operatingGasWei)
-        ) revert BadPayment();
 
         bytes32 digest = quoteDigest(quote);
         if (quoteUsed[digest] || nonceUsed[quote.nonce]) revert QuoteAlreadyUsed();
