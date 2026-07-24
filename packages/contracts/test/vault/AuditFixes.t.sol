@@ -13,6 +13,11 @@ import {PersonalRentalVault} from "vault/PersonalRentalVault.sol";
 import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
 import {RenterRoomPodFactory} from "vault/RenterRoomPodFactory.sol";
 import {RoomPod} from "vault/RoomPod.sol";
+import {PodRecoveryOperator} from "vault/PodRecoveryOperator.sol";
+import {
+    AccountSetOperatorSystem,
+    ID as AccountSetOperatorSystemID
+} from "systems/AccountSetOperatorSystem.sol";
 
 /**
  * Regressions for the 2026-07-24 security review.
@@ -261,6 +266,64 @@ contract AuditFixesTest is SetupTemplate {
         uint256 gross = 10_000;
         uint256 net = gross - (gross * PLATFORM_BPS) / 10_000;
         assertEq(market.owedMusu(alice.owner) - ownerBefore, net, "whole net goes to the owner");
+    }
+
+    /////////////////
+    // FINDING 1 — the recovery rotation must survive an operator squat
+
+    function testRecoveryRotationIsRetryableWhenSquatted() public {
+        uint32 tokenIndex = _listKami();
+        _submit(_quote(tokenIndex, bob.owner, "squatpod"));
+        vm.prank(keeper);
+        podFactory.markLeasePreparing(tokenIndex);
+        vm.prank(keeper);
+        podFactory.routePreparedKami(tokenIndex);
+        vm.prank(keeper);
+        podFactory.activateProvisionedLease(tokenIndex);
+        (, address podAddr,,,,) = podFactory.requests(tokenIndex);
+
+        // the attack: claim the address the pod WOULD have rotated to. Under the
+        // old code this address was address(pod) itself and one claim killed
+        // recovery permanently.
+        bytes32 squattedSalt = bytes32(uint256(1));
+        address doomed = _predictOperator(podAddr, squattedSalt);
+        // resolve BEFORE the prank: getAddrByID staticcalls the world, which would
+        // otherwise consume it and run the rotation as the test contract
+        AccountSetOperatorSystem setOp = AccountSetOperatorSystem(
+            getAddrByID(world.systems(), AccountSetOperatorSystemID)
+        );
+        // the account OWNER rotates their operator; this is a one-tx, permissionless
+        // claim on any unclaimed address in the game's global namespace
+        vm.prank(charlie.owner);
+        setOp.executeTyped(doomed);
+        assertEq(LibAccount.getByOperator(components, doomed), charlie.id, "address squatted");
+
+        _fastForward(9 days);
+        market.endLease(tokenIndex);
+        _fastForward(2 days + 1);
+
+        // the squatted salt fails — but it reverts atomically, burning no state
+        vm.expectRevert();
+        podFactory.enterPodRecovery(tokenIndex, squattedSalt);
+        (,,,,, uint8 stageAfterFail) = podFactory.requests(tokenIndex);
+        assertEq(stageAfterFail, 3, "still ACTIVE: a failed attempt costs nothing");
+        assertFalse(RoomPod(podAddr).recoveryMode(), "recovery not entered");
+
+        // and any other salt simply works: the squat is a nuisance, not a kill
+        podFactory.enterPodRecovery(tokenIndex, bytes32(uint256(2)));
+        assertTrue(RoomPod(podAddr).recoveryMode(), "recovery entered on retry");
+        assertEq(
+            LibAccount.getOperator(components, RoomPod(podAddr).accID()),
+            RoomPod(podAddr).recoveryOperator(),
+            "pod is driven by its own fresh operator"
+        );
+    }
+
+    function _predictOperator(address pod, bytes32 salt) internal pure returns (address) {
+        bytes32 initHash = keccak256(type(PodRecoveryOperator).creationCode);
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), pod, salt, initHash))))
+        );
     }
 
     /// raise the kami's XP so the next settle sees a delta, without harvesting

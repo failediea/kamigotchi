@@ -389,9 +389,12 @@ contract RenterRoomPodFactory {
         _refundAndClear(tokenIndex, false);
     }
 
-    /// @notice Irreversibly rotate a timed-out pod to its own recovery contract
-    /// address. This destroys the Kamibots EOA's authority for this pod only.
-    function enterPodRecovery(uint32 tokenIndex) external nonReentrant {
+    /// @notice Irreversibly rotate a timed-out pod to a fresh recovery operator.
+    /// This destroys the Kamibots EOA's authority for this pod only.
+    /// @param salt CREATE2 salt for the pod's recovery operator. If the derived
+    /// address has been squatted in the game's global operator namespace the
+    /// whole call reverts with no state change — retry with any other salt.
+    function enterPodRecovery(uint32 tokenIndex, bytes32 salt) external nonReentrant {
         Request storage request = requests[tokenIndex];
         uint8 priorStage = request.stage;
         if (priorStage == CANCEL_REQUESTED) {
@@ -414,7 +417,7 @@ contract RenterRoomPodFactory {
         if (market.listingKamiAccount(tokenIndex) != IRenterFundedRoomPod(request.pod).accID()) {
             revert BadStage();
         }
-        RoomPod(request.pod).enterRecoveryMode();
+        RoomPod(request.pod).enterRecoveryMode(salt);
         request.stage = priorStage == CANCEL_REQUESTED ? RECOVERY_PREPARING : RECOVERY_ACTIVE;
         emit PodRecoveryEntered(tokenIndex, request.pod, priorStage);
     }

@@ -10,6 +10,7 @@ import {HubGuard} from "vault/HubGuard.sol";
 import {PersonalRentalPoolRegistry} from "vault/PersonalRentalPoolRegistry.sol";
 import {RenterRoomPodFactory} from "vault/RenterRoomPodFactory.sol";
 import {RoomPod} from "vault/RoomPod.sol";
+import {PodRecoveryOperator} from "vault/PodRecoveryOperator.sol";
 
 /**
  * End-to-end tests for owner-specific idle custody feeding the existing managed
@@ -286,15 +287,22 @@ contract PersonalRentalVaultTest is SetupTemplate {
         market.endLease(tokenIndex);
 
         vm.expectRevert(RenterRoomPodFactory.Grace.selector);
-        renterPodFactory.enterPodRecovery(tokenIndex);
+        renterPodFactory.enterPodRecovery(tokenIndex, bytes32(uint256(1)));
         _fastForward(2 days + 1);
-        renterPodFactory.enterPodRecovery(tokenIndex);
+        renterPodFactory.enterPodRecovery(tokenIndex, bytes32(uint256(1)));
 
+        // the pod no longer rotates to ITSELF — that address is public and was
+        // squattable in the game's global operator namespace, which permanently
+        // disarmed recovery. It now rotates to a fresh CREATE2 operator it owns.
+        address recoveryOp = RoomPod(lastPod).recoveryOperator();
+        assertTrue(recoveryOp != address(0), "recovery operator deployed");
+        assertTrue(recoveryOp != lastPod, "target is not the squattable pod address");
         assertEq(
             LibAccount.getOperator(components, RoomPod(lastPod).accID()),
-            lastPod,
-            "pod contract becomes its own unique recovery operator"
+            recoveryOp,
+            "the pod's own recovery operator drives the account"
         );
+        assertEq(PodRecoveryOperator(recoveryOp).pod(), lastPod, "operator is bound to this pod");
         assertTrue(RoomPod(lastPod).recoveryMode());
         assertTrue(renterPodFactory.stopRecoveryHarvest(tokenIndex));
         renterPodFactory.prepareRecoveryReturn(tokenIndex);

@@ -15,6 +15,8 @@ import { LibInventory, MUSU_INDEX, TRANSFER_FEE } from "libraries/LibInventory.s
 import { LibHarvest } from "libraries/LibHarvest.sol";
 import { LibKami } from "libraries/LibKami.sol";
 
+import { PodRecoveryOperator } from "vault/PodRecoveryOperator.sol";
+
 interface IHub {
   function accID() external view returns (uint256);
   function listingPool(uint32 tokenIndex) external view returns (address);
@@ -39,7 +41,8 @@ interface IHub {
  *    account (hard-wired, anyone may call), where settle() pays owners/renters.
  *    No other outflow exists. ItemTransfer is owner-gated in-game, so the pod's
  *    operator cannot move funds either.
- *  - recovery rotation is fixed to address(this), unique per pod and irreversible
+ *  - recovery rotation targets a fresh CREATE2 PodRecoveryOperator, retryable
+ *    with a new salt if the address is squatted, and irreversible once it lands
  */
 contract RoomPod {
   IWorld public immutable world;
@@ -53,6 +56,9 @@ contract RoomPod {
   ///      zeroes admin — the terminal sweep must still work after that
   address public immutable factory;
   address public admin;
+  /// @notice the address the game resolves as this account's operator once
+  ///         recovery has been entered; zero beforehand
+  address public recoveryOperator;
   uint256 public accID; // this pod's game account
   string public label; // human tile name, e.g. "Misty Riverside (EERIE)"
   bool public recoveryMode;
@@ -102,17 +108,30 @@ contract RoomPod {
   }
 
   /// @notice Irreversibly cut Kamibots off after the factory's on-chain timeout.
-  /// This pod contract is a unique operator address, avoiding the game's
-  /// one-operator-to-one-account cache collision. No arbitrary replacement is
-  /// accepted and recovery mode can never be exited.
-  function enterRecoveryMode() external onlyAdmin {
+  /// @param salt CREATE2 salt for this pod's recovery operator.
+  /// @dev Rotating to `address(this)` was squattable: the game's operator
+  /// namespace is a global first-come map and a pod's address is public from
+  /// deployment, so anyone could claim it and permanently disarm recovery. The
+  /// target is now a fresh CREATE2 address — if it is taken, the whole call
+  /// reverts and the caller retries with a different salt, burning no state.
+  /// Recovery mode still can never be exited.
+  function enterRecoveryMode(bytes32 salt) external onlyAdmin {
     require(leaseBound, "Pod: unbound");
     require(!recoveryMode, "Pod: recovery active");
+    address op = address(new PodRecoveryOperator{salt: salt}());
+    // rotate FIRST: a squatted address must revert before any state is written
+    AccountSetOperatorSystem(_sys(AccountSetOperatorSystemID)).executeTyped(op);
+    recoveryOperator = op;
     recoveryMode = true;
     admin = address(0);
-    AccountSetOperatorSystem(_sys(AccountSetOperatorSystemID)).executeTyped(address(this));
-    emit OperatorRotated(address(this));
+    emit OperatorRotated(op);
     emit RecoveryModeEntered();
+  }
+
+  /// @dev Route a game call through the recovery operator so it originates from
+  ///      the address the game actually resolves as this account's operator.
+  function _asOperator(uint256 systemID, bytes memory data) internal returns (bytes memory) {
+    return PodRecoveryOperator(recoveryOperator).exec(_sys(systemID), data);
   }
 
   /// @notice Permissionless retry after recovery rotation. Uses the game's
@@ -126,10 +145,11 @@ contract RoomPod {
       emit RecoveryHarvestStopAttempt(harvestID, true);
       return true;
     }
-    bytes memory result = HarvestStopSystem(_sys(HarvestStopSystemID)).executeAllowFailure(
-      abi.encode(harvestID)
+    bytes memory result = _asOperator(
+      HarvestStopSystemID,
+      abi.encodeWithSelector(HarvestStopSystem.executeAllowFailure.selector, abi.encode(harvestID))
     );
-    stopped = abi.decode(result, (uint256)) != 0;
+    stopped = abi.decode(abi.decode(result, (bytes)), (uint256)) != 0;
     emit RecoveryHarvestStopAttempt(harvestID, stopped);
   }
 
@@ -138,7 +158,10 @@ contract RoomPod {
   /// can revive only this bound lease's Kami and cannot move inventory out.
   function reviveWithPodOnyxForRecovery() external {
     require(recoveryMode, "Pod: not recovering");
-    KamiOnyxReviveSystem(_sys(KamiOnyxReviveSystemID)).executeTyped(tokenIndex);
+    _asOperator(
+      KamiOnyxReviveSystemID,
+      abi.encodeWithSelector(KamiOnyxReviveSystem.executeTyped.selector, tokenIndex)
+    );
     emit RecoveryRevived(tokenIndex);
   }
 
@@ -149,7 +172,11 @@ contract RoomPod {
     require(recoveryMode, "Pod: not recovering");
     address pool = hub.listingPool(tokenIndex);
     require(pool != address(0), "Pod: no pool");
-    KamiSendSystem(_sys(KamiSendSystemID)).executeTyped(tokenIndex, pool);
+    // executeTyped is overloaded (single / batch), so name the exact signature
+    _asOperator(
+      KamiSendSystemID,
+      abi.encodeWithSignature("executeTyped(uint32,address)", tokenIndex, pool)
+    );
     emit ReturnedToPool(pool);
   }
 
