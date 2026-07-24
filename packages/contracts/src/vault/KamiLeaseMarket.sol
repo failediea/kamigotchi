@@ -172,6 +172,7 @@ contract KamiLeaseMarket {
   error NotReturning();
   error NotSettler();
   error NothingClaimable();
+  error NotDust();
   error OwnKami();
   error Reentrancy();
   error RegisterAnAccountFirst();
@@ -216,6 +217,7 @@ contract KamiLeaseMarket {
   event SettlementBatch(uint256 indexed from, uint256 indexed to, bool complete);
   event Payout(address indexed to, uint256 amount, bool held);
   event OwedClaimed(address indexed to, uint256 amount);
+  event DustForfeited(address indexed by, uint256 amount);
 
   ///////////////////
   // MODIFIERS
@@ -724,6 +726,30 @@ contract KamiLeaseMarket {
     owedMusuTotal -= amount; // release the reservation as the funds leave
     _transferMusu(target, amount - _claimFee());
     emit OwedClaimed(msg.sender, amount);
+  }
+
+  /// @notice Release a balance that is too small to ever be delivered.
+  /// @dev The in-game transfer fee is a flat 15 MUSU, so a payee holding at or
+  ///      below it can never claim: `claimOwed` reverts forever while
+  ///      `owedMusuTotal` keeps the amount reserved, permanently shaving that
+  ///      much off what management can withdraw. One abandoned payee is dust;
+  ///      they accumulate, and nothing else can ever clear them.
+  ///
+  ///      Only the payee may do this, and only while the balance is genuinely
+  ///      unreachable — so no admin gains any power over user funds, and a
+  ///      balance that later grows past the fee stays claimable as normal.
+  ///      Forfeited dust goes to management rather than being burned: it is
+  ///      real backed inventory that would otherwise sit frozen forever.
+  ///
+  ///      A non-MUSU hub pays no transfer fee, so `_claimFee()` is 0 and this
+  ///      is unreachable there by construction.
+  function forfeitDust() external nonReentrant {
+    uint256 amount = owedMusu[msg.sender];
+    require(amount > 0 && amount <= _claimFee(), NotDust());
+    owedMusu[msg.sender] = 0;
+    owedMusuTotal -= amount; // release the reservation
+    mgmtAccrued += amount;
+    emit DustForfeited(msg.sender, amount);
   }
 
   /// @notice Withdraw accrued platform fees only from inventory above all user
