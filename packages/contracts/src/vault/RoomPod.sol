@@ -19,6 +19,7 @@ interface IHub {
   function accID() external view returns (uint256);
   function listingPool(uint32 tokenIndex) external view returns (address);
   function listingKamiID(uint32 tokenIndex) external view returns (uint256);
+  function mgmtBps() external view returns (uint16);
 }
 
 /**
@@ -48,6 +49,9 @@ contract RoomPod {
   uint32 public tokenIndex;
   bool public leaseBound;
 
+  /// @dev the deploying factory, kept separately from `admin` because recovery
+  ///      zeroes admin — the terminal sweep must still work after that
+  address public immutable factory;
   address public admin;
   uint256 public accID; // this pod's game account
   string public label; // human tile name, e.g. "Misty Riverside (EERIE)"
@@ -73,6 +77,7 @@ contract RoomPod {
     nodeIndex = _nodeIndex;
     label = _label;
     admin = msg.sender;
+    factory = msg.sender;
     payItem = _payItem;
   }
 
@@ -155,6 +160,17 @@ contract RoomPod {
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 feeFromProceeds = payItem == MUSU_INDEX ? TRANSFER_FEE : 0;
     if (bal <= feeFromProceeds) return 0;
+    // The hub credits the FULL xp delta but only receives bal - fee, so every
+    // sweep whose flat fee exceeds the management cut it accrues leaves users
+    // under-backed. sweepMusu is permissionless and drains to zero, so without a
+    // floor anyone could re-enter that window after every collect and grind the
+    // hub insolvent 15 at a time. Require the sweep to at least pay for itself.
+    //
+    // The factory is exempt: its terminal sweep (lease finalization / recovery)
+    // is the last one this pod will ever do, so refusing it would strand the
+    // residue instead of protecting anyone. The floor exists to stop UNBOUNDED
+    // repetition, which a once-per-lease call cannot cause.
+    if (msg.sender != factory && bal < minSweep()) return 0;
     if (
       payItem != MUSU_INDEX
         && LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) < TRANSFER_FEE
@@ -167,6 +183,16 @@ contract RoomPod {
     amts[0] = swept;
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, hub.accID());
     emit Swept(swept);
+  }
+
+  /// @notice Smallest sweep whose management cut covers the in-world transfer
+  ///         fee. Read from the hub because mgmtBps is lower-only: a fee cut
+  ///         raises this floor, and a hardcoded constant would silently stop
+  ///         protecting users the moment management took less.
+  function minSweep() public view returns (uint256) {
+    uint16 bps = hub.mgmtBps();
+    if (bps == 0) return type(uint256).max; // no cut can ever cover the fee
+    return (TRANSFER_FEE * 10000) / bps;
   }
 
   function musuBalance() external view returns (uint256) {

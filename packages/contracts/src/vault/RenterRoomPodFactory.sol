@@ -26,6 +26,7 @@ interface IRenterFundedLeaseMarket {
     function activateProvisionedLease(uint32 tokenIndex, string calldata prefs, uint32 termSecs) external;
     function cancelProvisionedLease(uint32 tokenIndex) external;
     function leaseRenter(uint32 tokenIndex) external view returns (address);
+    function listingPool(uint32 tokenIndex) external view returns (address);
     function setPrefs(uint32 tokenIndex, string calldata prefs) external;
     function extendLease(uint32 tokenIndex, uint32 extraSecs) external;
     function finalizeLease(uint32 tokenIndex) external;
@@ -303,6 +304,10 @@ contract RenterRoomPodFactory {
         if (request.stage != REQUESTED) revert BadStage();
         market.prepareProvisionedLease(tokenIndex);
         request.stage = PREPARING;
+        // Restart the grace clock on the stage it actually guards. It was stamped
+        // at pod creation and never refreshed, so a lease dispatched near the
+        // 2-day mark was cancellable before it could ever activate.
+        request.requestedAt = uint64(block.timestamp);
         emit LeasePreparing(tokenIndex, request.pod);
     }
 
@@ -341,13 +346,26 @@ contract RenterRoomPodFactory {
         _refundAndClear(tokenIndex, false);
     }
 
-    /// @notice If provisioning stalls after custody moved, the renter can force
-    /// a constrained return after two days. Automation can return the Kami only
-    /// to its recorded Personal Rental Pool; it cannot redirect it.
+    /// @notice If provisioning stalls after custody moved, the renter can force a
+    /// constrained return immediately, and anyone may after two days. Automation
+    /// can return the Kami only to its recorded Personal Rental Pool.
     function requestPreparingCancellation(uint32 tokenIndex) external {
         Request storage request = requests[tokenIndex];
         if (request.stage != PREPARING) revert BadStage();
-        if (block.timestamp < uint256(request.requestedAt) + PREPARING_GRACE) revert Grace();
+        // Renter fast-path, permissionless fallback — the same shape as
+        // cancelBeforeDispatch. Renter-ONLY would be wrong: a silent renter would
+        // trap the OWNER's kami with no way out, which is why the owner drives
+        // this in testPreparingTimeoutReturnsOnlyToRecordedPool.
+        //
+        // The real defect was that the grace was not a grace: requestedAt was
+        // stamped at pod creation and never refreshed, so a lease dispatched near
+        // the 2-day mark was killable by a bystander before it could ever
+        // activate. markLeasePreparing now restarts the clock, so this window
+        // opens only on a genuinely stalled provision.
+        if (
+            request.renter != msg.sender
+                && block.timestamp < uint256(request.requestedAt) + PREPARING_GRACE
+        ) revert Grace();
         request.stage = CANCEL_REQUESTED;
         emit PreparingCancellationRequested(tokenIndex, request.renter, request.pod);
     }
@@ -379,11 +397,14 @@ contract RenterRoomPodFactory {
         if (priorStage == CANCEL_REQUESTED) {
             // The renter already waited PREPARING_GRACE before reaching this stage.
         } else if (priorStage == ACTIVE) {
-            // If market finalization already happened through its independent
-            // timeout path, pod custody should become recoverable immediately.
+            // A timeout must hold INDEPENDENTLY. The old `&&` short-circuited the
+            // moment the settler called finalizeLease directly (leaseRenter -> 0
+            // without advancing the factory stage), letting anyone irreversibly
+            // burn a healthy pod with zero elapsed grace — killing pullGas and
+            // closing finalizeGasRefund with the kami still inside.
             if (
-                market.leaseRenter(tokenIndex) == request.renter
-                    && !market.recoveryReady(tokenIndex)
+                !market.recoveryReady(tokenIndex)
+                    && block.timestamp < uint256(request.requestedAt) + FINALIZED_GRACE
             ) revert Grace();
         } else if (priorStage == FINALIZED) {
             if (block.timestamp < uint256(request.requestedAt) + FINALIZED_GRACE) revert Grace();
@@ -424,8 +445,12 @@ contract RenterRoomPodFactory {
         Request storage request = requests[tokenIndex];
         if (request.stage != RECOVERY_RETURN) revert BadStage();
         RoomPod(request.pod).returnKamiToPool();
+        // same listing-deleted hazard as finalizeGasRefund: never let a missing
+        // listing block the renter's refund
         if (market.pendingRenter(tokenIndex) != address(0)) market.cancelProvisionedLease(tokenIndex);
-        else market.confirmReturnedToPool(tokenIndex);
+        else if (market.listingPool(tokenIndex) != address(0)) {
+            market.confirmReturnedToPool(tokenIndex);
+        }
         address pod = request.pod;
         _refundAndClear(tokenIndex, true);
         emit RecoveredKamiReturned(tokenIndex, pod);
@@ -495,7 +520,15 @@ contract RenterRoomPodFactory {
             request.requestedAt = uint64(block.timestamp);
         }
         if (request.stage != FINALIZED || market.leaseRenter(tokenIndex) == request.renter) revert BadStage();
-        market.confirmReturnedToPool(tokenIndex);
+        // The owner's documented exit (requestReturn -> permissionless
+        // clearReturned) DELETES the listing, after which confirmReturnedToPool
+        // reverts NotOwner() forever — stranding the renter's escrow and, because
+        // requests[tokenIndex].renter stays set, barring that kami from ever being
+        // leased again. A deleted listing already proves the kami left the market,
+        // so treat its absence as the confirmation rather than a failure.
+        if (market.listingPool(tokenIndex) != address(0)) {
+            market.confirmReturnedToPool(tokenIndex);
+        }
         _refundAndClear(tokenIndex, true);
     }
 

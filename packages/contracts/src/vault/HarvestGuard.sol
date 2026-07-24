@@ -150,8 +150,14 @@ contract HarvestGuard {
   ///         the destination is verified on-chain against the target operator's
   ///         resolved account; arbitrary destinations are impossible.
   function ship(uint32 tokenIndex, address targetOperator) external onlyKeeper {
-    address owner_ = hub.listings(tokenIndex).owner;
+    IHubListings.Listing memory l = hub.listings(tokenIndex);
+    address owner_ = l.owner;
     require(owner_ != address(0), "Guard: not listed");
+    // Mirror keeperStop. Without this the keeper could evict a kami mid-term
+    // from a fully paid lease — every rest window is an opening, and the renter
+    // cannot even flag ending until MIN_TERM has elapsed. "Permissions follow
+    // the lease" has to bind the shipping path too, not just the stop path.
+    require(l.renter == address(0) || l.returning || l.ending, "Guard: lease active");
     uint256 targetAcc = LibAccount.getByOperator(_comps(), targetOperator);
     require(
       targetAcc == hub.accID() || targetAcc == uint256(uint160(owner_)),

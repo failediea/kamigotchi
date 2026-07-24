@@ -454,6 +454,12 @@ contract KamiLeaseMarket {
     // caller must not be able to front-run the factory and wedge the renter's
     // verified gas refund after the first successful confirmation.
     if (!l.staked) return;
+    // Credit BEFORE re-baselining. _creditPending early-returns on !staked, so
+    // advancing xpBase first would orphan the delta permanently — the swept
+    // payItem would sit in the hub reachable by neither claimOwed (bounded by
+    // owedMusu) nor claimMgmt (bounded by mgmtAccrued). Same reason clearReturned
+    // credits first.
+    _creditPending(tokenIndex);
     l.staked = false;
     l.xpBase = LibExperience.get(_comps(), l.kamiID);
     emit PoolRestored(l.owner, tokenIndex);
@@ -480,7 +486,11 @@ contract KamiLeaseMarket {
     require(!l.returning, BeingReturned());
     require(l.renter == address(0), AlreadyLeased());
     require(pendingRenter[tokenIndex] == address(0), PendingLeaseExists());
-    require(l.owner != renter, OwnKami());
+    // l.owner is ALWAYS a PersonalRentalPool clone (listKami gates on
+    // registry.isPool), never an EOA — comparing it to a renter EOA could never
+    // be true, so this guard was dead. The human is the beneficiary, which is
+    // the same identity _creditSplit pays.
+    require(_listingBeneficiary[tokenIndex] != renter, OwnKami());
     require(l.reservedFor == address(0) || l.reservedFor == renter, Reserved());
     require(l.ownerShareBps == expectedOwnerShareBps, TermsChanged());
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
@@ -560,6 +570,9 @@ contract KamiLeaseMarket {
         LibKami.getAccount(_comps(), l.kamiID) == IPersonalRentalCustody(l.owner).accID(),
         KamiNotHomeYet()
       );
+      // during PREPARING l.renter is still zero, so this delta is 100% the
+      // owner's — credit it before the baseline moves (see confirmReturnedToPool)
+      _creditPending(tokenIndex);
       l.staked = false;
       l.xpBase = LibExperience.get(_comps(), l.kamiID);
     }
@@ -675,14 +688,11 @@ contract KamiLeaseMarket {
     uint256 totalDelta;
     uint256 mgmtAdd;
     for (uint256 i = start; i < end; i++) {
-      Listing storage l = _listings[tokenIndices[i]];
-      if (!l.staked) continue;
-      uint256 xp = LibExperience.get(comps, l.kamiID);
-      uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
-      l.xpBase = xp;
-      if (delta == 0) continue;
+      // hoisted into _settleOne: the split call's operands blow the legacy
+      // codegen stack when inlined here (this repo builds tests without via-IR)
+      (uint256 delta, uint256 cut) = _settleOne(comps, tokenIndices[i]);
       totalDelta += delta;
-      mgmtAdd += _creditSplit(_listingBeneficiary[tokenIndices[i]], l.renter, l.ownerShareBps, delta);
+      mgmtAdd += cut;
     }
     mgmtAccrued += mgmtAdd;
     settleCursor = end;
@@ -855,6 +865,31 @@ contract KamiLeaseMarket {
   ///////////////////
   // INTERNALS
 
+  /// @dev One listing's share of a settle batch: advance its baseline and credit
+  ///      the delta at the listing's current terms.
+  function _settleOne(
+    IUintComp comps,
+    uint32 tokenIndex
+  ) internal returns (uint256 delta, uint256 cut) {
+    Listing storage l = _listings[tokenIndex];
+    if (!l.staked) return (0, 0);
+    uint256 xp = LibExperience.get(comps, l.kamiID);
+    delta = xp > l.xpBase ? xp - l.xpBase : 0;
+    l.xpBase = xp;
+    if (delta == 0) return (0, 0);
+    cut = _creditSplit(_listingBeneficiary[tokenIndex], _activeRenter(l), l.ownerShareBps, delta);
+  }
+
+  /// @dev The renter earns only within the term they paid for. l.renter is
+  ///      cleared by finalizeLease, but nothing forces finalizeLease to be
+  ///      prompt — and renters pay no rent, so every second past leaseEnd was
+  ///      free yield taken from the owner. Attribution now follows the clock,
+  ///      not the bookkeeping.
+  function _activeRenter(Listing storage l) internal view returns (address) {
+    if (l.renter == address(0)) return address(0);
+    return block.timestamp > l.leaseEnd ? address(0) : l.renter;
+  }
+
   /// @dev Credit a kami's current delta immediately at its current terms. Used at
   ///      lease/listing boundaries so attribution cannot race a later daily settle.
   function _creditPending(uint32 tokenIndex) internal {
@@ -864,7 +899,12 @@ contract KamiLeaseMarket {
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
     if (delta == 0) return;
-    uint256 cut = _creditSplit(_listingBeneficiary[tokenIndex], l.renter, l.ownerShareBps, delta);
+    uint256 cut = _creditSplit(
+      _listingBeneficiary[tokenIndex],
+      _activeRenter(l),
+      l.ownerShareBps,
+      delta
+    );
     mgmtAccrued += cut;
     emit Settled(delta - cut, cut, delta);
   }
