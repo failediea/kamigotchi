@@ -5,6 +5,7 @@ import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
 import {IWorld} from "solecs/interfaces/IWorld.sol";
 
 import {LibAccount} from "libraries/LibAccount.sol";
+import {MUSU_INDEX} from "libraries/LibInventory.sol";
 import {HubGuard} from "./HubGuard.sol";
 import {RoomPod} from "./RoomPod.sol";
 
@@ -27,6 +28,7 @@ interface IRenterFundedLeaseMarket {
     function cancelProvisionedLease(uint32 tokenIndex) external;
     function leaseRenter(uint32 tokenIndex) external view returns (address);
     function listingPool(uint32 tokenIndex) external view returns (address);
+    function seedPodFeeFloat(uint256 podAccID, uint256 amount) external;
     function setPrefs(uint32 tokenIndex, string calldata prefs) external;
     function extendLease(uint32 tokenIndex, uint32 extraSecs) external;
     function finalizeLease(uint32 tokenIndex) external;
@@ -64,6 +66,10 @@ contract RenterRoomPodFactory {
     uint8 internal constant RECOVERY_RETURN = 8;
     uint64 public constant PREPARING_GRACE = 2 days;
     uint64 public constant FINALIZED_GRACE = 2 days;
+    /// @notice MUSU seeded to a non-MUSU pod so it can pay its own sweep fees.
+    ///         10 sweeps' worth — a lease needs one terminal sweep plus headroom
+    ///         for mid-term collections and retries.
+    uint256 public constant POD_FEE_FLOAT_SEED = 150;
 
     struct Quote {
         address renter;
@@ -246,6 +252,15 @@ contract RenterRoomPodFactory {
         created.bindLease(quote.tokenIndex);
         created.initialize(quote.operator, quote.accountName);
         pod = address(created);
+
+        // A non-MUSU pod earns only payItem, but the game charges its transfer
+        // fee in MUSU — so without a seeded float this pod could never sweep its
+        // own earnings to the hub and they would strand permanently. Seed it now,
+        // from the hub's float, while the hub still has a chance to say no: a dry
+        // float must block checkout rather than mint a lease that cannot pay out.
+        if (market.payItem() != MUSU_INDEX) {
+            market.seedPodFeeFloat(created.accID(), POD_FEE_FLOAT_SEED);
+        }
 
         requests[quote.tokenIndex] = Request({
             renter: quote.renter,

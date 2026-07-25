@@ -198,10 +198,11 @@ contract RoomPod {
     // residue instead of protecting anyone. The floor exists to stop UNBOUNDED
     // repetition, which a once-per-lease call cannot cause.
     if (msg.sender != factory && bal < minSweep()) return 0;
-    if (
-      payItem != MUSU_INDEX
-        && LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX) < TRANSFER_FEE
-    ) return 0;
+    // A non-MUSU pod earns only payItem but the game still charges its fee in
+    // MUSU, so without a seeded float the sweep can never happen and the pod's
+    // whole balance strands while the hub keeps crediting the xp delta. The
+    // factory seeds this at pod creation; feeFloat() lets ops see it draining.
+    if (payItem != MUSU_INDEX && feeFloat() < TRANSFER_FEE) return 0;
     swept = bal - feeFromProceeds;
 
     uint32[] memory indices = new uint32[](1);
@@ -210,6 +211,19 @@ contract RoomPod {
     amts[0] = swept;
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, hub.accID());
     emit Swept(swept);
+  }
+
+  /// @notice MUSU this pod holds to pay its own in-world transfer fees. Only
+  ///         meaningful on a non-MUSU pod, which never earns MUSU itself.
+  function feeFloat() public view returns (uint256) {
+    return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+  }
+
+  /// @notice How many more sweeps this pod can pay for. Max on a MUSU pod, which
+  ///         funds each fee out of the proceeds it is already moving.
+  function sweepsLeft() external view returns (uint256) {
+    if (payItem == MUSU_INDEX) return type(uint256).max;
+    return feeFloat() / TRANSFER_FEE;
   }
 
   /// @notice Smallest sweep whose management cut covers the in-world transfer

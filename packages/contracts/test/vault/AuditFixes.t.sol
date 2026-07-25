@@ -326,6 +326,93 @@ contract AuditFixesTest is SetupTemplate {
         );
     }
 
+    /////////////////
+    // FINDING 3 — a non-MUSU hub needs a MUSU fee float to pay anyone at all
+
+    /// stand up a second hub paying VIPP (item 2), the config
+    /// PersonalRentalVaultFactory treats as first-class
+    function _vippHub() internal returns (KamiLeaseMarket vipp, RenterRoomPodFactory vippFactory) {
+        vipp = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, 2);
+        vippFactory = new RenterRoomPodFactory(
+            world, address(vipp), vm.addr(QUOTE_SIGNER_KEY), keeper
+        );
+        HubGuard g = new HubGuard(world, address(vipp), address(vippFactory));
+        PersonalRentalPoolRegistry r = new PersonalRentalPoolRegistry(address(this));
+        vipp.initialize(address(g), "vipphub");
+        vipp.setSettler(address(this));
+        vipp.setMgmtAccount(charlie.id);
+        vipp.setLeaseFactory(address(vippFactory));
+        vipp.setPoolRegistry(address(r));
+        vipp.sealAdmin();
+    }
+
+    function testMusuHubNeedsNoFeeFloat() public view {
+        // a MUSU hub nets the fee out of the claimant's own payout, so the float
+        // concept does not apply and must never gate it
+        assertEq(market.musuFeeFloat(), type(uint256).max, "MUSU hub is never float-bound");
+        assertEq(market.feeFloatClaimsLeft(), type(uint256).max, "unbounded claims");
+    }
+
+    function testVippHubReportsItsFeeFloatHonestly() public {
+        (KamiLeaseMarket vipp,) = _vippHub();
+
+        // a fresh VIPP hub holds no MUSU, so it can pay exactly nobody --
+        // backingShortfall() cannot see this, which is why the float has its own view
+        assertEq(vipp.musuFeeFloat(), 0, "fresh VIPP hub has no float");
+        assertEq(vipp.feeFloatClaimsLeft(), 0, "and therefore no claims");
+        assertEq(vipp.backingShortfall(), 0, "payItem-denominated view still reads healthy");
+
+        // anyone may top it up in-game; 10 claims' worth
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, vipp.accID(), MUSU_INDEX, 150);
+        vm.stopPrank();
+        assertEq(vipp.feeFloatClaimsLeft(), 10, "float converts to payouts remaining");
+    }
+
+    function testVippCheckoutIsBlockedWhileTheFloatIsDry() public {
+        (KamiLeaseMarket vipp, RenterRoomPodFactory vippFactory) = _vippHub();
+        RenterRoomPodFactory.Quote memory q = _quote(1, bob.owner, "vippdry");
+        bytes memory qs = _sign2(vippFactory, q, QUOTE_SIGNER_KEY);
+        bytes memory ks = _sign2(vippFactory, q, KEEPER_KEY);
+
+        vm.deal(bob.owner, QUOTE_TOTAL);
+        vm.prank(bob.owner);
+        // better to refuse the lease than to mint one whose earnings can never
+        // leave the pod
+        vm.expectRevert(KamiLeaseMarket.FeeFloatEmpty.selector);
+        vippFactory.createPodAndRequestLease{value: QUOTE_TOTAL}(q, qs, ks);
+    }
+
+    function testVippPayoutFailsWithANameNotAnUnderflow() public {
+        (KamiLeaseMarket vipp,) = _vippHub();
+        // mirror _credit exactly: the payee entry AND the global reservation
+        stdstore.target(address(vipp)).sig("owedMusu(address)").with_key(bob.owner).checked_write(
+            uint256(1_000)
+        );
+        stdstore.target(address(vipp)).sig("owedMusuTotal()").checked_write(uint256(1_000));
+        // fully backed in payItem — the ONLY thing missing is the MUSU the game
+        // will charge for the transfer, which is exactly the invisible failure
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, vipp.accID(), 2, 1_000);
+        vm.stopPrank();
+        assertEq(vipp.backingShortfall(), 0, "hub looks perfectly solvent");
+
+        vm.prank(bob.owner);
+        // the old failure was a checked-underflow deep inside LibInventory, which
+        // told nobody that the answer was "top up the hub's MUSU"
+        vm.expectRevert(KamiLeaseMarket.FeeFloatEmpty.selector);
+        vipp.claimOwed();
+    }
+
+    function _sign2(RenterRoomPodFactory f, RenterRoomPodFactory.Quote memory q, uint256 key)
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, f.quoteDigest(q));
+        return abi.encodePacked(r, s, v);
+    }
+
     /// raise the kami's XP so the next settle sees a delta, without harvesting
     /// (every harvest path in this repo currently reverts — see the file header)
     function _giveDelta(uint32 tokenIndex, uint256 amount) internal {

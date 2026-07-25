@@ -173,6 +173,8 @@ contract KamiLeaseMarket {
   error NotSettler();
   error NothingClaimable();
   error NotDust();
+  error NotNeeded();
+  error FeeFloatEmpty();
   error OwnKami();
   error Reentrancy();
   error RegisterAnAccountFirst();
@@ -218,6 +220,7 @@ contract KamiLeaseMarket {
   event Payout(address indexed to, uint256 amount, bool held);
   event OwedClaimed(address indexed to, uint256 amount);
   event DustForfeited(address indexed by, uint256 amount);
+  event PodFeeFloatSeeded(uint256 indexed podAccID, uint256 amount);
 
   ///////////////////
   // MODIFIERS
@@ -855,6 +858,47 @@ contract KamiLeaseMarket {
     return promised > bal ? promised - bal : 0;
   }
 
+  /// @notice MUSU this hub holds purely to pay the in-world transfer fee.
+  /// @dev The game charges a flat TRANSFER_FEE in MUSU on EVERY item transfer,
+  ///      whatever item actually moves. A MUSU market nets that out of the
+  ///      claimant's own payout, so it needs no float. A non-MUSU market cannot:
+  ///      it pays out VIPP while the fee is still taken in MUSU, from the hub.
+  ///      That float has to exist or every payout reverts — and it is invisible
+  ///      to backingShortfall(), which is denominated in payItem and would keep
+  ///      reporting a fully-backed hub with 100% of user funds frozen.
+  function musuFeeFloat() public view returns (uint256) {
+    if (payItem == MUSU_INDEX) return type(uint256).max; // netted per-claim; no float needed
+    return LibInventory.getBalanceOf(_comps(), accID, MUSU_INDEX);
+  }
+
+  /// @notice How many more payouts the current fee float can cover. Zero means
+  ///         claims are about to start reverting; top the float up in-game by
+  ///         sending MUSU to this hub's account.
+  function feeFloatClaimsLeft() external view returns (uint256) {
+    uint256 float_ = musuFeeFloat();
+    return float_ == type(uint256).max ? type(uint256).max : float_ / TRANSFER_FEE;
+  }
+
+  /// @notice Give a renter's pod enough MUSU to pay its own sweep fees.
+  /// @dev A non-MUSU pod earns only payItem, so it can never fund the fee its
+  ///      own sweep costs — without this its earnings stay stranded in the pod
+  ///      forever while the hub keeps crediting the xp delta. Factory-gated
+  ///      because only the factory knows which pod belongs to which request;
+  ///      the destination is never caller-supplied.
+  function seedPodFeeFloat(uint256 podAccID, uint256 amount) external nonReentrant {
+    require(msg.sender == leaseFactory, NotFactory());
+    require(payItem != MUSU_INDEX, NotNeeded());
+    require(podAccID != 0 && amount > 0, NotNeeded());
+    // the seeding transfer costs a fee of its own, so require cover for both
+    require(musuFeeFloat() >= amount + TRANSFER_FEE, FeeFloatEmpty());
+    uint32[] memory indices = new uint32[](1);
+    uint256[] memory amts = new uint256[](1);
+    indices[0] = MUSU_INDEX;
+    amts[0] = amount;
+    ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, podAccID);
+    emit PodFeeFloatSeeded(podAccID, amount);
+  }
+
   /// @notice has this kami arrived in the market's game account? (UI helper for the
   ///         send-in flow's confirm step)
   function kamiInMarket(uint32 tokenIndex) external view returns (bool) {
@@ -916,6 +960,10 @@ contract KamiLeaseMarket {
   }
 
   function _transferMusu(uint256 targetAccID, uint256 amount) internal {
+    // Fail with a name rather than as a checked-underflow deep inside
+    // LibInventory. On a non-MUSU hub this is the difference between "top up the
+    // fee float" and an opaque revert nobody can diagnose.
+    require(musuFeeFloat() >= TRANSFER_FEE, FeeFloatEmpty());
     uint32[] memory indices = new uint32[](1);
     uint256[] memory amts = new uint256[](1);
     indices[0] = payItem;
