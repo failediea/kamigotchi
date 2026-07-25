@@ -7,6 +7,7 @@ import {IWorld} from "solecs/interfaces/IWorld.sol";
 import {LibAccount} from "libraries/LibAccount.sol";
 import {MUSU_INDEX} from "libraries/LibInventory.sol";
 import {HubGuard} from "./HubGuard.sol";
+import {PodRecoveryOperator} from "./PodRecoveryOperator.sol";
 import {RoomPod} from "./RoomPod.sol";
 
 interface IRenterFundedLeaseMarket {
@@ -101,6 +102,8 @@ contract RenterRoomPodFactory {
     IRenterFundedLeaseMarket public immutable market;
     address public immutable quoteSigner;
     address public immutable keeper;
+    /// @notice shared PodRecoveryOperator implementation cloned by every pod
+    address public immutable recoveryOpImpl;
 
     mapping(bytes32 => bool) public quoteUsed;
     mapping(bytes32 => bool) public nonceUsed;
@@ -174,6 +177,10 @@ contract RenterRoomPodFactory {
         market = IRenterFundedLeaseMarket(_market);
         quoteSigner = _quoteSigner;
         keeper = _keeper;
+        // One shared implementation for every pod's recovery operator. Pods clone
+        // it, so neither RoomPod nor this factory has to carry its creation code
+        // — that nesting was consuming most of this contract's EIP-170 headroom.
+        recoveryOpImpl = address(new PodRecoveryOperator());
     }
 
     /// @notice Any submitter may fund a dual-signed quote; pod ownership,
@@ -248,7 +255,9 @@ contract RenterRoomPodFactory {
         quoteUsed[digest] = true;
         nonceUsed[quote.nonce] = true;
 
-        RoomPod created = new RoomPod(world, address(market), quote.nodeIndex, quote.label, market.payItem());
+        RoomPod created = new RoomPod(
+            world, address(market), quote.nodeIndex, quote.label, market.payItem(), recoveryOpImpl
+        );
         created.bindLease(quote.tokenIndex);
         created.initialize(quote.operator, quote.accountName);
         pod = address(created);

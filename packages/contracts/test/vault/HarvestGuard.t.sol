@@ -44,7 +44,7 @@ contract HarvestGuardTest is SetupTemplate {
     market.setMgmtAccount(charlie.id);
 
     guard = new HarvestGuard(world, address(market), keeper);
-    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (self-farm)", 1);
+    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (self-farm)", 1, address(0));
     pod.initialize(address(guard), "selfpod1"); // THE GUARD IS THE OPERATOR
     guard.setPod(address(pod));
 

@@ -25,13 +25,22 @@ pragma solidity >=0.8.28;
  * that matters still lives in RoomPod.
  */
 contract PodRecoveryOperator {
-    /// @notice the RoomPod that deployed this operator; the only permitted caller
-    address public immutable pod;
+    /// @notice the RoomPod this operator serves; the only permitted caller
+    /// @dev Not immutable because instances are minimal-proxy CLONES of a single
+    ///      implementation. Embedding this contract's creation code in RoomPod
+    ///      (and therefore in RenterRoomPodFactory, which embeds RoomPod's) cost
+    ///      the factory most of its remaining EIP-170 headroom; a clone is ~45
+    ///      bytes of runtime instead.
+    address public pod;
 
     error NotPod();
+    error AlreadyBound();
 
-    constructor() {
-        pod = msg.sender;
+    /// @notice Bind a fresh clone to its pod. Called by the pod in the same
+    ///         transaction as the deployment, so there is no window to race.
+    function initialize(address _pod) external {
+        if (pod != address(0)) revert AlreadyBound();
+        pod = _pod;
     }
 
     /// @notice Forward one call so it originates from THIS address, which is what

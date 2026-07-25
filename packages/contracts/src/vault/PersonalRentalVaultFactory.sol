@@ -159,7 +159,16 @@ contract PersonalRentalVaultFactory {
         string calldata accountName
     ) internal returns (address pool) {
         if (!isApprovedMarket(market)) revert InvalidMarket();
-        pool = LibClone.clone(poolImplementation);
+        // Deterministic, salted by the caller. A plain CREATE clone lands at an
+        // address derived from this factory's nonce, which anyone can predict and
+        // claim in the game's global operator namespace — and because the failed
+        // initialize reverts without consuming the nonce, every retry landed on
+        // the same squatted address. Binding the salt to msg.sender and their own
+        // pool count means a squatter cannot camp the next address for everyone.
+        pool = LibClone.cloneDeterministic(
+            poolImplementation,
+            keccak256(abi.encode(msg.sender, accountName))
+        );
         PersonalRentalPool(pool)
             .initialize(
                 PersonalRentalPool.Init({

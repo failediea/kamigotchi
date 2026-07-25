@@ -729,14 +729,32 @@ contract KamiLeaseMarket {
 
   /// @notice claim held MUSU (payee had no game account, or amount was below the
   ///         transfer fee). the fee comes out of the claimed amount.
+  /// @notice Claim your held balance. Pays in full when the hub is fully backed,
+  ///         and your PRO-RATA share of the balance when it is not.
+  /// @dev The old all-or-nothing `bal >= amount` guard settled a pool-wide
+  ///      shortfall by arrival order: early claimants were paid whole and the
+  ///      last one absorbed the entire gap. That fell hardest on exactly the
+  ///      wrong people — a renter can spread claims across a fresh EOA per lease,
+  ///      while an owner's earnings all land on the single beneficiary the pool
+  ///      registry records, so owners were structurally the ones left holding it.
+  ///      A partial claim shares the shortfall instead of assigning it.
   function claimOwed() external nonReentrant {
-    uint256 amount = owedMusu[msg.sender];
-    require(amount > _claimFee(), NothingClaimable());
+    uint256 owed = owedMusu[msg.sender];
+    require(owed > _claimFee(), NothingClaimable());
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), RegisterAnAccountFirst());
-    require(LibInventory.getBalanceOf(_comps(), accID, payItem) >= amount, "LM: not backed yet");
-    owedMusu[msg.sender] = 0;
-    owedMusuTotal -= amount; // release the reservation as the funds leave
+
+    uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
+    uint256 amount = owed;
+    if (bal < owedMusuTotal) {
+      // floor divides in the hub's favour, so the sum of every payee's share can
+      // never exceed the balance
+      amount = (bal * owed) / owedMusuTotal;
+      require(amount > _claimFee(), NothingClaimable());
+    }
+
+    owedMusu[msg.sender] = owed - amount; // remainder stays claimable
+    owedMusuTotal -= amount; // release only what actually leaves
     _transferMusu(target, amount - _claimFee());
     emit OwedClaimed(msg.sender, amount);
   }

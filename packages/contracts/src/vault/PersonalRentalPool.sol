@@ -163,12 +163,21 @@ contract PersonalRentalPool {
     function declareKami(uint32 tokenIndex) external onlyOwner {
         if (tokenPos[tokenIndex] != 0) revert AlreadyListed();
         uint256 kamiID = LibKami.getByIndex(_comps(), tokenIndex);
-        if (LibKami.getAccount(_comps(), kamiID) != uint256(uint160(vaultOwner))) {
+        uint256 holder = LibKami.getAccount(_comps(), kamiID);
+        // Accept a kami that has ALREADY arrived here, not just one still in the
+        // owner's account. The documented order is declare-then-send, but the
+        // pool's address is a valid in-game send target, so sending first was one
+        // slip away — and it was unrecoverable: declareKami rejected it (no longer
+        // the owner's) while withdrawToOwner needs a listing only declareKami can
+        // create. A contract that advertises no rescue path must not need one.
+        bool alreadyHere = holder == accID;
+        if (holder != uint256(uint160(vaultOwner)) && !alreadyHere) {
             revert KamiNotInOwnerAccount();
         }
         if (!_isRestedFull(kamiID)) revert NotRestedFull();
 
-        _listings[tokenIndex] = LocalListing({kamiID: kamiID, arrived: false, published: false, released: false});
+        _listings[tokenIndex] =
+            LocalListing({kamiID: kamiID, arrived: alreadyHere, published: false, released: false});
         tokenIndices.push(tokenIndex);
         tokenPos[tokenIndex] = tokenIndices.length;
         emit ListingDeclared(tokenIndex, kamiID);

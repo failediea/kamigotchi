@@ -43,7 +43,7 @@ contract DeployLeasePods is Script {
       address operator = vm.envAddress(string.concat(p, "_OPERATOR"));
       string memory name = vm.envString(string.concat(p, "_NAME"));
 
-      RoomPod pod = new RoomPod(world, hub, node, label, uint32(vm.envOr("PAY_ITEM", uint256(1))));
+      RoomPod pod = new RoomPod(world, hub, node, label, uint32(vm.envOr("PAY_ITEM", uint256(1))), address(0));
       pod.initialize(operator, name);
       registry.addPod(address(pod));
 

@@ -6,6 +6,7 @@ import { TRANSFER_FEE } from "libraries/LibInventory.sol";
 import { KamiLeaseMarket } from "vault/KamiLeaseMarket.sol";
 import { RoomPod } from "vault/RoomPod.sol";
 import { LeasePodRegistry } from "vault/LeasePodRegistry.sol";
+import { PodRecoveryOperator } from "vault/PodRecoveryOperator.sol";
 
 /**
  * RoomPod + LeasePodRegistry tests — legacy pre-deployed tile model.
@@ -24,6 +25,7 @@ contract RoomPodTest is SetupTemplate {
   KamiLeaseMarket market;
   LeasePodRegistry registry;
   RoomPod pod;
+  address recoveryImpl;
   address marketOperator;
   address podOperator;
 
@@ -44,7 +46,9 @@ contract RoomPodTest is SetupTemplate {
     market.setMgmtAccount(charlie.id);
 
     registry = new LeasePodRegistry(address(market));
-    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (EERIE)", 1);
+    // shared implementation the pods clone their recovery operator from
+    recoveryImpl = address(new PodRecoveryOperator());
+    pod = new RoomPod(world, address(market), POD_NODE, "Misty Riverside (EERIE)", 1, recoveryImpl);
     pod.initialize(podOperator, "leasepod1");
     registry.addPod(address(pod));
 
@@ -111,18 +115,18 @@ contract RoomPodTest is SetupTemplate {
     assertTrue(pod.accID() != 0, "pod account registered");
 
     // one pod per node
-    RoomPod dup = new RoomPod(world, address(market), POD_NODE, "dup", 1);
+    RoomPod dup = new RoomPod(world, address(market), POD_NODE, "dup", 1, recoveryImpl);
     dup.initialize(_getNextUserAddress(), "leasepodx");
     vm.expectRevert("Registry: node already served");
     registry.addPod(address(dup));
 
     // wrong hub rejected
-    RoomPod stray = new RoomPod(world, address(0xdead), 2, "stray", 1);
+    RoomPod stray = new RoomPod(world, address(0xdead), 2, "stray", 1, recoveryImpl);
     vm.expectRevert("Registry: pod serves another hub");
     registry.addPod(address(stray));
 
     // uninitialized rejected
-    RoomPod raw = new RoomPod(world, address(market), 2, "raw", 1);
+    RoomPod raw = new RoomPod(world, address(market), 2, "raw", 1, recoveryImpl);
     vm.expectRevert("Registry: pod not initialized");
     registry.addPod(address(raw));
 
@@ -252,7 +256,7 @@ contract RoomPodTest is SetupTemplate {
     uint32 vippIndex = 2;
     KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
     vippMarket.initialize(_getNextUserAddress(), "vipphub");
-    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex, recoveryImpl);
     vippPod.initialize(_getNextUserAddress(), "vipppod");
     vm.startPrank(deployer);
     LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
@@ -270,7 +274,7 @@ contract RoomPodTest is SetupTemplate {
     uint32 vippIndex = 2;
     KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
     vippMarket.initialize(_getNextUserAddress(), "vipphub2");
-    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex);
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex, recoveryImpl);
     vippPod.initialize(_getNextUserAddress(), "vipppod2");
     vm.startPrank(deployer);
     LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);

@@ -15,6 +15,8 @@ import { LibInventory, MUSU_INDEX, TRANSFER_FEE } from "libraries/LibInventory.s
 import { LibHarvest } from "libraries/LibHarvest.sol";
 import { LibKami } from "libraries/LibKami.sol";
 
+import { LibClone } from "solady/utils/LibClone.sol";
+
 import { PodRecoveryOperator } from "vault/PodRecoveryOperator.sol";
 
 interface IHub {
@@ -49,6 +51,8 @@ contract RoomPod {
   IHub public immutable hub;
   uint32 public immutable nodeIndex;
   uint32 public immutable payItem; // the ONE item this pod sweeps to the hub // the tile this pod farms, forever
+  /// @notice shared PodRecoveryOperator implementation; recovery clones from it
+  address public immutable recoveryOpImpl;
   uint32 public tokenIndex;
   bool public leaseBound;
 
@@ -77,7 +81,14 @@ contract RoomPod {
     _;
   }
 
-  constructor(IWorld _world, address _hub, uint32 _nodeIndex, string memory _label, uint32 _payItem) {
+  constructor(
+    IWorld _world,
+    address _hub,
+    uint32 _nodeIndex,
+    string memory _label,
+    uint32 _payItem,
+    address _recoveryOpImpl
+  ) {
     world = _world;
     hub = IHub(_hub);
     nodeIndex = _nodeIndex;
@@ -85,6 +96,7 @@ contract RoomPod {
     admin = msg.sender;
     factory = msg.sender;
     payItem = _payItem;
+    recoveryOpImpl = _recoveryOpImpl;
   }
 
   /// @notice One-time lease binding used by renter-created pods. Legacy shared
@@ -118,7 +130,8 @@ contract RoomPod {
   function enterRecoveryMode(bytes32 salt) external onlyAdmin {
     require(leaseBound, "Pod: unbound");
     require(!recoveryMode, "Pod: recovery active");
-    address op = address(new PodRecoveryOperator{salt: salt}());
+    address op = LibClone.cloneDeterministic(recoveryOpImpl, salt);
+    PodRecoveryOperator(op).initialize(address(this));
     // rotate FIRST: a squatted address must revert before any state is written
     AccountSetOperatorSystem(_sys(AccountSetOperatorSystemID)).executeTyped(op);
     recoveryOperator = op;

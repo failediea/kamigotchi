@@ -14,6 +14,7 @@ import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
 import {RenterRoomPodFactory} from "vault/RenterRoomPodFactory.sol";
 import {RoomPod} from "vault/RoomPod.sol";
 import {PodRecoveryOperator} from "vault/PodRecoveryOperator.sol";
+import {LibClone} from "solady/utils/LibClone.sol";
 import {
     AccountSetOperatorSystem,
     ID as AccountSetOperatorSystemID
@@ -319,10 +320,11 @@ contract AuditFixesTest is SetupTemplate {
         );
     }
 
-    function _predictOperator(address pod, bytes32 salt) internal pure returns (address) {
-        bytes32 initHash = keccak256(type(PodRecoveryOperator).creationCode);
-        return address(
-            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), pod, salt, initHash))))
+    /// the operator is a minimal-proxy clone, so predict it the way LibClone
+    /// derives it rather than from PodRecoveryOperator's own creation code
+    function _predictOperator(address pod, bytes32 salt) internal view returns (address) {
+        return LibClone.predictDeterministicAddress(
+            RoomPod(pod).recoveryOpImpl(), salt, pod
         );
     }
 
@@ -411,6 +413,89 @@ contract AuditFixesTest is SetupTemplate {
     {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, f.quoteDigest(q));
         return abi.encodePacked(r, s, v);
+    }
+
+    /////////////////
+    // FINDING 14 — a shortfall must be shared, not dumped on the last claimant
+
+    function testShortfallIsSplitProRataNotFirstComeFirstServed() public {
+        // two payees owed 1,000 each against only 1,000 of backing. Under the old
+        // all-or-nothing guard the first caller took the lot and the second could
+        // never claim a single unit.
+        _credit(alice.owner, 1_000);
+        _credit(bob.owner, 1_000);
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, market.accID(), MUSU_INDEX, 1_000);
+        vm.stopPrank();
+
+        uint256 aliceBefore = LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX);
+        vm.prank(alice.owner);
+        market.claimOwed();
+        uint256 alicePaid = LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX) - aliceBefore;
+
+        // half the pool, minus the in-world transfer fee
+        assertEq(alicePaid, 500 - 15, "alice takes her share, not everything");
+        assertEq(market.owedMusu(alice.owner), 500, "the rest stays claimable");
+
+        // and bob can still claim — the whole point
+        uint256 bobBefore = LibInventory.getBalanceOf(components, bob.id, MUSU_INDEX);
+        vm.prank(bob.owner);
+        market.claimOwed();
+        assertGt(
+            LibInventory.getBalanceOf(components, bob.id, MUSU_INDEX),
+            bobBefore,
+            "the last claimant is no longer left with nothing"
+        );
+    }
+
+    function testFullyBackedClaimsStillPayInFull() public {
+        _credit(alice.owner, 1_000);
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, market.accID(), MUSU_INDEX, 1_000);
+        vm.stopPrank();
+
+        uint256 before = LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX);
+        vm.prank(alice.owner);
+        market.claimOwed();
+        assertEq(
+            LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX) - before,
+            1_000 - 15,
+            "no partial-payment behaviour when the hub is solvent"
+        );
+        assertEq(market.owedMusu(alice.owner), 0, "balance cleared");
+    }
+
+    function _credit(address payee, uint256 amount) internal {
+        stdstore.target(address(market)).sig("owedMusu(address)").with_key(payee).checked_write(
+            amount
+        );
+        stdstore.target(address(market)).sig("owedMusuTotal()").checked_write(
+            market.owedMusuTotal() + amount
+        );
+    }
+
+    /////////////////
+    // FINDING 15 — a kami sent to the pool early must not be stranded
+
+    function testKamiSentBeforeDeclaringCanStillBeDeclared() public {
+        uint256 kamiID = _mintKami(alice);
+        uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+        // the slip: send FIRST, declare second. declareKami used to reject this
+        // (kami no longer in the owner's account) while withdrawToOwner needs a
+        // listing only declareKami creates -- permanently stuck, no rescue path.
+        vm.prank(alice.operator);
+        _KamiSendSystem.executeTyped(tokenIndex, address(pool));
+        _fastForward(2 hours);
+        assertEq(LibKami.getAccount(components, kamiID), pool.accID(), "kami is in the pool");
+
+        vm.prank(alice.owner);
+        pool.declareKami(tokenIndex);
+
+        // and it is recorded as already arrived, so the flow continues normally
+        vm.prank(alice.owner);
+        pool.confirmAndPublish(tokenIndex, address(0));
+        assertEq(market.listingBeneficiary(tokenIndex), alice.owner, "listed and recoverable");
     }
 
     /// raise the kami's XP so the next settle sees a delta, without harvesting
