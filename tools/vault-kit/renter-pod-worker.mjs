@@ -357,7 +357,13 @@ async function ingestEvents() {
 
 async function ensureOperatorGas(tokenIndex, request, operator) {
   const balance = await provider.getBalance(operator.address);
-  const reserve = 1_000_000_000_000n;
+  // One operating action costs ~1,611,833 gas at the chain's 2.5 Mwei price
+  // ~= 4.03e12 wei, and the bot averages ~2 tx per 439-minute cycle
+  // ~= 6.6 tx/day ~= 2.7e13 wei/day. The old reserve (1e12) bought a QUARTER
+  // of one action: the first top-up was also the last one that could ever
+  // matter, and the rest of the lease's escrowed gas budget stranded in the
+  // factory. 3e13 keeps roughly one day of actions (~7 tx) on the operator.
+  const reserve = 30_000_000_000_000n;
   if (balance >= reserve || request.gasBudget === 0n) return;
   const amount = request.gasBudget < reserve ? request.gasBudget : reserve;
   await (await factory.connect(operator).pullGas(tokenIndex, amount)).wait();
