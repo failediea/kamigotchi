@@ -70,6 +70,7 @@ contract RoomPod {
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
   event Swept(uint256 amount);
+  event FeeFloatReturned(uint256 amount);
   event RecoveryModeEntered();
   event RecoveryHarvestStopAttempt(uint256 harvestID, bool stopped);
   event ReturnedToPool(address indexed pool);
@@ -199,7 +200,22 @@ contract RoomPod {
   function sweepMusu() external returns (uint256 swept) {
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 feeFromProceeds = payItem == MUSU_INDEX ? TRANSFER_FEE : 0;
-    if (bal <= feeFromProceeds) return 0;
+
+    // The factory's sweep is this pod's last act, so on a non-MUSU pod it also
+    // carries the unspent MUSU fee float home in the same batch. Without this,
+    // every finalized pod strands whatever seed it did not burn as fees — and a
+    // seed that scales with term would hand griefers a way to park the hub's
+    // float in dead pods by churning cheap leases. Each index in the batch
+    // costs its own in-world fee, so the float only rides along when it more
+    // than covers that fee; anything smaller strands as accepted dust.
+    uint256 floatReturn;
+    if (msg.sender == factory && payItem != MUSU_INDEX) {
+      uint256 held = feeFloat();
+      uint256 fees = bal > feeFromProceeds ? 2 * TRANSFER_FEE : TRANSFER_FEE;
+      if (held > fees) floatReturn = held - fees;
+    }
+
+    if (bal <= feeFromProceeds && floatReturn == 0) return 0;
     // The hub credits the FULL xp delta but only receives bal - fee, so every
     // sweep whose flat fee exceeds the management cut it accrues leaves users
     // under-backed. sweepMusu is permissionless and drains to zero, so without a
@@ -215,15 +231,26 @@ contract RoomPod {
     // MUSU, so without a seeded float the sweep can never happen and the pod's
     // whole balance strands while the hub keeps crediting the xp delta. The
     // factory seeds this at pod creation; feeFloat() lets ops see it draining.
-    if (payItem != MUSU_INDEX && feeFloat() < TRANSFER_FEE) return 0;
-    swept = bal - feeFromProceeds;
+    // A positive floatReturn already proves the float covers every fee below.
+    if (payItem != MUSU_INDEX && floatReturn == 0 && feeFloat() < TRANSFER_FEE) return 0;
+    swept = bal > feeFromProceeds ? bal - feeFromProceeds : 0;
 
-    uint32[] memory indices = new uint32[](1);
-    uint256[] memory amts = new uint256[](1);
-    indices[0] = payItem;
-    amts[0] = swept;
+    uint256 n = (swept > 0 ? 1 : 0) + (floatReturn > 0 ? 1 : 0);
+    uint32[] memory indices = new uint32[](n);
+    uint256[] memory amts = new uint256[](n);
+    uint256 i;
+    if (swept > 0) {
+      indices[i] = payItem;
+      amts[i] = swept;
+      i++;
+    }
+    if (floatReturn > 0) {
+      indices[i] = MUSU_INDEX;
+      amts[i] = floatReturn;
+    }
     ItemTransferSystem(_sys(ItemTransferSystemID)).executeTyped(indices, amts, hub.accID());
     emit Swept(swept);
+    if (floatReturn > 0) emit FeeFloatReturned(floatReturn);
   }
 
   /// @notice MUSU this pod holds to pay its own in-world transfer fees. Only

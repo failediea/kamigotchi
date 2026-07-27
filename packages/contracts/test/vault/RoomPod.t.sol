@@ -283,4 +283,63 @@ contract RoomPodTest is SetupTemplate {
     assertEq(vippPod.sweepMusu(), 0, "cannot pay the game's MUSU transfer fee");
     assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), vippIndex), 1_000);
   }
+
+  function testTerminalVippSweepReturnsUnusedFloatToHub() public {
+    uint32 vippIndex = 2;
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
+    vippMarket.initialize(_getNextUserAddress(), "vipphub3");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex, recoveryImpl);
+    vippPod.initialize(_getNextUserAddress(), "vipppod3");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, 45);
+    vm.stopPrank();
+
+    // this test contract deployed the pod, so it IS the factory: this sweep is
+    // the terminal one and must carry the unused float home in the same batch.
+    // 45 held, two indices cost 30 in fees, so 15 rides back to the hub.
+    uint256 swept = vippPod.sweepMusu();
+    assertEq(swept, 1_000, "proceeds still move in full");
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), vippIndex), 1_000);
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), MUSU_INDEX), 0, "pod fully drained");
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), MUSU_INDEX), 15, "unused float returned");
+  }
+
+  function testTerminalVippSweepReturnsFloatEvenWithNothingFarmed() public {
+    uint32 vippIndex = 2;
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
+    vippMarket.initialize(_getNextUserAddress(), "vipphub4");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex, recoveryImpl);
+    vippPod.initialize(_getNextUserAddress(), "vipppod4");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, 45);
+    vm.stopPrank();
+
+    // a lease canceled before farming still finalizes: the terminal sweep has
+    // no proceeds but must not strand the seed. single index, one 15 fee.
+    assertEq(vippPod.sweepMusu(), 0, "nothing farmed");
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), MUSU_INDEX), 0, "pod fully drained");
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), MUSU_INDEX), 30, "float minus one fee returned");
+  }
+
+  function testOpenCallerSweepDoesNotTouchTheFloat() public {
+    uint32 vippIndex = 2;
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, vippIndex);
+    vippMarket.initialize(_getNextUserAddress(), "vipphub5");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", vippIndex, recoveryImpl);
+    vippPod.initialize(_getNextUserAddress(), "vipppod5");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), vippIndex, 1_000);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, 45);
+    vm.stopPrank();
+
+    // the float only rides home on the FACTORY's terminal sweep. a mid-lease
+    // permissionless sweep spends one fee and leaves the rest for later.
+    address rando = _getNextUserAddress();
+    vm.prank(rando);
+    uint256 swept = vippPod.sweepMusu();
+    assertEq(swept, 1_000, "proceeds move");
+    assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), MUSU_INDEX), 30, "float stays with the pod");
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), MUSU_INDEX), 0, "hub got no float");
+  }
 }

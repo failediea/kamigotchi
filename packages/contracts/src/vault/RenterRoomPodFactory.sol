@@ -68,9 +68,15 @@ contract RenterRoomPodFactory {
     uint64 public constant PREPARING_GRACE = 2 days;
     uint64 public constant FINALIZED_GRACE = 2 days;
     /// @notice MUSU seeded to a non-MUSU pod so it can pay its own sweep fees.
-    ///         10 sweeps' worth — a lease needs one terminal sweep plus headroom
-    ///         for mid-term collections and retries.
-    uint256 public constant POD_FEE_FLOAT_SEED = 150;
+    ///         3 fees' worth: the worker sweeps exactly once, at finalization
+    ///         (measured — renter-pod-worker.mjs makes a single sweep call), the
+    ///         terminal batch spends a second fee when the unused float rides
+    ///         home with it, and the spare covers one manual mid-lease sweep.
+    ///         The old 150 assumed ten sweeps that never happen and stranded
+    ///         ~135 in every dead pod. Now that the terminal sweep returns the
+    ///         unused float to the hub, a small seed also caps what lease-churn
+    ///         can park in not-yet-finalized pods.
+    uint256 public constant POD_FEE_FLOAT_SEED = 45;
 
     struct Quote {
         address renter;
