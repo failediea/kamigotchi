@@ -22,3 +22,6 @@ tools/**/*deployment*.json
 tools/**/*.pem
 tools/**/*.key
 tools/**/*.log
+
+# local dev stack state (scripts/services)
+.local-stack/
