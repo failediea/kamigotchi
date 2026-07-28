@@ -25,6 +25,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
     HubGuard hubGuard;
     address marketOperator;
     address keeper;
+    address settler;
     address lastPod;
     address lastPodOperator;
 
@@ -41,6 +42,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         super.setUp();
         marketOperator = vm.addr(PROVISIONING_SIGNER_KEY);
         keeper = vm.addr(KEEPER_KEY);
+        settler = _getNextUserAddress();
 
         market = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, MUSU_INDEX);
         renterPodFactory = new RenterRoomPodFactory(
@@ -50,7 +52,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         PersonalRentalPoolRegistry registry = new PersonalRentalPoolRegistry(address(this));
         marketOperator = address(hubGuard);
         market.initialize(marketOperator, "leasehub");
-        market.setSettler(address(this));
+        market.setSettler(settler);
         market.setMgmtAccount(charlie.id);
         market.setLeaseFactory(address(renterPodFactory));
         market.setPoolRegistry(address(registry));
@@ -455,6 +457,26 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(remaining, OPERATING_GAS - 0.0005 ether);
     }
 
+    function testOnlyKeeperAdvancesProvisioning() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _request(tokenIndex);
+
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotProvisioner.selector);
+        renterPodFactory.markLeasePreparing(tokenIndex);
+
+        vm.prank(keeper);
+        renterPodFactory.markLeasePreparing(tokenIndex);
+
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotProvisioner.selector);
+        renterPodFactory.routePreparedKami(tokenIndex);
+
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotProvisioner.selector);
+        renterPodFactory.activateProvisionedLease(tokenIndex);
+    }
+
     function testRenterUpdatesLiveKamibotsPrefsThroughFactory() public {
         (, uint32 tokenIndex) = _listAndPublish();
         _accept(tokenIndex);
@@ -490,6 +512,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _accept(tokenIndex);
         _fastForward(1 days + 1);
         market.endLease(tokenIndex);
+        vm.prank(settler);
         market.finalizeLease(tokenIndex);
 
         vm.prank(lastPodOperator);
@@ -518,9 +541,16 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(bob.owner.balance, renterBefore, "refund waits for verified pool return");
 
         vm.prank(lastPodOperator);
+        renterPodFactory.returnGas{value: 0.0005 ether}(tokenIndex);
+
+        vm.prank(lastPodOperator);
         _KamiSendSystem.executeTyped(tokenIndex, address(pool));
         renterPodFactory.finalizeGasRefund(tokenIndex);
-        assertEq(bob.owner.balance, renterBefore + OPERATING_GAS, "unused operating gas returned");
+        assertEq(
+            bob.owner.balance,
+            renterBefore + OPERATING_GAS + 0.0005 ether,
+            "factory refund includes terminal operator gas"
+        );
 
         KamiLeaseMarket.Listing memory listing = market.listings(tokenIndex);
         assertEq(LibKami.getAccount(components, kamiID), pool.accID());
@@ -553,7 +583,32 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _fastForward(1 days + 1);
         vm.prank(alice.owner); // expired: anyone may trigger the stop/finalize flow
         market.endLease(tokenIndex);
+        vm.prank(settler);
         market.finalizeLease(tokenIndex);
+    }
+
+    function testRenterCanFinalizeAfterEndingGrace() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        _fastForward(1 days + 1);
+        market.endLease(tokenIndex);
+        _fastForward(2 days);
+
+        vm.prank(bob.owner);
+        market.finalizeLease(tokenIndex);
+        assertEq(market.leaseRenter(tokenIndex), address(0), "renter timeout path clears lease");
+    }
+
+    function testOwnerPoolCanFinalizeAfterEndingGrace() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        _fastForward(1 days + 1);
+        market.endLease(tokenIndex);
+        _fastForward(2 days);
+
+        vm.prank(alice.owner);
+        pool.finalizeLease(tokenIndex);
+        assertEq(market.leaseRenter(tokenIndex), address(0), "owner timeout path clears lease");
     }
 
     function testTenPercentFeeAndOwnerRenterSplitRemainInGlobalMarket() public {
@@ -562,6 +617,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _harvestInHub(kamiID, 100_000);
 
         uint256 gross = market.pendingXpDelta(tokenIndex);
+        vm.prank(settler);
         market.settle();
         uint256 platformCut = (gross * PLATFORM_BPS) / 10_000;
         uint256 net = gross - platformCut;
@@ -578,6 +634,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _listAndPublish();
         _listAndPublish();
 
+        vm.prank(settler);
         market.settleBatch(1);
         assertTrue(market.settlementInProgress(), "first bounded batch leaves cycle open");
         assertEq(market.settleCursor(), 1);
@@ -587,8 +644,22 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertFalse(market.settlementInProgress(), "anyone can finish a started cycle");
         assertEq(market.settleCursor(), 0);
 
+        vm.prank(settler);
         vm.expectRevert(KamiLeaseMarket.Cooldown.selector);
         market.settleBatch(1);
+    }
+
+    function testStrangerCannotStartSettlementCycle() public {
+        vm.prank(bob.owner);
+        vm.expectRevert(KamiLeaseMarket.NotSettler.selector);
+        market.settleBatch(1);
+    }
+
+    function testSettlementBecomesPermissionlessWhenSettlerIsStale() public {
+        _fastForward(3 days);
+        vm.prank(bob.owner);
+        market.settleBatch(1);
+        assertGt(market.lastSettleAt(), 0, "stale settler fallback starts a cycle");
     }
 
     function testSettlementRejectsUnboundedCallerInput() public {
@@ -605,6 +676,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _accept(tokenIndex);
         _fastForward(1 days + 1);
         market.endLease(tokenIndex); // expired, permissionless
+        vm.prank(settler);
         market.finalizeLease(tokenIndex);
 
         vm.prank(alice.owner);
@@ -632,8 +704,213 @@ contract PersonalRentalVaultTest is SetupTemplate {
         _accept(tokenIndex);
         _harvestInHub(kamiID, 100_000);
         RoomPod(lastPod).sweepMusu();
+        vm.prank(settler);
         market.settle();
         vm.prank(bob.owner);
         market.claimMgmt(); // anyone may relay; payout can only go to fixed charlie.id
+    }
+
+    function testRecoveryOperatorRejectsNonPodAndRebinding() public {
+        PodRecoveryOperator recovery = new PodRecoveryOperator();
+        recovery.initialize(address(this));
+
+        vm.prank(bob.owner);
+        vm.expectRevert(PodRecoveryOperator.NotPod.selector);
+        recovery.exec(address(market), "");
+
+        vm.expectRevert(PodRecoveryOperator.AlreadyBound.selector);
+        recovery.initialize(bob.owner);
+    }
+}
+
+/**
+ * Terminal non-MUSU regressions use a real factory, operator EOA and unrelated
+ * caller. RoomPod-only tests cannot prove this path because their test contract
+ * is also the pod's deploying factory.
+ */
+contract RenterRoomPodTerminalTest is SetupTemplate {
+    KamiLeaseMarket market;
+    RenterRoomPodFactory podFactory;
+    PersonalRentalPool pool;
+    address keeper;
+    address podOperator;
+
+    uint256 constant QUOTE_SIGNER_KEY = 0xA11CE;
+    uint256 constant KEEPER_KEY = 0xB0B;
+    uint16 constant PLATFORM_BPS = 1_000;
+    uint16 constant OWNER_BPS = 3_000;
+    uint32 constant VIPP_INDEX = 2;
+
+    function setUp() public override {
+        super.setUp();
+        keeper = vm.addr(KEEPER_KEY);
+        podOperator = _getNextUserAddress();
+
+        market = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, VIPP_INDEX);
+        podFactory = new RenterRoomPodFactory(
+            world, address(market), vm.addr(QUOTE_SIGNER_KEY), keeper
+        );
+        HubGuard guard = new HubGuard(world, address(market), address(podFactory));
+        PersonalRentalPoolRegistry registry = new PersonalRentalPoolRegistry(address(this));
+        market.initialize(address(guard), "terminalvipphub");
+        market.setSettler(_getNextUserAddress());
+        market.setMgmtAccount(charlie.id);
+        market.setLeaseFactory(address(podFactory));
+        market.setPoolRegistry(address(registry));
+        market.sealAdmin();
+
+        // Non-MUSU checkout spends 60 MUSU: 45 reaches the pod and 15 is the
+        // in-world transfer fee. Give the test hub enough float for every case.
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, market.accID(), MUSU_INDEX, 1_000);
+        vm.stopPrank();
+
+        PersonalRentalPool implementation = new PersonalRentalPool();
+        PersonalRentalVaultFactory vaultFactory = new PersonalRentalVaultFactory(
+            world, address(implementation), address(0), address(market), address(registry)
+        );
+        registry.setFactory(address(vaultFactory));
+        vm.prank(alice.owner);
+        PersonalRentalVault v = PersonalRentalVault(
+            vaultFactory.createVault("Alice terminal vault")
+        );
+        vm.prank(alice.owner);
+        pool = PersonalRentalPool(
+            v.createPool(address(market), OWNER_BPS, 7 days, "terminalvipppool")
+        );
+    }
+
+    function _sign(RenterRoomPodFactory.Quote memory quote, uint256 key)
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, podFactory.quoteDigest(quote));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _activate() internal returns (uint32 tokenIndex, RoomPod pod) {
+        uint256 kamiID = _mintKami(alice);
+        tokenIndex = LibKami.getIndex(components, kamiID);
+        vm.prank(alice.owner);
+        pool.declareKami(tokenIndex);
+        vm.prank(alice.operator);
+        _KamiSendSystem.executeTyped(tokenIndex, address(pool));
+        vm.prank(alice.owner);
+        pool.confirmAndPublish(tokenIndex, address(0));
+        _fastForward(2 hours);
+
+        RenterRoomPodFactory.Quote memory quote = RenterRoomPodFactory.Quote({
+            renter: bob.owner,
+            tokenIndex: tokenIndex,
+            nodeIndex: 1,
+            operator: podOperator,
+            expectedOwnerShareBps: OWNER_BPS,
+            termSecs: 1 days,
+            setupGasWei: 0,
+            hubGasWei: 0,
+            operatingGasWei: 0,
+            deadline: uint64(block.timestamp + 1 hours),
+            nonce: keccak256(abi.encode("terminal", tokenIndex)),
+            label: "Misty Riverside (EERIE)",
+            accountName: "terminalvipppod",
+            prefs: '{"node":1,"risk":"balanced"}'
+        });
+        address podAddress = podFactory.createPodAndRequestLease(
+            quote, _sign(quote, QUOTE_SIGNER_KEY), _sign(quote, KEEPER_KEY)
+        );
+        pod = RoomPod(podAddress);
+
+        vm.prank(keeper);
+        podFactory.markLeasePreparing(tokenIndex);
+        _fastForward(2 hours);
+        vm.prank(keeper);
+        podFactory.routePreparedKami(tokenIndex);
+        _fastForward(2 hours);
+        vm.prank(keeper);
+        podFactory.activateProvisionedLease(tokenIndex);
+
+        _fastForward(1 days + 1);
+        vm.prank(podOperator);
+        market.endLease(tokenIndex);
+    }
+
+    function testTerminalFactoryCallRejectsAnArbitraryCaller() public {
+        (uint32 tokenIndex,) = _activate();
+
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotOperator.selector);
+        podFactory.finalizeMarketLease(tokenIndex);
+
+        (,,,,, uint8 stage) = podFactory.requests(tokenIndex);
+        assertEq(stage, 3, "failed caller leaves request active");
+    }
+
+    function testTerminalFactorySweepBypassesOpenCallerFloorAndReturnsFloat() public {
+        (uint32 tokenIndex, RoomPod pod) = _activate();
+        assertEq(pod.feeFloat(), 45, "checkout seeded the fee float");
+
+        // 100 is below minSweep (150), but the once-per-lease factory terminal
+        // sweep must move it instead of booking unbacked final liabilities.
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, pod.accID(), VIPP_INDEX, 100);
+        vm.stopPrank();
+        uint256 hubMusuBefore = LibInventory.getBalanceOf(
+            components, market.accID(), MUSU_INDEX
+        );
+
+        vm.prank(podOperator);
+        podFactory.finalizeMarketLease(tokenIndex);
+
+        assertEq(pod.musuBalance(), 0, "pay item drained");
+        assertEq(pod.feeFloat(), 0, "terminal float drained");
+        assertEq(
+            LibInventory.getBalanceOf(components, market.accID(), VIPP_INDEX),
+            100,
+            "VIPP reached the hub"
+        );
+        assertEq(
+            LibInventory.getBalanceOf(components, market.accID(), MUSU_INDEX)
+                - hubMusuBefore,
+            15,
+            "unused float returned after both transfer fees"
+        );
+        assertEq(market.leaseRenter(tokenIndex), address(0), "accounting finalized");
+    }
+
+    function testTerminalFactorySweepReturnsFloatWhenNothingWasFarmed() public {
+        (uint32 tokenIndex, RoomPod pod) = _activate();
+        uint256 hubMusuBefore = LibInventory.getBalanceOf(
+            components, market.accID(), MUSU_INDEX
+        );
+
+        vm.prank(podOperator);
+        podFactory.finalizeMarketLease(tokenIndex);
+
+        assertEq(pod.musuBalance(), 0, "no proceeds remain");
+        assertEq(pod.feeFloat(), 0, "unused seed did not strand");
+        assertEq(
+            LibInventory.getBalanceOf(components, market.accID(), MUSU_INDEX)
+                - hubMusuBefore,
+            30,
+            "one fee paid and the rest returned"
+        );
+    }
+
+    function testInsufficientFeeFloatCannotFinalizeOverVippProceeds() public {
+        (uint32 tokenIndex, RoomPod pod) = _activate();
+        vm.startPrank(deployer);
+        LibInventory.decFor(components, pod.accID(), MUSU_INDEX, 35);
+        LibInventory.incFor(components, pod.accID(), VIPP_INDEX, 1_000);
+        vm.stopPrank();
+
+        vm.prank(podOperator);
+        vm.expectRevert(KamiLeaseMarket.TerminalSweepIncomplete.selector);
+        podFactory.finalizeMarketLease(tokenIndex);
+
+        assertEq(pod.musuBalance(), 1_000, "proceeds remain retryable");
+        assertEq(market.leaseRenter(tokenIndex), bob.owner, "liabilities were not credited");
+        (,,,,, uint8 stage) = podFactory.requests(tokenIndex);
+        assertEq(stage, 3, "request remains recoverable");
     }
 }

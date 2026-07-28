@@ -35,6 +35,7 @@ contract OwedDustTest is SetupTemplate {
     using stdStorage for StdStorage;
 
     KamiLeaseMarket market;
+    address settler;
 
     uint256 constant QUOTE_SIGNER_KEY = 0xA11CE;
     uint256 constant KEEPER_KEY = 0xB0B;
@@ -43,6 +44,7 @@ contract OwedDustTest is SetupTemplate {
 
     function setUp() public override {
         super.setUp();
+        settler = _getNextUserAddress();
         market = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, MUSU_INDEX);
         RenterRoomPodFactory podFactory = new RenterRoomPodFactory(
             world, address(market), vm.addr(QUOTE_SIGNER_KEY), vm.addr(KEEPER_KEY)
@@ -50,7 +52,7 @@ contract OwedDustTest is SetupTemplate {
         HubGuard hubGuard = new HubGuard(world, address(market), address(podFactory));
         PersonalRentalPoolRegistry registry = new PersonalRentalPoolRegistry(address(this));
         market.initialize(address(hubGuard), "dusthub");
-        market.setSettler(address(this));
+        market.setSettler(settler);
         market.setMgmtAccount(charlie.id);
         market.setLeaseFactory(address(podFactory));
         market.setPoolRegistry(address(registry));

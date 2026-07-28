@@ -17,7 +17,11 @@ import { HarvestGuard } from "vault/HarvestGuard.sol";
  * sacrifice, sell, or act on kamis that aren't theirs. Shipping is keeper-only
  * and can only target the hub pool or the kami's recorded owner.
  */
-contract HarvestGuardTest is SetupTemplate {
+// Kept abstract because self-farm/direct-listing was removed before v16.
+// Treating these obsolete scenarios as five passing skips obscured the real
+// release result; current Kamibots-only coverage lives in the active
+// renter-funded pod suites.
+abstract contract HarvestGuardLegacyDocumentation is SetupTemplate {
   KamiLeaseMarket market;
   RoomPod pod;
   HarvestGuard guard;
@@ -31,8 +35,7 @@ contract HarvestGuardTest is SetupTemplate {
 
   function setUp() public override {
     // LEGACY SUITE — v13 direct-listing API (see KamiLeaseMarket.t.sol note).
-    // All 5 tests die on InvalidPool under the v15 pool-registry market.
-    vm.skip(true);
+    // All 5 scenarios die on InvalidPool under the v16 pool-registry market.
     super.setUp();
 
     marketOperator = _getNextUserAddress();

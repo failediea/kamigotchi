@@ -67,6 +67,7 @@ contract RoomPod {
   string public label; // human tile name, e.g. "Misty Riverside (EERIE)"
   bool public recoveryMode;
 
+
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
   event Swept(uint256 amount);
@@ -198,18 +199,24 @@ contract RoomPod {
   ///         the destination is hard-wired to the hub's game account. the
   ///         in-world fee is always charged in MUSU, even for another pay item.
   function sweepMusu() external returns (uint256 swept) {
+    bool terminal = msg.sender == factory || msg.sender == address(hub);
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 feeFromProceeds = payItem == MUSU_INDEX ? TRANSFER_FEE : 0;
 
-    // The factory's sweep is this pod's last act, so on a non-MUSU pod it also
+    // A terminal sweep is this pod's last act, so on a non-MUSU pod it also
     // carries the unspent MUSU fee float home in the same batch. Without this,
     // every finalized pod strands whatever seed it did not burn as fees — and a
     // seed that scales with term would hand griefers a way to park the hub's
     // float in dead pods by churning cheap leases. Each index in the batch
     // costs its own in-world fee, so the float only rides along when it more
     // than covers that fee; anything smaller strands as accepted dust.
+    //
+    // The market calls through the hub and the renter factory calls directly;
+    // both are immutable liability-boundary callers. An operator-sent sweep
+    // stays permissionless but cannot return the float or bypass the public
+    // anti-grief floor.
     uint256 floatReturn;
-    if (msg.sender == factory && payItem != MUSU_INDEX) {
+    if (terminal && payItem != MUSU_INDEX) {
       uint256 held = feeFloat();
       uint256 fees = bal > feeFromProceeds ? 2 * TRANSFER_FEE : TRANSFER_FEE;
       if (held > fees) floatReturn = held - fees;
@@ -226,7 +233,7 @@ contract RoomPod {
     // is the last one this pod will ever do, so refusing it would strand the
     // residue instead of protecting anyone. The floor exists to stop UNBOUNDED
     // repetition, which a once-per-lease call cannot cause.
-    if (msg.sender != factory && bal < minSweep()) return 0;
+    if (!terminal && bal < minSweep()) return 0;
     // A non-MUSU pod earns only payItem but the game still charges its fee in
     // MUSU, so without a seeded float the sweep can never happen and the pod's
     // whole balance strands while the hub keeps crediting the xp delta. The

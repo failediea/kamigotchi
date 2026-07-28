@@ -506,7 +506,9 @@ contract RenterRoomPodFactory {
 
     function returnGas(uint32 tokenIndex) external payable {
         Request storage request = requests[tokenIndex];
-        if (request.stage != PREPARING && request.stage != ACTIVE) revert BadStage();
+        // Returning value cannot advance a request or choose its beneficiary, so
+        // the exact on-chain pod operator may do it at any uncleared stage. That
+        // includes terminal cleanup immediately before its ephemeral key is erased.
         if (msg.sender != _operator(request.pod)) revert NotOperator();
         request.gasBudget += msg.value;
         emit GasReturned(tokenIndex, msg.sender, msg.value);
@@ -568,6 +570,12 @@ contract RenterRoomPodFactory {
     /// @notice The dedicated pod operator pays the final stop/sweep/accounting
     /// transaction from the renter-funded gas it already holds. The market sees
     /// only this immutable factory, and this factory verifies the exact operator.
+    ///
+    /// The market performs the terminal sweep itself and verifies the pod's
+    /// inventory before it credits the final XP delta. Keeping this operator
+    /// entrypoint atomic prevents the worker from clearing its ephemeral key
+    /// between the sweep and accounting transactions; the same receipt also
+    /// protects settler and timed-out user finalization paths.
     function finalizeMarketLease(uint32 tokenIndex) external nonReentrant {
         Request storage request = requests[tokenIndex];
         if (request.stage != ACTIVE || msg.sender != _operator(request.pod)) revert NotOperator();

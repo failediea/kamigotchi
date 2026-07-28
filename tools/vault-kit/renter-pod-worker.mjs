@@ -27,7 +27,12 @@ import {
   kamibotsStrategySignature,
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
-import { StageZeroAction, stageZeroAction } from "./renter-pod-recovery.mjs";
+import {
+  StageZeroAction,
+  operatorGasReturnAmount,
+  operatorGasTopUpAmount,
+  stageZeroAction,
+} from "./renter-pod-recovery.mjs";
 import {
   bindOperatorReservationQuote,
   claimOperatorReservation,
@@ -100,6 +105,7 @@ const factory = new Contract(
     "function routePreparedKami(uint32)",
     "function activateProvisionedLease(uint32)",
     "function pullGas(uint32,uint256)",
+    "function returnGas(uint32) payable",
     "function finalizeMarketLease(uint32)",
     "function finalizeGasRefund(uint32)",
     "function finalizePreparingCancellation(uint32)",
@@ -364,9 +370,35 @@ async function ensureOperatorGas(tokenIndex, request, operator) {
   // matter, and the rest of the lease's escrowed gas budget stranded in the
   // factory. 3e13 keeps roughly one day of actions (~7 tx) on the operator.
   const reserve = 30_000_000_000_000n;
-  if (balance >= reserve || request.gasBudget === 0n) return;
-  const amount = request.gasBudget < reserve ? request.gasBudget : reserve;
+  const amount = operatorGasTopUpAmount(balance, request.gasBudget, reserve);
+  if (amount === 0n) return;
   await (await factory.connect(operator).pullGas(tokenIndex, amount)).wait();
+}
+
+async function returnUnusedOperatorGas(tokenIndex, operator) {
+  const balance = await provider.getBalance(operator.address);
+  if (balance === 0n) return;
+
+  const gasPrice = (await provider.getFeeData()).gasPrice;
+  if (gasPrice == null) throw new Error("could not price the terminal operator gas return");
+
+  const connected = factory.connect(operator);
+  // Estimate the storage-changing path even when the factory budget is zero.
+  const gasLimit = await connected.returnGas.estimateGas(tokenIndex, { value: 1n });
+  const amount = operatorGasReturnAmount(balance, gasLimit, gasPrice);
+  if (amount === 0n) return;
+
+  // A legacy-priced transaction makes its maximum cost exact on Yominet. The
+  // value can therefore return the rest of the ephemeral EOA's balance before
+  // its key is erased; the factory includes it in the renter's final refund.
+  await (
+    await connected.returnGas(tokenIndex, {
+      value: amount,
+      gasLimit,
+      gasPrice,
+      type: 0,
+    })
+  ).wait();
 }
 
 async function stopStrategy(job) {
@@ -458,7 +490,6 @@ async function processJob(job) {
     }
     if (listing.ending) {
       await stopStrategy(job);
-      await (await pod.connect(operator).sweepMusu()).wait();
       await (await factory.connect(operator).finalizeMarketLease(job.tokenIndex)).wait();
       job.finalized = true;
       save();
@@ -477,6 +508,7 @@ async function processJob(job) {
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
+      await returnUnusedOperatorGas(job.tokenIndex, operator);
       await (await factory.connect(operator).finalizePreparingCancellation(job.tokenIndex)).wait();
       job.returned = true;
       purgeReturnedJobSecrets(job);
@@ -492,6 +524,7 @@ async function processJob(job) {
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
+      await returnUnusedOperatorGas(job.tokenIndex, operator);
       await (await factory.connect(keeper).finalizeGasRefund(job.tokenIndex)).wait();
       job.returned = true;
       purgeReturnedJobSecrets(job);

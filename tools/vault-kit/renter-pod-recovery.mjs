@@ -17,3 +17,14 @@ export function stageZeroAction({ actualAccID, podAccID, ownerAccID, staked, ret
   if (staked) return StageZeroAction.CONFIRM_POOL_RETURN;
   return StageZeroAction.COMPLETE;
 }
+
+export function operatorGasTopUpAmount(balance, budget, reserve) {
+  if (balance >= reserve || budget === 0n) return 0n;
+  const deficit = reserve - balance;
+  return budget < deficit ? budget : deficit;
+}
+
+export function operatorGasReturnAmount(balance, gasLimit, gasPrice) {
+  const transactionCost = gasLimit * gasPrice;
+  return balance > transactionCost ? balance - transactionCost : 0n;
+}

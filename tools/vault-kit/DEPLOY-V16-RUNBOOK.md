@@ -1,8 +1,9 @@
 # v16 deploy runbook — kami-vault branch
 
-Written 2026-07-27. This is the coordinated deploy that has been pending since
-the audit: 13 audit fixes, the pod-recovery machinery, the VIPP fee-float
-system, and the terminal float return + seed 150→45 (commit `a3b40df`).
+Written 2026-07-27 and corrected after the release audit. This is the
+coordinated deploy that has been pending since the audit: 13 audit fixes, the
+pod-recovery machinery, the VIPP fee-float system, and the terminal float
+return + seed 150→45.
 Everything assumes the `kami-vault` branch of `~/kamigotchi`. The permanent
 deployment record lives in **`~/kamistats/DEPLOYMENTS.md`** (not in this repo)
 — update it in the same change as every step below that touches an address.
@@ -13,7 +14,7 @@ deployment record lives in **`~/kamistats/DEPLOYMENTS.md`** (not in this repo)
 |---|---|---|
 | `RenterRoomPodFactory` | `enterPodRecovery(uint32, bytes32 salt)` — NEW SIGNATURE | audit #1: squat-proof recovery rotation |
 | `RoomPod` | constructor takes `recoveryOpImpl`; recovery clones it via CREATE2 | recovery machinery |
-| `RoomPod.sweepMusu` | factory's terminal sweep also returns unused MUSU float to the hub (`FeeFloatReturned`) | stops seed stranding + churn-drain; makes VIPP viable |
+| `RoomPod.sweepMusu` | market/factory terminal sweeps also return unused MUSU float to the hub (`FeeFloatReturned`) | stops seed stranding + churn-drain; makes VIPP viable |
 | `POD_FEE_FLOAT_SEED` | 150 → 45 (`RenterRoomPodFactory.sol:79`) | worker sweeps ONCE (measured); 150 stranded ~135/pod |
 | `KamiLeaseMarket` | `seedPodFeeFloat`, `musuFeeFloat`, `feeFloatClaimsLeft`, `forfeitDust`, pro-rata `claimOwed`, `_creditPending` in cancel paths | audit fixes + VIPP fee plumbing |
 | `RenterRoomPodFactory` | native `createPodsAndRequestLeases` batch entrypoint | replaces the BatchLease periphery (DEPLOYMENTS.md redeploy rule 3) |
@@ -24,25 +25,39 @@ deployment record lives in **`~/kamistats/DEPLOYMENTS.md`** (not in this repo)
 Open by design: #5 (KamiVault dead code — do NOT deploy it, see DEPLOYMENTS.md
 "Dead contracts"), #7 (XP metering).
 
-## 0. Preconditions — do not start until all true
+## 0. Preconditions and the deploy/cutover boundary
 
 1. **Branch.** `git branch --show-current` says `kami-vault` in
    `~/kamigotchi`. `git status` shows no staged surprises (the uncommitted
-   `tools/vault-kit/ops-bot.mjs` edit is unrelated — leave it alone).
-2. **Tests green.** `cd packages/contracts && forge test --match-path
-   "test/vault/*"` — 83 passed / 0 failed as of `a3b40df` (5 pre-existing
-   documented skips). There is no `run-vault-tests.sh` wrapper; this is the
-   command.
-3. **Lease #10165 on v15 MUSU is finished or ended.** Ends 2026-08-02 19:07
-   UTC unless the renter ends early. Never cut a stack over mid-lease. (v15
-   keeps running either way — this gate is about not splitting attention.)
+   `tools/vault-kit/ops-bot.mjs`/tile-eligibility work is unrelated — leave it
+   unstaged).
+2. **Tests green.** Run the vault files one at a time and one thread at a time;
+   a single full-glob via-IR build can exhaust this WSL VM before Forge prints a
+   result:
+
+   ```bash
+   cd packages/contracts
+   for TEST in test/vault/*.t.sol; do
+     FOUNDRY_PROFILE=v14 forge test --match-path "$TEST" --threads 1 || exit 1
+   done
+   ```
+
+   Every executable suite must exit zero and the aggregate skip count must be
+   zero. Record exact per-file counts from the release commit rather than
+   copying a historical number into the deploy record.
+3. **Lease #10165 is a CUTOVER gate, not a broadcast gate.** It ends
+   2026-08-02 19:07 UTC unless the renter ends early. Steps 1–2, read-only
+   wiring verification, and staging V16 workers on their separate ports can
+   happen while V15 continues serving it. Do not perform the production
+   env/frontend/Caddy cutover in steps 3–5, remove V15 map entries, or stop the
+   V15 units until the lease has finalized and its claims/refund are drained.
 4. **ItemBurn grief posture — ships as a KNOWN ACCEPTED RISK.** The branch
    does NOT close the vector: the renter's in-game operator can call the
    game's `ItemBurnSystem` against the pod's inventory, including the VIPP
    pod's seeded MUSU fee float. What the branch DOES do is bound it:
    - blast radius per pod is capped at `POD_FEE_FLOAT_SEED = 45` MUSU
      (`RenterRoomPodFactory.sol:79`);
-   - the factory's terminal sweep returns any unburned float to the hub
+   - the market/factory terminal sweep returns any unburned float to the hub
      (`RoomPod.sweepMusu` float-return branch, commit `a3b40df`), so churned
      leases no longer strand seed;
    - burning the float is self-harming — the renter's own earnings sweep
@@ -76,6 +91,12 @@ addresses: `script/DeployDualKamiLeaseMarket.s.sol`. The
 (`RenterRoomPodFactory.sol:189`); the factory constructor is
 `(world, market, quoteSigner, keeper)`.
 
+**Registry naming:** the newly deployed `PersonalRentalPoolRegistry` approves
+owner-created pools for these markets. It is NOT either `LeasePodRegistry`
+used by the frontend tile picker. The current tile registries remain
+`0xE205C6A75cB54309874cDF2B2B506E48C72C2871` (MUSU) and
+`0xFea42ab917706F3ADfdA803970a41649C84eF7Cf` (VIPP).
+
 ```bash
 cd /home/matrix/kamigotchi/packages/contracts
 # values: DEPLOYER_* / WORLD_ADDR / YOMINET_RPC / MGMT_ACC_ID from
@@ -92,19 +113,22 @@ VIPP_MARKET_NAME=vipphub16 \
 FOUNDRY_PROFILE=v14 \
 forge script script/DeployDualKamiLeaseMarket.s.sol:DeployDualKamiLeaseMarket \
   --rpc-url "$YOMINET_RPC" --private-key "$DEPLOYER_KEY" \
-  --legacy --slow --broadcast --skip-simulation
+  --legacy --slow
 ```
 
 Notes:
+- The command above is the mandatory dry run. Save and review its predicted
+  addresses, constructor arguments, and transaction sequence. Only then rerun
+  the exact command with `--broadcast`; do not use `--skip-simulation`.
 - `FOUNDRY_PROFILE=v14` is the production profile (via-IR, runs=200 — the
   name is historical; it's what keeps `KamiLeaseMarket` under EIP-170 and
   matches how v15 was compiled per DEPLOYMENTS.md).
 - Hub account names must be fresh (`m16hub` / `vipphub16` following the
   `m15hub` / `vipphub15` convention) — in-game names are unique.
-- The script still deploys the two `BatchLease` periphery contracts. The v16
-  factory has the native `createPodsAndRequestLeases` entrypoint, so per
-  DEPLOYMENTS.md rule 3 either delete those two lines from the script before
-  running, or deploy them and never wire them into kamistats.
+- The reviewed v16 script intentionally does not deploy the obsolete
+  `BatchLease` periphery. The factory's native
+  `createPodsAndRequestLeases` entrypoint is the only batch path. Do not edit
+  the script between the dry run and broadcast.
 - Record the deploy block number — it becomes `START_BLOCK` in step 5.
 
 Then verify the wiring read-only (the checker is env-driven and
@@ -116,7 +140,8 @@ YOMINET_RPC=<rpc> \
 MUSU_MARKET=<V16_MUSU_MARKET> VIPP_MARKET=<V16_VIPP_MARKET> \
 MUSU_RENTER_FACTORY=<V16_MUSU_FACTORY> VIPP_RENTER_FACTORY=<V16_VIPP_FACTORY> \
 MUSU_HUB_GUARD=<V16_MUSU_GUARD> VIPP_HUB_GUARD=<V16_VIPP_GUARD> \
-POOL_REGISTRY=<V16_POOL_REGISTRY> PERSONAL_VAULT_FACTORY=<V16_PERSONAL_FACTORY> \
+PERSONAL_POOL_REGISTRY=<V16_PERSONAL_POOL_REGISTRY> \
+PERSONAL_VAULT_FACTORY=<V16_PERSONAL_FACTORY> \
 QUOTE_SIGNER=0xf1B03dC03b310726e04d524aE1498ccf4FC65BAc \
 MARKET_KEEPER=0x0d0294C57B01ED7189b8A9ba354cf77b935abcDc \
 MGMT_ACC_ID=756360582917686076792667387455343056142985847610 \
@@ -148,6 +173,12 @@ unused seed, so the float mostly recycles. Verify:
 
 ## 3. kamistats env re-key — OPERATOR RUNS THESE
 
+**Do not change `NEXT_PUBLIC_REGISTRY_ADDRESS` or
+`NEXT_PUBLIC_VIPP_REGISTRY_ADDRESS` here.** Those variables are the two
+`LeasePodRegistry` tile directories above, not the new
+`PersonalRentalPoolRegistry`. Pointing either variable at the personal
+registry makes the UI's `allPods()` call fail and empties the tile picker.
+
 `OPERATOR_RESERVATION_URLS` / `OPERATOR_RESERVATION_TOKENS` are JSON maps
 **keyed by lowercase market address** (shape set by
 `fix-reservation-maps.sh`). Add the v16 keys and KEEP the v15 keys until the
@@ -172,12 +203,11 @@ printf '%s' '{"0x94546710ab310fa0beaa92b4b0701d801d8ae800":"<MUSU_TOKEN>","0x3e8
 for PAIR in \
   "NEXT_PUBLIC_MARKET_ADDRESS <V16_MUSU_MARKET>" \
   "NEXT_PUBLIC_VIPP_MARKET_ADDRESS <V16_VIPP_MARKET>" \
-  "NEXT_PUBLIC_REGISTRY_ADDRESS <V16_POOL_REGISTRY>" \
-  "NEXT_PUBLIC_VIPP_REGISTRY_ADDRESS <V16_VIPP_REGISTRY_OR_SAME>" \
   "NEXT_PUBLIC_PERSONAL_VAULT_FACTORY_ADDRESS <V16_PERSONAL_FACTORY>" \
   "NEXT_PUBLIC_MARKET_ACCOUNT_NAME m16hub" \
   "NEXT_PUBLIC_MARKET_VERSION 16" \
-  "NEXT_PUBLIC_VIPP_MARKET_VERSION 16"; do
+  "NEXT_PUBLIC_VIPP_MARKET_VERSION 16" \
+  "NEXT_PUBLIC_PERSONAL_VAULT_VERSION 16"; do
   set -- $PAIR
   npx vercel@latest env rm "$1" production --yes --token "$TOKEN"
   printf '%s' "$2" | npx vercel@latest env add "$1" production --token "$TOKEN"
@@ -191,9 +221,10 @@ paste-block with `tools/vault-kit/make-vercel-env.sh` as the cross-check.
 ## 4. kamistats vault-versions change + ship
 
 File: **`~/kamistats/lib/vault-versions.ts`**. The current entries are built
-from env (step 3 flips them to v16 automatically). What needs editing is the
-append-only `historicalMarkets` array — add the two v15 entries at the TOP
-(newest first), never deleting anything:
+from env (step 3 flips them to v16 automatically). The V15 market entries and
+V15 personal factory are pre-staged on the release branch so they dedupe while
+V15 is current and become legacy sources immediately after the env flips.
+Verify these immutable facts before shipping; never delete an older entry:
 
 ```ts
 {
@@ -202,7 +233,7 @@ append-only `historicalMarkets` array — add the two v15 entries at the TOP
   currency: "MUSU",
   label: "MUSU v15",
   market: "0x94546710aB310FA0BEAa92B4B0701d801d8AE800",
-  registry: "0x0069A041B87Fe9a5cd542908eC752714aCB38A34",
+  registry: "0xE205C6A75cB54309874cDF2B2B506E48C72C2871",
   selfRegistry: "",   // carry over the live NEXT_PUBLIC_SELF_REGISTRY_ADDRESS value if set
   lifecycle: "legacy",
   acceptsNewLeases: false,
@@ -214,13 +245,31 @@ append-only `historicalMarkets` array — add the two v15 entries at the TOP
   currency: "VIPP",
   label: "VIPP v15",
   market: "0x3E83748a2053Aa745ba6125b696072E277ffFa2b",
-  registry: "0x0069A041B87Fe9a5cd542908eC752714aCB38A34",
+  registry: "0xFea42ab917706F3ADfdA803970a41649C84eF7Cf",
   selfRegistry: "",
   lifecycle: "legacy",
   acceptsNewLeases: false,
   has721: false,
 },
 ```
+
+And in `historicalPersonalFactories`:
+
+```ts
+{
+  id: "v15-personal",
+  version: 15,
+  label: "Personal Rental Vault v15",
+  address: "0x3F04d39508d20580A994cf78Badaf73813C3981f",
+  lifecycle: "legacy",
+}
+```
+
+V15 owner pools cannot be registered into V16: the V15 personal registry is
+sealed to its one immutable factory, and every pool is bound to its V15 market.
+The owner UI therefore keeps V15 visible and walks each Kami through the safe
+multi-step migration (finish/cancel → withdraw → create/select V16 pool →
+declare/send/publish). This migration is expected and is not automatic.
 
 (While v15 still has a live lease, `uniqueByAddress` dedupes: the env-driven
 "current" v15 entry wins until step 3 flips the env — safe to land early.)
@@ -229,10 +278,19 @@ moves under services/legacy notes. Then the standard kamistats ship pattern:
 
 ```bash
 cd /home/matrix/kamistats
-git add -A && git commit -m "v16 cutover: v15 -> historical, env-driven current to v16"
+git status --short
+git add -- lib/vault-versions.ts DEPLOYMENTS.md
+git diff --cached --check
+git diff --cached --stat
+git diff --cached
+git commit -m "v16 cutover: v15 -> historical, env-driven current to v16"
 git push origin HEAD
 npx vercel@latest --prod --yes --token "$(tr -d '\r\n' < ~/.vercel-token)"
 ```
+
+Stop if the staged diff contains anything except the two files above. Audit
+and commit application-code changes separately; never use `git add -A` in the
+cutover workflow.
 
 Smoke the quote path immediately: `/api/vault/lease-quote` must return 200 +
 signatures on BOTH v16 markets — this is the check that caught the stale
@@ -243,6 +301,10 @@ reservation map last time.
 v15 units keep running (they still own lease #10165). v16 gets NEW dirs,
 ports, and units — pattern per `repoint-v15-workers.sh` and
 `deploy/README-vps.md`:
+
+The new directories, unit files and services on ports 8791/8792 may be staged
+before the cutover gate. The Caddy repoint at the end of this section must wait
+and move in the same sitting as steps 3–4.
 
 ```bash
 ssh root@68.183.190.126

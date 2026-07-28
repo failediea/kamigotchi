@@ -12,6 +12,13 @@ const expect = (condition, message) => {
 };
 
 const provider = new JsonRpcProvider(required("YOMINET_RPC"));
+const personalPoolRegistry =
+  process.env.PERSONAL_POOL_REGISTRY || process.env.POOL_REGISTRY;
+if (!personalPoolRegistry) {
+  throw new Error(
+    "PERSONAL_POOL_REGISTRY is required (POOL_REGISTRY remains a legacy alias)"
+  );
+}
 const expected = {
   musuMarket: required("MUSU_MARKET"),
   vippMarket: required("VIPP_MARKET"),
@@ -19,7 +26,7 @@ const expected = {
   vippFactory: required("VIPP_RENTER_FACTORY"),
   musuGuard: required("MUSU_HUB_GUARD"),
   vippGuard: required("VIPP_HUB_GUARD"),
-  registry: required("POOL_REGISTRY"),
+  registry: personalPoolRegistry,
   vaultFactory: required("PERSONAL_VAULT_FACTORY"),
   quoteSigner: required("QUOTE_SIGNER"),
   keeper: required("MARKET_KEEPER"),
@@ -97,4 +104,4 @@ expect(same(musuMarket, expected.musuMarket) && same(vippMarket, expected.vippMa
 expect(same(poolRegistry, expected.registry), "vault registry mismatch");
 expect(BigInt(platformAccID) === expected.mgmtAccID, "vault platform account mismatch");
 
-console.log("v15 security deployment verified: both markets sealed, registry sealed, roles split, wiring exact");
+console.log("security deployment verified: both markets sealed, personal-pool registry sealed, roles split, wiring exact");

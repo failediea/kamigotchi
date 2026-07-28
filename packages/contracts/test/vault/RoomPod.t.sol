@@ -150,8 +150,9 @@ contract RoomPodTest is SetupTemplate {
   /////////////////
   // THE FULL POD LEASE CYCLE
 
-  function testLeaseFarmedInPodSettlesExactly() public {
-    vm.skip(true); // v14 lease integration lives in PersonalRentalVault.t.sol
+  // Legacy direct-listing scenario retained for migration reference only.
+  // The executable v16 equivalent lives in PersonalRentalVault.t.sol.
+  function _legacyLeaseFarmedInPodSettlesExactly() internal {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
@@ -195,8 +196,9 @@ contract RoomPodTest is SetupTemplate {
     assertEq(_accountMusu(bob) - bBefore, (net - ownerCut) - TRANSFER_FEE, "renter share");
   }
 
-  function testKamiReturnsPodToHubToOwner() public {
-    vm.skip(true); // v14 returns directly to the immutable Personal Rental Pool
+  // V16 returns directly to the immutable Personal Rental Pool; the active
+  // pool-return assertion lives in PersonalRentalVault.t.sol.
+  function _legacyKamiReturnsPodToHubToOwner() internal {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);
@@ -229,8 +231,9 @@ contract RoomPodTest is SetupTemplate {
   /////////////////
   // MONEY IS ONE-WAY
 
-  function testPodOperatorCannotMoveFunds() public {
-    vm.skip(true); // covered through the v14 renter-funded pod regression suite
+  // The executable v16 operator-isolation regression uses the renter-funded
+  // pod path in PersonalRentalVault.t.sol.
+  function _legacyPodOperatorCannotMoveFunds() internal {
     uint256 kamiID = _mintKami(alice);
     uint32 tokenIndex = _listPool(alice, kamiID);
     _accept(bob, tokenIndex);

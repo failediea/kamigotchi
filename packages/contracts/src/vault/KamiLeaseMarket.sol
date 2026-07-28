@@ -33,6 +33,13 @@ interface IRenterRoomPod {
   function accID() external view returns (uint256);
   function nodeIndex() external view returns (uint32);
   function payItem() external view returns (uint32);
+  function sweepMusu() external returns (uint256);
+  function musuBalance() external view returns (uint256);
+  function feeFloat() external view returns (uint256);
+}
+
+interface IRenterRoomPodFactoryView {
+  function latestPodForKami(uint32 tokenIndex) external view returns (address);
 }
 
 /**
@@ -175,6 +182,8 @@ contract KamiLeaseMarket {
   error NotDust();
   error NotNeeded();
   error FeeFloatEmpty();
+  error FeeZero();
+  error TerminalSweepIncomplete();
   error OwnKami();
   error Reentrancy();
   error RegisterAnAccountFirst();
@@ -246,6 +255,9 @@ contract KamiLeaseMarket {
   // SETUP / ADMIN
 
   constructor(IWorld _world, Kami721, uint16 _mgmtBps, uint32 _payItem) {
+    // RoomPod derives its anti-grief minimum sweep from this cut. A zero cut
+    // makes that floor infinite and permanently strands every open-call sweep.
+    require(_mgmtBps != 0, FeeZero());
     require(_mgmtBps <= 3000, FeeTooHigh());
     require(_payItem != 0, PayItemZero());
     world = _world;
@@ -640,6 +652,19 @@ contract KamiLeaseMarket {
       NotFinalizer()
     );
     require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), "LM: still harvesting");
+
+    // Accounting itself enforces the terminal inventory receipt. Putting this
+    // at the liability boundary means the settler and timed-out user paths
+    // cannot bypass the sweep even if they call the market without the factory.
+    address pod = IRenterRoomPodFactoryView(leaseFactory).latestPodForKami(tokenIndex);
+    IRenterRoomPod roomPod = IRenterRoomPod(pod);
+    require(pod.code.length != 0 && LibKami.getAccount(_comps(), l.kamiID) == roomPod.accID(), NotArrived());
+    roomPod.sweepMusu();
+    uint32 item = roomPod.payItem();
+    if (
+      roomPod.musuBalance() > (item == MUSU_INDEX ? TRANSFER_FEE : 0)
+        || (item != MUSU_INDEX && roomPod.feeFloat() > TRANSFER_FEE)
+    ) revert TerminalSweepIncomplete();
 
     _creditPending(tokenIndex); // final split at the lease's terms
 

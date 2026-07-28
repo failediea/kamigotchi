@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { StageZeroAction, stageZeroAction } from "./renter-pod-recovery.mjs";
+import {
+  StageZeroAction,
+  operatorGasReturnAmount,
+  operatorGasTopUpAmount,
+  stageZeroAction,
+} from "./renter-pod-recovery.mjs";
 
 const base = { actualAccID: 20n, podAccID: 20n, ownerAccID: 10n, staked: true, returning: false };
 
@@ -34,4 +39,15 @@ test("waits when custody is at an unexpected account", () => {
     stageZeroAction({ ...base, actualAccID: 99n }),
     StageZeroAction.WAIT
   );
+});
+
+test("tops an operator up by only the reserve deficit", () => {
+  assert.equal(operatorGasTopUpAmount(29n, 100n, 30n), 1n);
+  assert.equal(operatorGasTopUpAmount(0n, 10n, 30n), 10n);
+  assert.equal(operatorGasTopUpAmount(30n, 100n, 30n), 0n);
+});
+
+test("returns every wei except the exact terminal transaction cost", () => {
+  assert.equal(operatorGasReturnAmount(1_000n, 100n, 3n), 700n);
+  assert.equal(operatorGasReturnAmount(300n, 100n, 3n), 0n);
 });

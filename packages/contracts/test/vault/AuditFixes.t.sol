@@ -40,6 +40,7 @@ contract AuditFixesTest is SetupTemplate {
     PersonalRentalPool pool;
     HarvestGuard harvestGuard;
     address keeper;
+    address settler;
 
     uint256 constant QUOTE_SIGNER_KEY = 0xA11CE;
     uint256 constant KEEPER_KEY = 0xB0B;
@@ -53,6 +54,7 @@ contract AuditFixesTest is SetupTemplate {
     function setUp() public override {
         super.setUp();
         keeper = vm.addr(KEEPER_KEY);
+        settler = _getNextUserAddress();
         market = new KamiLeaseMarket(world, _Kami721, PLATFORM_BPS, MUSU_INDEX);
         podFactory = new RenterRoomPodFactory(
             world, address(market), vm.addr(QUOTE_SIGNER_KEY), keeper
@@ -60,7 +62,7 @@ contract AuditFixesTest is SetupTemplate {
         HubGuard hubGuard = new HubGuard(world, address(market), address(podFactory));
         PersonalRentalPoolRegistry registry = new PersonalRentalPoolRegistry(address(this));
         market.initialize(address(hubGuard), "fixhub");
-        market.setSettler(address(this));
+        market.setSettler(settler);
         market.setMgmtAccount(charlie.id);
         market.setLeaseFactory(address(podFactory));
         market.setPoolRegistry(address(registry));
@@ -204,6 +206,11 @@ contract AuditFixesTest is SetupTemplate {
     /////////////////
     // FINDING 6 — sweeps must pay for themselves
 
+    function testZeroManagementCutIsRejectedBeforeItCanBrickSweeps() public {
+        vm.expectRevert(KamiLeaseMarket.FeeZero.selector);
+        new KamiLeaseMarket(world, _Kami721, 0, MUSU_INDEX);
+    }
+
     function testMinSweepTracksTheManagementCut() public {
         uint32 tokenIndex = _listKami();
         _submit(_quote(tokenIndex, bob.owner, "sweeppod"));
@@ -251,6 +258,7 @@ contract AuditFixesTest is SetupTemplate {
 
         // credit a delta while the term is live -> renter gets their share
         _giveDelta(tokenIndex, 10_000);
+        vm.prank(settler);
         market.settle();
         uint256 renterDuringTerm = market.owedMusu(bob.owner);
         assertGt(renterDuringTerm, 0, "renter earns inside the term they paid for");
@@ -261,6 +269,7 @@ contract AuditFixesTest is SetupTemplate {
         uint256 ownerBefore = market.owedMusu(alice.owner);
         _giveDelta(tokenIndex, 10_000);
         _fastForward(1 days);
+        vm.prank(settler);
         market.settle();
 
         assertEq(market.owedMusu(bob.owner), renterDuringTerm, "expired renter accrues nothing");
@@ -341,7 +350,7 @@ contract AuditFixesTest is SetupTemplate {
         HubGuard g = new HubGuard(world, address(vipp), address(vippFactory));
         PersonalRentalPoolRegistry r = new PersonalRentalPoolRegistry(address(this));
         vipp.initialize(address(g), "vipphub");
-        vipp.setSettler(address(this));
+        vipp.setSettler(settler);
         vipp.setMgmtAccount(charlie.id);
         vipp.setLeaseFactory(address(vippFactory));
         vipp.setPoolRegistry(address(r));
