@@ -14,7 +14,8 @@
  *   OPERATOR_RESERVATION_TOKEN (shared only with the quote API, 32+ chars)
  * Optional: LEGACY_PROVISIONING_OPERATOR_SEED (migration only),
  *   OPERATOR_RESERVATION_HOST, OPERATOR_RESERVATION_PORT,
- *   KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE
+ *   KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE,
+ *   EVENT_CONFIRMATIONS (default 12; confirmed blocks only)
  */
 import { timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -27,6 +28,12 @@ import {
   kamibotsStrategySignature,
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
+import {
+  assertCanonicalCheckpoint,
+  assertCursorSequence,
+  checkpointForBlock,
+  eventIdentity,
+} from "./renter-pod-events.mjs";
 import {
   StageZeroAction,
   operatorGasHealth,
@@ -83,6 +90,10 @@ if (OPERATOR_ACTION_GAS_FLOOR <= 0n) {
 }
 if (OPERATOR_RESERVE_GAS_UNITS < OPERATOR_ACTION_GAS_FLOOR) {
   throw new Error("OPERATOR_RESERVE_GAS_UNITS must cover at least one operator action");
+}
+const EVENT_CONFIRMATIONS = Number(process.env.EVENT_CONFIRMATIONS || 12);
+if (!Number.isSafeInteger(EVENT_CONFIRMATIONS) || EVENT_CONFIRMATIONS < 1 || EVENT_CONFIRMATIONS > 256) {
+  throw new Error("EVENT_CONFIRMATIONS must be an integer between 1 and 256");
 }
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
 const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
@@ -335,15 +346,34 @@ async function walk(job, operator, accID) {
 
 async function ingestEvents() {
   const latest = await provider.getBlockNumber();
-  if (!state.lastBlock) state.lastBlock = Math.max(0, latest - 2_000);
-  if (state.lastBlock > latest) return;
+  assertCursorSequence(state.lastBlock, state.eventCursor);
+  if (state.eventCursor) {
+    const canonicalCheckpoint = await provider.getBlock(state.eventCursor.blockNumber);
+    assertCanonicalCheckpoint(state.eventCursor, canonicalCheckpoint);
+  }
+
+  // Do not consume tip events: advancing the durable cursor past a block that
+  // is later reorganized can permanently miss its canonical replacement.
+  const confirmedTip = latest - EVENT_CONFIRMATIONS;
+  if (confirmedTip < 0) return;
+  if (!state.lastBlock) state.lastBlock = Math.max(0, confirmedTip - 2_000);
+  if (state.lastBlock > confirmedTip) return;
+  const confirmedBlockBefore = await provider.getBlock(confirmedTip);
+  if (!confirmedBlockBefore) throw new Error(`confirmed block ${confirmedTip} is unavailable`);
+  const nextCursor = checkpointForBlock(confirmedBlockBefore);
   const events = await factory.queryFilter(
     factory.filters.RenterPodCreated(),
     state.lastBlock,
-    latest
+    confirmedTip
   );
+  // If the query raced a reorg, discard all in-memory results before claiming
+  // a reservation or changing any durable job state.
+  const confirmedBlockAfter = await provider.getBlock(confirmedTip);
+  assertCanonicalCheckpoint(nextCursor, confirmedBlockAfter);
+
   for (const event of events) {
     const args = event.args;
+    const identity = eventIdentity(event);
     const tokenIndex = Number(args.tokenIndex);
     const eventNonce = String(args.nonce);
     const existing = state.jobs[tokenIndex];
@@ -364,10 +394,15 @@ async function ingestEvents() {
         finalized: false,
         returned: false,
         eventBlock: event.blockNumber,
+        eventBlockHash: identity.blockHash,
+        eventTransactionHash: identity.transactionHash,
+        eventIndex: identity.index,
+        eventId: identity.id,
       };
     }
   }
-  state.lastBlock = latest + 1;
+  state.lastBlock = confirmedTip + 1;
+  state.eventCursor = nextCursor;
   // Events are ingested before cleanup, so a valid on-chain request always
   // claims its key even if the worker was offline past the quote deadline.
   removeExpiredUnclaimedReservations(state);
