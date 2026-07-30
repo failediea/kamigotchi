@@ -1,12 +1,14 @@
-# v16 deploy runbook — kami-vault branch
+# v16 deploy runbook — deployed contract stack / pending cutover
 
 Written 2026-07-27 and corrected after the release audit. This is the
 coordinated deploy that has been pending since the audit: 13 audit fixes, the
 pod-recovery machinery, the VIPP fee-float system, and the terminal float
 return + seed 150→45.
-Everything assumes the `kami-vault` branch of `~/kamigotchi`. The permanent
-deployment record lives in **`~/kamistats/DEPLOYMENTS.md`** (not in this repo)
-— update it in the same change as every step below that touches an address.
+The contracts were deployed on 2026-07-29 from source commit
+`f781b2d7e0b122d20750621323fc75f9da4defef`. The public address and receipt
+records live under `deployments/`. V15 remains the production/cutover stack
+while lease #10165 is active; the V16 worker directories are staged but
+disabled.
 
 ## What changes vs the deployed v15
 
@@ -27,10 +29,9 @@ Open by design: #5 (KamiVault dead code — do NOT deploy it, see DEPLOYMENTS.md
 
 ## 0. Preconditions and the deploy/cutover boundary
 
-1. **Branch.** `git branch --show-current` says `kami-vault` in
-   `~/kamigotchi`. `git status` shows no staged surprises (the uncommitted
-   `tools/vault-kit/ops-bot.mjs`/tile-eligibility work is unrelated — leave it
-   unstaged).
+1. **Commit.** Use an audited release commit with a clean tracked worktree.
+   The deployed contract bytecode is pinned to `f781b2d7e`; later documentation
+   commits do not change that bytecode.
 2. **Tests green.** Run the vault files one at a time and one thread at a time;
    a single full-glob via-IR build can exhaust this WSL VM before Forge prints a
    result:
@@ -38,7 +39,7 @@ Open by design: #5 (KamiVault dead code — do NOT deploy it, see DEPLOYMENTS.md
    ```bash
    cd packages/contracts
    for TEST in test/vault/*.t.sol; do
-     FOUNDRY_PROFILE=v14 forge test --match-path "$TEST" --threads 1 || exit 1
+     FOUNDRY_PROFILE=v16 forge test --match-path "$TEST" --threads 1 || exit 1
    done
    ```
 
@@ -108,23 +109,27 @@ QUOTE_SIGNER=0xf1B03dC03b310726e04d524aE1498ccf4FC65BAc \
 MARKET_KEEPER=0x0d0294C57B01ED7189b8A9ba354cf77b935abcDc \
 MARKET_SETTLER=0xD8A64a5cf338480B2EAf77955979cF163716957c \
 MGMT_ACC_ID=756360582917686076792667387455343056142985847610 \
-MUSU_MARKET_NAME=m16hub \
-VIPP_MARKET_NAME=vipphub16 \
-FOUNDRY_PROFILE=v14 \
+MUSU_MARKET_NAME=<FRESH_MUSU_NAME> \
+VIPP_MARKET_NAME=<FRESH_VIPP_NAME> \
+FOUNDRY_PROFILE=v16 \
 forge script script/DeployDualKamiLeaseMarket.s.sol:DeployDualKamiLeaseMarket \
   --rpc-url "$YOMINET_RPC" --private-key "$DEPLOYER_KEY" \
-  --legacy --slow
+  --legacy --slow --gas-estimate-multiplier 500
 ```
 
 Notes:
 - The command above is the mandatory dry run. Save and review its predicted
   addresses, constructor arguments, and transaction sequence. Only then rerun
   the exact command with `--broadcast`; do not use `--skip-simulation`.
-- `FOUNDRY_PROFILE=v14` is the production profile (via-IR, runs=200 — the
-  name is historical; it's what keeps `KamiLeaseMarket` under EIP-170 and
-  matches how v15 was compiled per DEPLOYMENTS.md).
-- Hub account names must be fresh (`m16hub` / `vipphub16` following the
-  `m15hub` / `vipphub15` convention) — in-game names are unique.
+- `FOUNDRY_PROFILE=v16` is mandatory: via-IR, optimizer runs=1, and metadata
+  removed. The deployed `KamiLeaseMarket` runtime is 24,541 bytes, only 35
+  bytes below EIP-170. Do not build or broadcast this source under v14.
+- Yominet performs fee-precompile work before the EVM call. Foundry's default
+  130% gas estimate, and even 300% for `sealAdmin`, can leave too little EVM
+  gas. Use the 500% multiplier above, preserve normal simulation, and fund the
+  deployer for the displayed maximum requirement.
+- Hub account names must be fresh because in-game names are unique. The live
+  V16 deployment uses `m16hub2` / `vipphub162`.
 - The reviewed v16 script intentionally does not deploy the obsolete
   `BatchLease` periphery. The factory's native
   `createPodsAndRequestLeases` entrypoint is the only batch path. Do not edit
@@ -148,9 +153,9 @@ MGMT_ACC_ID=756360582917686076792667387455343056142985847610 \
 node verify-v15-security-deployment.mjs
 ```
 
-In-game setup: activate both hub accounts and walk them to room 1 —
-follow the `activate-v13-accounts.mjs` pattern (it reads the migration
-deployment json + operator keys; adapt its stack id to v16).
+No separate hub-account activation or walk is required. `initialize()` calls
+`AccountRegisterSystem`, whose `LibAccount.create` path places every new
+account in room 1. Verify the recorded `accID` values instead.
 
 **Record every address in `tools/vault-kit/migration-v16-deployment.json`
 and `~/kamistats/DEPLOYMENTS.md` BEFORE touching any env** — the stack-A
@@ -162,7 +167,7 @@ incident happened because prod env pointed at an abandoned deploy.
 checkout — but it draws from the hub's own MUSU balance, and per
 `KamiLeaseMarket.feeFloatClaimsLeft()` docs the top-up mechanism is simply an
 in-game MUSU transfer to the hub's game account. So: **send 600 MUSU to the
-v16 VIPP hub's game account (`vipphub16`)** from any funded game account —
+v16 VIPP hub's game account (`vipphub162`)** from any funded game account —
 in-client trade/send, or the operator-scripted equivalent
 (`ItemTransferSystem.executeTyped([1], [600], <vippHubAccID>)`; item index 1
 = MUSU; the sender pays the 15-MUSU transfer fee on top).
@@ -326,22 +331,38 @@ Ship the fixed worker code (the repo copy now carries the
 `ensureOperatorGas` reserve fix) into both v16 dirs from WSL:
 
 ```bash
-rsync -av /home/matrix/kamigotchi/tools/vault-kit/{renter-pod-worker.mjs,renter-pod-keys.mjs,renter-pod-recovery.mjs,kamibots-rental-config.mjs} \
+rsync -av /home/matrix/kamigotchi/tools/vault-kit/{renter-pod-worker.mjs,renter-pod-events.mjs,renter-pod-keys.mjs,renter-pod-recovery.mjs,kamibots-rental-config.mjs} \
   root@68.183.190.126:/root/kamigotchi/tools/vault-kit-v16-musu/
-rsync -av /home/matrix/kamigotchi/tools/vault-kit/{renter-pod-worker.mjs,renter-pod-keys.mjs,renter-pod-recovery.mjs,kamibots-rental-config.mjs} \
+rsync -av /home/matrix/kamigotchi/tools/vault-kit/{renter-pod-worker.mjs,renter-pod-events.mjs,renter-pod-keys.mjs,renter-pod-recovery.mjs,kamibots-rental-config.mjs} \
   root@68.183.190.126:/root/kamigotchi/tools/vault-kit-v16-vipp/
 ```
 
-**Manual reserve edit for the still-running v15 units** (their copies
-predate the fix; without it any remaining v15 provisioning strands its gas
-escrow — one bot action costs ~4.03e12 wei but the old reserve tops up only
-1e12):
+**Apply the compatibility-safe reserve hotfix to the still-running v15
+units.** Their copies predate the fix; without it any remaining v15
+provisioning can strand its gas escrow because one bot action costs ~4.03e12
+wei while the old reserve tops up only 1e12. Do not replace the entire V15
+worker with the V16 worker: V15 does not support V16's terminal
+`returnUnusedOperatorGas()` sequence.
+
+The hotfix also changes V15's pull from `min(budget, reserve)` to
+`min(budget, reserve - balance)`. That exact-deficit calculation is essential:
+V15 cannot return terminal operator dust, so knowingly overfunding the
+ephemeral operator would trade a liveness fix for avoidable renter loss.
 
 ```bash
-ssh root@68.183.190.126 'sed -i "s/1_000_000_000_000n/30_000_000_000_000n/" \
-  /root/kamigotchi/tools/vault-kit-v15-musu/renter-pod-worker.mjs \
-  /root/kamigotchi/tools/vault-kit-v15-vipp/renter-pod-worker.mjs && \
-  systemctl restart kami-renter-pod-v15-musu kami-renter-pod-v15-vipp'
+scp tools/vault-kit/apply-v15-gas-reserve-hotfix.sh \
+  root@68.183.190.126:/root/kamigotchi/tools/
+ssh root@68.183.190.126 \
+  'bash /root/kamigotchi/tools/apply-v15-gas-reserve-hotfix.sh --apply'
+```
+
+The script is idempotent, creates timestamped backups, refuses unexpected
+worker layouts, runs `node --check`, restarts both V15 services, and requires
+both services to return to `active`. A later read-only verification is:
+
+```bash
+ssh root@68.183.190.126 \
+  'bash /root/kamigotchi/tools/apply-v15-gas-reserve-hotfix.sh --check'
 ```
 
 Units — copy the v15 unit files, fix `WorkingDirectory`/`ExecStart` to the
