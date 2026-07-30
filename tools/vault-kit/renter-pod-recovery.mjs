@@ -24,6 +24,27 @@ export function operatorGasTopUpAmount(balance, budget, reserve) {
   return budget < deficit ? budget : deficit;
 }
 
+/**
+ * Full gas verdict for an operator: what a top-up would pull, where the
+ * balance lands afterwards, and whether that is enough for even one action.
+ * The shortfall is reported so the worker can fail closed with the exact
+ * number instead of silently proceeding when the remaining escrow is already
+ * too small to make the operator usable.
+ */
+export function operatorGasHealth(balance, budget, reserve, minimumActionWei) {
+  const topUpAmount = operatorGasTopUpAmount(balance, budget, reserve);
+  const projectedBalance = balance + topUpAmount;
+  const shortfall =
+    projectedBalance >= minimumActionWei ? 0n : minimumActionWei - projectedBalance;
+  return {
+    topUpAmount,
+    projectedBalance,
+    minimumActionWei,
+    shortfall,
+    canAffordAction: shortfall === 0n,
+  };
+}
+
 export function operatorGasReturnAmount(balance, gasLimit, gasPrice) {
   const transactionCost = gasLimit * gasPrice;
   return balance > transactionCost ? balance - transactionCost : 0n;

@@ -29,8 +29,8 @@ import {
 } from "./kamibots-rental-config.mjs";
 import {
   StageZeroAction,
+  operatorGasHealth,
   operatorGasReturnAmount,
-  operatorGasTopUpAmount,
   stageZeroAction,
 } from "./renter-pod-recovery.mjs";
 import {
@@ -71,6 +71,19 @@ const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const KAMISTATS = process.env.KAMISTATS_URL || "https://kamistats.com";
 const POLL_MS = Number(process.env.POLL_MS || 30_000);
 const STATE_FILE = process.env.WORKER_STATE_FILE || join(here, "renter-pod-worker-state.json");
+// Measured operating calls use ~1,611,833 gas. The default leaves a small
+// regression margin while still checking the current network gas price.
+const OPERATOR_ACTION_GAS_FLOOR = BigInt(process.env.OPERATOR_ACTION_GAS_FLOOR || "1700000");
+// Roughly seven measured actions, matching the worker's observed daily cadence.
+// The wei reserve is calculated from the live gas price instead of assuming
+// Yominet will remain fixed at 2.5 Mwei.
+const OPERATOR_RESERVE_GAS_UNITS = BigInt(process.env.OPERATOR_RESERVE_GAS_UNITS || "12000000");
+if (OPERATOR_ACTION_GAS_FLOOR <= 0n) {
+  throw new Error("OPERATOR_ACTION_GAS_FLOOR must be a positive integer");
+}
+if (OPERATOR_RESERVE_GAS_UNITS < OPERATOR_ACTION_GAS_FLOOR) {
+  throw new Error("OPERATOR_RESERVE_GAS_UNITS must cover at least one operator action");
+}
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
 const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -362,17 +375,38 @@ async function ingestEvents() {
 }
 
 async function ensureOperatorGas(tokenIndex, request, operator) {
-  const balance = await provider.getBalance(operator.address);
-  // One operating action costs ~1,611,833 gas at the chain's 2.5 Mwei price
-  // ~= 4.03e12 wei, and the bot averages ~2 tx per 439-minute cycle
-  // ~= 6.6 tx/day ~= 2.7e13 wei/day. The old reserve (1e12) bought a QUARTER
-  // of one action: the first top-up was also the last one that could ever
-  // matter, and the rest of the lease's escrowed gas budget stranded in the
-  // factory. 3e13 keeps roughly one day of actions (~7 tx) on the operator.
-  const reserve = 30_000_000_000_000n;
-  const amount = operatorGasTopUpAmount(balance, request.gasBudget, reserve);
-  if (amount === 0n) return;
-  await (await factory.connect(operator).pullGas(tokenIndex, amount)).wait();
+  const [balance, feeData] = await Promise.all([
+    provider.getBalance(operator.address),
+    provider.getFeeData(),
+  ]);
+  if (feeData.gasPrice == null) {
+    throw new Error(`operator gas health failed for Kami #${tokenIndex}: RPC returned no gas price`);
+  }
+  // One operating action costs ~1,611,833 gas, and the bot averages ~2 tx per
+  // 439-minute cycle (~6.6 tx/day). The old fixed 1e12-wei reserve bought a
+  // quarter of one action at 2.5 Mwei. Price the one-day reserve dynamically
+  // so an RPC gas-price change cannot turn a previously safe constant into
+  // another underfunded valve.
+  const minimumActionWei = feeData.gasPrice * OPERATOR_ACTION_GAS_FLOOR;
+  const reserve = feeData.gasPrice * OPERATOR_RESERVE_GAS_UNITS;
+  const health = operatorGasHealth(balance, request.gasBudget, reserve, minimumActionWei);
+  if (!health.canAffordAction) {
+    throw new Error(
+      `operator gas health failed for Kami #${tokenIndex}: ${operator.address} has ${balance} wei, `
+        + `${request.gasBudget} wei escrow remains, projected ${health.projectedBalance} wei is `
+        + `${health.shortfall} wei short of one action (${minimumActionWei} wei)`
+    );
+  }
+  if (health.topUpAmount === 0n) return;
+
+  await (await factory.connect(operator).pullGas(tokenIndex, health.topUpAmount)).wait();
+  const fundedBalance = await provider.getBalance(operator.address);
+  if (fundedBalance < minimumActionWei) {
+    throw new Error(
+      `operator gas health failed after top-up for Kami #${tokenIndex}: ${operator.address} has `
+        + `${fundedBalance} wei but one action requires ${minimumActionWei} wei`
+    );
+  }
 }
 
 async function returnUnusedOperatorGas(tokenIndex, operator) {
