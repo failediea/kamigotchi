@@ -8,8 +8,9 @@
 >
 > **Verification boundary:** the recorded 409 responses prove routing reached
 > the listing check; they are not successful signed quotes and do not prove the
-> money path. VIPP personal-pool creation is still disabled in the production
-> owner UI. The MUSU and VIPP burn-in loops in section 7 remain required.
+> money path. VIPP personal-pool creation was enabled in production by Kamistats
+> commit `9395f40`; that UI gate is closed. The MUSU and VIPP burn-in loops in
+> section 7 remain required.
 > The V16 pool registry is new — owners must re-declare kamis into V16 pools.
 
 Written 2026-07-27 and corrected after the release audit. This is the
