@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  EndingAction,
   StageZeroAction,
+  endingAction,
   operatorGasHealth,
   operatorGasReturnAmount,
   operatorGasTopUpAmount,
@@ -9,6 +11,12 @@ import {
 } from "./renter-pod-recovery.mjs";
 
 const base = { actualAccID: 20n, podAccID: 20n, ownerAccID: 10n, staked: true, returning: false };
+
+test("ending action stops harvesting before finalization", () => {
+  assert.equal(endingAction("HARVESTING"), EndingAction.STOP_HARVEST);
+  assert.equal(endingAction("RESTING"), EndingAction.FINALIZE);
+  assert.equal(endingAction("DEAD"), EndingAction.WAIT);
+});
 
 test("recovers a finalized lease after local state loss", () => {
   assert.equal(stageZeroAction(base), StageZeroAction.RETURN_FROM_POD);

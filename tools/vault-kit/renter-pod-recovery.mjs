@@ -6,6 +6,18 @@ export const StageZeroAction = Object.freeze({
   WAIT: "wait",
 });
 
+export const EndingAction = Object.freeze({
+  STOP_HARVEST: "stop-harvest",
+  FINALIZE: "finalize",
+  WAIT: "wait",
+});
+
+export function endingAction(kamiState) {
+  if (kamiState === "HARVESTING") return EndingAction.STOP_HARVEST;
+  if (kamiState === "RESTING") return EndingAction.FINALIZE;
+  return EndingAction.WAIT;
+}
+
 /**
  * Rebuild the post-lease action from durable chain state. Local worker flags
  * are only a cache and must never decide whether a Kami still needs returning.
