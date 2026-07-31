@@ -42,9 +42,11 @@ import {
 } from "./renter-pod-events.mjs";
 import {
   StageZeroAction,
+  TerminalGasReturnMode,
   operatorGasHealth,
   operatorGasReturnAmount,
   stageZeroAction,
+  terminalGasReturnMode,
 } from "./renter-pod-recovery.mjs";
 import { advanceEndingLease } from "./renter-pod-ending.mjs";
 import {
@@ -102,6 +104,9 @@ const EVENT_CONFIRMATIONS = Number(process.env.EVENT_CONFIRMATIONS || 12);
 if (!Number.isSafeInteger(EVENT_CONFIRMATIONS) || EVENT_CONFIRMATIONS < 1 || EVENT_CONFIRMATIONS > 256) {
   throw new Error("EVENT_CONFIRMATIONS must be an integer between 1 and 256");
 }
+const TERMINAL_GAS_RETURN_MODE = terminalGasReturnMode(
+  process.env.TERMINAL_GAS_RETURN_MODE
+);
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
 const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -464,6 +469,7 @@ async function ensureOperatorGas(tokenIndex, request, operator) {
 }
 
 async function returnUnusedOperatorGas(tokenIndex, operator) {
+  if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.SKIP) return;
   const balance = await provider.getBalance(operator.address);
   if (balance === 0n) return;
 
@@ -689,7 +695,10 @@ async function tick() {
 await wire();
 await startReservationServer();
 console.log(`operator reservations listening on http://${RESERVATION_HOST}:${RESERVATION_PORT}`);
-console.log(`renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, keeper ${keeper.address}`);
+console.log(
+  `renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, keeper ${keeper.address}, `
+    + `terminalGasReturn=${TERMINAL_GAS_RETURN_MODE}`
+);
 for (;;) {
   const started = Date.now();
   await tick().catch((error) => console.error("tick failed:", error.message || error));

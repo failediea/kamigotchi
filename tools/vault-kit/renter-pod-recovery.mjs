@@ -12,6 +12,19 @@ export const EndingAction = Object.freeze({
   WAIT: "wait",
 });
 
+export const TerminalGasReturnMode = Object.freeze({
+  FACTORY: "factory",
+  SKIP: "skip",
+});
+
+export function terminalGasReturnMode(rawValue) {
+  const value = String(rawValue ?? TerminalGasReturnMode.FACTORY).trim().toLowerCase();
+  if (value === TerminalGasReturnMode.FACTORY || value === TerminalGasReturnMode.SKIP) {
+    return value;
+  }
+  throw new Error("TERMINAL_GAS_RETURN_MODE must be factory or skip");
+}
+
 export function endingAction(kamiState) {
   if (kamiState === "HARVESTING") return EndingAction.STOP_HARVEST;
   if (kamiState === "RESTING") return EndingAction.FINALIZE;
