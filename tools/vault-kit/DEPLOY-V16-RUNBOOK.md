@@ -1,4 +1,13 @@
-# v16 deploy runbook — deployed contract stack / pending cutover
+# v16 deploy runbook — LAUNCHED 2026-07-31
+
+> **Status: v16 is the production stack as of 2026-07-31.** Workers staged from
+> `c8346aae`; both v16 services active/enabled with `terminalGasReturn=factory`
+> on ports 8791/8792; Caddy repointed; Vercel production deployed and aliased to
+> kamistats.com. Both v15 services remain active with `terminalGasReturn=skip`
+> for legacy recovery only, and the v15 markets reject new leases.
+> Smoke evidence: quote route returns 409 (reached listing check) for both v16
+> markets and 400 "market is not open for new leases" for both v15 markets.
+> The v16 pool registry is new — owners must re-declare kamis into v16 pools.
 
 Written 2026-07-27 and corrected after the release audit. This is the
 coordinated deploy that has been pending since the audit: 13 audit fixes, the
