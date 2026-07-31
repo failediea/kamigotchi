@@ -6,7 +6,8 @@
  * automation wallet. This worker contributes no ETH and has no admin path. It
  * only advances the factory's constrained state machine:
  *   register Kamibots -> walk pod -> owner pool to hub -> hub to pod ->
- *   start Kamibots -> activate paid clock -> stop/sweep/finalize -> owner pool.
+ *   start Kamibots -> prove HARVESTING -> activate paid clock ->
+ *   stop/sweep/finalize -> owner pool.
  *
  * Required env:
  *   YOMINET_RPC, WORLD_ADDR, MARKET_ADDRESS, RENTER_POD_FACTORY
@@ -49,6 +50,7 @@ import {
   terminalGasReturnMode,
 } from "./renter-pod-recovery.mjs";
 import { advanceEndingLease } from "./renter-pod-ending.mjs";
+import { advancePreparingLease } from "./renter-pod-activation.mjs";
 import {
   bindOperatorReservationQuote,
   claimOperatorReservation,
@@ -569,8 +571,13 @@ async function processJob(job) {
     }
     if (actualAccID !== podAccID) return;
     await ensureOperatorGas(job.tokenIndex, request, operator);
-    await reconcileStrategy(job);
-    await (await factory.connect(keeper).activateProvisionedLease(job.tokenIndex)).wait();
+    await advancePreparingLease({
+      reconcileStrategy: () => reconcileStrategy(job),
+      readKamiState: () => kamiStateComponent.get(listing.kamiID),
+      activateLease: async () => {
+        await (await factory.connect(keeper).activateProvisionedLease(job.tokenIndex)).wait();
+      },
+    });
     return;
   }
 

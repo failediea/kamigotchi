@@ -448,7 +448,7 @@ Do this any time — it does not gate the v16 deploy.
 1. **MUSU:** list one kami on v16 via the kamistats UI, self-lease it for
    1 day from the second wallet, and watch the v16 musu journal walk the
    stages: `markLeasePreparing` → walk → `routePreparedKami` →
-   `activateProvisionedLease` → HARVESTING. Verify the operator wallet pulls
+   Kamibots armed → on-chain `HARVESTING` → `activateProvisionedLease`. Verify the operator wallet pulls
    ~3e13 wei once (the new reserve) rather than 1e12.
 2. Verify the kamistats **`/api/vault/live-lease`** panel shows the lease
    with the v16 market address, and the vault page reads green.
