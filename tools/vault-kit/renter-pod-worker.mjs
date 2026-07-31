@@ -22,7 +22,13 @@ import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Contract, JsonRpcProvider, Wallet, id as keccakId } from "ethers";
+import {
+  Contract,
+  JsonRpcProvider,
+  Wallet,
+  id as keccakId,
+  solidityPackedKeccak256,
+} from "ethers";
 import {
   buildKamibotsStartBody,
   kamibotsStrategySignature,
@@ -40,6 +46,7 @@ import {
   operatorGasReturnAmount,
   stageZeroAction,
 } from "./renter-pod-recovery.mjs";
+import { advanceEndingLease } from "./renter-pod-ending.mjs";
 import {
   bindOperatorReservationQuote,
   claimOperatorReservation,
@@ -157,7 +164,9 @@ const migratedLegacyJobs = migrateLegacyJobKeys(state, LEGACY_OPERATOR_SEED);
 if (migratedLegacyJobs) save();
 
 let idOwnsKami;
+let kamiStateComponent;
 let roomComponent;
+let harvestStopSystem;
 let moveSystem;
 let sendSystem;
 let marketAccID;
@@ -262,9 +271,19 @@ async function wire() {
     ["function safeGet(uint256) view returns (uint256)"],
     provider
   );
+  kamiStateComponent = new Contract(
+    await registryAddress(components, "component.state"),
+    ["function get(uint256) view returns (string)"],
+    provider
+  );
   roomComponent = new Contract(
     await registryAddress(components, "component.index.room"),
     ["function get(uint256) view returns (uint32)"],
+    provider
+  );
+  harvestStopSystem = new Contract(
+    await registryAddress(systems, "system.harvest.stop"),
+    ["function executeTyped(uint256) returns (bytes)"],
     provider
   );
   moveSystem = new Contract(
@@ -551,18 +570,36 @@ async function processJob(job) {
 
   if (stage === 3) {
     await ensureOperatorGas(job.tokenIndex, request, operator);
-    await reconcileStrategy(job);
     const now = Math.floor(Date.now() / 1000);
     if (!listing.ending && Number(listing.leaseEnd) > 0 && now > Number(listing.leaseEnd)) {
       await (await market.connect(operator).endLease(job.tokenIndex)).wait();
       return;
     }
     if (listing.ending) {
-      await stopStrategy(job);
-      await (await factory.connect(operator).finalizeMarketLease(job.tokenIndex)).wait();
-      job.finalized = true;
-      save();
+      await advanceEndingLease({
+        tokenIndex: job.tokenIndex,
+        stopStrategy: () => stopStrategy(job),
+        readKamiState: () => kamiStateComponent.get(listing.kamiID),
+        stopHarvest: async () => {
+          const harvestID = solidityPackedKeccak256(
+            ["string", "uint256"],
+            ["harvest", listing.kamiID]
+          );
+          const connectedStop = harvestStopSystem.connect(operator);
+          await connectedStop.executeTyped.staticCall(harvestID);
+          await (await connectedStop.executeTyped(harvestID)).wait();
+        },
+        finalizeLease: async () => {
+          await (await factory.connect(operator).finalizeMarketLease(job.tokenIndex)).wait();
+        },
+        markFinalized: async () => {
+          job.finalized = true;
+          save();
+        },
+      });
+      return;
     }
+    await reconcileStrategy(job);
     return;
   }
 
