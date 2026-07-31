@@ -3,11 +3,13 @@ import test from "node:test";
 import {
   EndingAction,
   StageZeroAction,
+  TerminalGasReturnMode,
   endingAction,
   operatorGasHealth,
   operatorGasReturnAmount,
   operatorGasTopUpAmount,
   stageZeroAction,
+  terminalGasReturnMode,
 } from "./renter-pod-recovery.mjs";
 
 const base = { actualAccID: 20n, podAccID: 20n, ownerAccID: 10n, staked: true, returning: false };
@@ -16,6 +18,14 @@ test("ending action stops harvesting before finalization", () => {
   assert.equal(endingAction("HARVESTING"), EndingAction.STOP_HARVEST);
   assert.equal(endingAction("RESTING"), EndingAction.FINALIZE);
   assert.equal(endingAction("DEAD"), EndingAction.WAIT);
+});
+
+test("configures terminal gas return explicitly for v15 and v16", () => {
+  assert.equal(terminalGasReturnMode(undefined), TerminalGasReturnMode.FACTORY);
+  assert.equal(terminalGasReturnMode("factory"), TerminalGasReturnMode.FACTORY);
+  assert.equal(terminalGasReturnMode("skip"), TerminalGasReturnMode.SKIP);
+  assert.throws(() => terminalGasReturnMode("auto"), /must be factory or skip/);
+  assert.throws(() => terminalGasReturnMode(""), /must be factory or skip/);
 });
 
 test("recovers a finalized lease after local state loss", () => {
