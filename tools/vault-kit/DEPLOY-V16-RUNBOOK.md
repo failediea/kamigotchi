@@ -1,13 +1,16 @@
 # v16 deploy runbook — LAUNCHED 2026-07-31
 
-> **Status: v16 is the production stack as of 2026-07-31.** Workers staged from
-> `c8346aae`; both v16 services active/enabled with `terminalGasReturn=factory`
-> on ports 8791/8792; Caddy repointed; Vercel production deployed and aliased to
-> kamistats.com. Both v15 services remain active with `terminalGasReturn=skip`
-> for legacy recovery only, and the v15 markets reject new leases.
-> Smoke evidence: quote route returns 409 (reached listing check) for both v16
-> markets and 400 "market is not open for new leases" for both v15 markets.
-> The v16 pool registry is new — owners must re-declare kamis into v16 pools.
+> **Status: V16 infrastructure is the production stack as of 2026-07-31.**
+> Workers staged from `c8346aae`; both V16 services are active/enabled with
+> `terminalGasReturn=factory` on ports 8791/8792; Caddy and Vercel point at V16.
+> Both V15 services remain active with `terminalGasReturn=skip` for legacy
+> recovery only, and V15 rejects new leases.
+>
+> **Verification boundary:** the recorded 409 responses prove routing reached
+> the listing check; they are not successful signed quotes and do not prove the
+> money path. VIPP personal-pool creation is still disabled in the production
+> owner UI. The MUSU and VIPP burn-in loops in section 7 remain required.
+> The V16 pool registry is new — owners must re-declare kamis into V16 pools.
 
 Written 2026-07-27 and corrected after the release audit. This is the
 coordinated deploy that has been pending since the audit: 13 audit fixes, the
@@ -15,9 +18,9 @@ pod-recovery machinery, the VIPP fee-float system, and the terminal float
 return + seed 150→45.
 The contracts were deployed on 2026-07-29 from source commit
 `f781b2d7e0b122d20750621323fc75f9da4defef`. The public address and receipt
-records live under `deployments/`. V15 remains the production/cutover stack
-while lease #10165 is active; the V16 worker directories are staged but
-disabled.
+records live under `deployments/`. V16 infrastructure is now the production
+stack. Lease #10165 is finalized; V15 remains online only for legacy recovery.
+End-to-end feature burn-in is still pending as described in section 7.
 
 ## What changes vs the deployed v15
 
@@ -435,6 +438,11 @@ earlier incident: `diag-16218.mjs`, `poll-16218.mjs`, `rearm-16218.mjs`.
 Do this any time — it does not gate the v16 deploy.
 
 ## 7. Post-deploy smoke test (the money path, once each)
+
+> **OPEN RELEASE GATE:** neither currency has a recorded successful signed quote
+> (HTTP 200) plus complete lifecycle. The existing 409 checks are wiring evidence
+> only. Record transaction hashes and refund/claim evidence before marking MUSU
+> or VIPP end-to-end verified.
 
 1. **MUSU:** list one kami on v16 via the kamistats UI, self-lease it for
    1 day from the second wallet, and watch the v16 musu journal walk the
