@@ -2,6 +2,7 @@
 pragma solidity >=0.8.28;
 
 import "tests/utils/SetupTemplate.t.sol";
+import {LibClone} from "solady/utils/LibClone.sol";
 import {PersonalRentalPool} from "vault/PersonalRentalPool.sol";
 import {PersonalRentalVault} from "vault/PersonalRentalVault.sol";
 import {PersonalRentalVaultFactory} from "vault/PersonalRentalVaultFactory.sol";
@@ -257,6 +258,11 @@ contract PersonalRentalVaultTest is SetupTemplate {
 
         vm.prank(alice.owner);
         renterPodFactory.requestPreparingCancellation(tokenIndex);
+
+        uint256 terminalBefore = lastPodOperator.balance;
+        vm.prank(lastPodOperator);
+        renterPodFactory.pullGas(tokenIndex, 1);
+        assertEq(lastPodOperator.balance, terminalBefore + 1, "terminal cancellation can refill its operator");
         renterPodFactory.recoverPreparingFromHub(tokenIndex);
 
         assertEq(LibKami.getAccount(components, kamiID), pool.accID());
@@ -346,6 +352,56 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(factory.vaultOf(owner2), vault2);
         assertTrue(PersonalRentalVault(vault2).isPool(pool2));
         assertEq(PersonalRentalPool(pool2).vaultOwner(), owner2);
+    }
+
+    function testRevertedPoolRetryDerivesFreshAddressInLaterBlock() public {
+        string memory accountName = "retry-pool";
+        uint256 rolledBackNonce = factory.poolDeployNonce(alice.owner);
+        bytes32 firstRandao = bytes32(uint256(0x1111));
+        bytes32 retryRandao = bytes32(uint256(0x2222));
+
+        vm.prevrandao(firstRandao);
+        bytes32 firstSalt = keccak256(
+            abi.encode(alice.owner, address(vault), rolledBackNonce, accountName, firstRandao)
+        );
+        address firstAttempt = LibClone.predictDeterministicAddress(
+            factory.poolImplementation(), firstSalt, address(factory)
+        );
+
+        // Reproduce the mempool grief: a watcher registers the soon-to-exist clone
+        // as a game operator before the owner's transaction is included.
+        address squatter = _getNextUserAddress();
+        vm.prank(squatter);
+        _AccountRegisterSystem.executeTyped(firstAttempt, "pool-squatter");
+
+        vm.prank(alice.owner);
+        vm.expectRevert();
+        vault.createPool(address(market), OWNER_BPS, 7 days, accountName);
+        assertEq(factory.poolDeployNonce(alice.owner), rolledBackNonce, "revert consumed nonce");
+        assertEq(firstAttempt.code.length, 0, "failed clone survived revert");
+
+        // The same owner/input/rolled-back nonce must derive a fresh address when
+        // retried in a later block, and the factory must actually deploy there.
+        vm.roll(block.number + 1);
+        vm.prevrandao(retryRandao);
+        bytes32 retrySalt = keccak256(
+            abi.encode(alice.owner, address(vault), rolledBackNonce, accountName, retryRandao)
+        );
+        address retryAttempt = LibClone.predictDeterministicAddress(
+            factory.poolImplementation(), retrySalt, address(factory)
+        );
+        assertNotEq(firstAttempt, retryAttempt, "reverted retry reused squattable address");
+
+        vm.prank(alice.owner);
+        address deployed = vault.createPool(
+            address(market), OWNER_BPS, 7 days, accountName
+        );
+        assertEq(deployed, retryAttempt, "factory deployed at unexpected retry address");
+        assertEq(
+            factory.poolDeployNonce(alice.owner),
+            rolledBackNonce + 1,
+            "successful retry did not consume nonce"
+        );
     }
 
     function testIdleKamiStaysInOwnerPoolUntilRented() public {
@@ -507,6 +563,28 @@ contract PersonalRentalVaultTest is SetupTemplate {
         assertEq(afterBudget, beforeBudget + addedBudget, "extension gas stays in renter escrow");
     }
 
+    function testRenterCannotExtendWithDustGas() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        vm.txGasPrice(2_500_000);
+
+        vm.deal(bob.owner, 1);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.BudgetTooLow.selector);
+        renterPodFactory.extendLeaseAndTopUp{value: 1}(tokenIndex, 1 days);
+    }
+
+    function testExpiredLeaseCannotBeRevivedByExtension() public {
+        (, uint32 tokenIndex) = _listAndPublish();
+        _accept(tokenIndex);
+        _fastForward(1 days + 1);
+
+        vm.deal(bob.owner, 0.001 ether);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.BadStage.selector);
+        renterPodFactory.extendLeaseAndTopUp{value: 0.001 ether}(tokenIndex, 1 days);
+    }
+
     function testUnusedOperatingGasRefundsAfterLeaseFinalization() public {
         (, uint32 tokenIndex) = _listAndPublish();
         _accept(tokenIndex);
@@ -540,6 +618,11 @@ contract PersonalRentalVaultTest is SetupTemplate {
         renterPodFactory.finalizeMarketLease(tokenIndex);
         assertEq(bob.owner.balance, renterBefore, "refund waits for verified pool return");
 
+        uint256 operatorBefore = lastPodOperator.balance;
+        vm.prank(lastPodOperator);
+        renterPodFactory.pullGas(tokenIndex, 1);
+        assertEq(lastPodOperator.balance, operatorBefore + 1, "finalized return can refill its operator");
+
         vm.prank(lastPodOperator);
         renterPodFactory.returnGas{value: 0.0005 ether}(tokenIndex);
 
@@ -548,7 +631,7 @@ contract PersonalRentalVaultTest is SetupTemplate {
         renterPodFactory.finalizeGasRefund(tokenIndex);
         assertEq(
             bob.owner.balance,
-            renterBefore + OPERATING_GAS + 0.0005 ether,
+            renterBefore + OPERATING_GAS - 1 + 0.0005 ether,
             "factory refund includes terminal operator gas"
         );
 
@@ -816,8 +899,11 @@ contract RenterRoomPodTerminalTest is SetupTemplate {
             accountName: "terminalvipppod",
             prefs: '{"node":1,"risk":"balanced"}'
         });
+        bytes memory quoteSignature = _sign(quote, QUOTE_SIGNER_KEY);
+        bytes memory keeperSignature = _sign(quote, KEEPER_KEY);
+        vm.prank(bob.owner);
         address podAddress = podFactory.createPodAndRequestLease(
-            quote, _sign(quote, QUOTE_SIGNER_KEY), _sign(quote, KEEPER_KEY)
+            quote, quoteSignature, keeperSignature
         );
         pod = RoomPod(podAddress);
 

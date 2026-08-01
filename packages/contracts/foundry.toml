@@ -24,3 +24,12 @@ via_ir = true
 optimizer = true
 optimizer_runs = 200
 out = "out-v14"
+
+# The post-v16 vault hardening release is byte-constrained: both the market and
+# renter factory sit immediately below EIP-170 only with the size-oriented run
+# count. Deployment must use this profile exactly.
+[profile.v17]
+via_ir = true
+optimizer = true
+optimizer_runs = 1
+out = "out-v17"

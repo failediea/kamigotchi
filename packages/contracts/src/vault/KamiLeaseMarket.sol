@@ -122,6 +122,9 @@ contract KamiLeaseMarket {
   uint256 public settleCursor;
   bool public settlementInProgress;
   uint64 internal initializedAt;
+  /// @notice Timestamp of each listing's XP baseline. A settlement interval
+  ///         crossing leaseEnd is prorated across its leased/unleased seconds.
+  mapping(uint32 => uint64) public xpCheckpointAt;
 
   uint64 internal constant ENDING_GRACE = 2 days;
   uint64 internal constant SETTLER_STALE = 3 days;
@@ -151,6 +154,7 @@ contract KamiLeaseMarket {
   error AdminAlreadySealed();
   error KamiNotHomeYet();
   error KamiNotInYourAccount();
+  error KamiDead();
   error EndingNow();
   error Leased();
   error MgmtAccountUnset();
@@ -193,6 +197,7 @@ contract KamiLeaseMarket {
   error NoPendingLease();
   error ProvisioningRequired();
   error InvalidPool();
+  error StillHarvesting();
 
   ///////////////////
   // EVENTS
@@ -397,6 +402,7 @@ contract KamiLeaseMarket {
       leaseEnd: 0,
       reservedFor: reservedFor
     });
+    xpCheckpointAt[tokenIndex] = uint64(block.timestamp);
     tokenIndices.push(tokenIndex);
     tokenPos[tokenIndex] = tokenIndices.length;
     participations[msg.sender]++;
@@ -477,6 +483,7 @@ contract KamiLeaseMarket {
     _creditPending(tokenIndex);
     l.staked = false;
     l.xpBase = LibExperience.get(_comps(), l.kamiID);
+    xpCheckpointAt[tokenIndex] = uint64(block.timestamp);
     emit PoolRestored(l.owner, tokenIndex);
   }
 
@@ -509,7 +516,7 @@ contract KamiLeaseMarket {
     require(l.reservedFor == address(0) || l.reservedFor == renter, Reserved());
     require(l.ownerShareBps == expectedOwnerShareBps, TermsChanged());
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
-    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
+    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), KamiDead());
 
     IRenterRoomPod roomPod = IRenterRoomPod(pod);
     require(address(roomPod.hub()) == address(this), NotFactory());
@@ -540,6 +547,7 @@ contract KamiLeaseMarket {
     require(LibKami.getAccount(_comps(), l.kamiID) == accID, NotArrived());
     l.staked = true;
     l.xpBase = LibExperience.get(_comps(), l.kamiID);
+    xpCheckpointAt[tokenIndex] = uint64(block.timestamp);
     emit Arrived(l.owner, tokenIndex);
     emit LeasePreparing(tokenIndex, pendingPod[tokenIndex]);
   }
@@ -559,7 +567,7 @@ contract KamiLeaseMarket {
     require(l.staked, NotInPoolYet());
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
     require(LibKami.getAccount(_comps(), l.kamiID) == IRenterRoomPod(pod).accID(), NotArrived());
-    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), "LM: kami is dead");
+    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), KamiDead());
 
     _creditPending(tokenIndex); // setup-time XP remains the owner's
     l.renter = renter;
@@ -590,6 +598,7 @@ contract KamiLeaseMarket {
       _creditPending(tokenIndex);
       l.staked = false;
       l.xpBase = LibExperience.get(_comps(), l.kamiID);
+      xpCheckpointAt[tokenIndex] = uint64(block.timestamp);
     }
     delete pendingRenter[tokenIndex];
     delete pendingPod[tokenIndex];
@@ -609,11 +618,9 @@ contract KamiLeaseMarket {
   function extendLease(uint32 tokenIndex, uint32 extraSecs) external {
     Listing storage l = _listings[tokenIndex];
     require(msg.sender == leaseFactory, NotFactory());
-    require(l.renter != address(0), NotLeased());
     require(!l.ending, EndingNow());
-    require(extraSecs != 0, TermRails());
     uint64 newEnd = l.leaseEnd + extraSecs;
-    require(uint256(newEnd) - l.leaseStart <= l.maxTermSecs, TermRails());
+    if (uint256(newEnd) - l.leaseStart > l.maxTermSecs) revert TermRails();
     l.leaseEnd = newEnd;
     emit LeaseExtended(tokenIndex, newEnd);
   }
@@ -651,7 +658,7 @@ contract KamiLeaseMarket {
         || (timedOut && (msg.sender == renter || msg.sender == l.owner)),
       NotFinalizer()
     );
-    require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), "LM: still harvesting");
+    require(!LibKami.isState(_comps(), l.kamiID, "HARVESTING"), StillHarvesting());
 
     // Accounting itself enforces the terminal inventory receipt. Putting this
     // at the liability boundary means the settler and timed-out user paths
@@ -960,21 +967,49 @@ contract KamiLeaseMarket {
   ) internal returns (uint256 delta, uint256 cut) {
     Listing storage l = _listings[tokenIndex];
     if (!l.staked) return (0, 0);
+    uint64 checkpoint = xpCheckpointAt[tokenIndex];
+    uint64 now_ = uint64(block.timestamp);
     uint256 xp = LibExperience.get(comps, l.kamiID);
     delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
+    xpCheckpointAt[tokenIndex] = now_;
     if (delta == 0) return (0, 0);
-    cut = _creditSplit(_listingBeneficiary[tokenIndex], _activeRenter(l), l.ownerShareBps, delta);
+    cut = _creditTimed(tokenIndex, l, checkpoint, now_, delta);
   }
 
-  /// @dev The renter earns only within the term they paid for. l.renter is
-  ///      cleared by finalizeLease, but nothing forces finalizeLease to be
-  ///      prompt — and renters pay no rent, so every second past leaseEnd was
-  ///      free yield taken from the owner. Attribution now follows the clock,
-  ///      not the bookkeeping.
-  function _activeRenter(Listing storage l) internal view returns (address) {
-    if (l.renter == address(0)) return address(0);
-    return block.timestamp > l.leaseEnd ? address(0) : l.renter;
+  /// @dev Attribute one XP interval. XP is cumulative and carries no production
+  ///      timestamps, so an interval straddling leaseEnd cannot be partitioned
+  ///      exactly after the fact. We use the only deterministic on-chain proxy:
+  ///      elapsed seconds on each side of leaseEnd. The management fee is taken
+  ///      once, then the net is prorated; the leased portion uses the agreed
+  ///      owner/renter split and the post-expiry portion belongs to the owner.
+  function _creditTimed(
+    uint32 tokenIndex,
+    Listing storage l,
+    uint64 checkpoint,
+    uint64 now_,
+    uint256 gross
+  ) internal returns (uint256 cut) {
+    address owner_ = _listingBeneficiary[tokenIndex];
+    address renter_ = l.renter;
+    if (renter_ == address(0)) return _creditSplit(owner_, address(0), l.ownerShareBps, gross);
+    if (now_ <= l.leaseEnd) return _creditSplit(owner_, renter_, l.ownerShareBps, gross);
+
+    if (checkpoint == 0) checkpoint = l.leaseStart;
+    if (checkpoint >= l.leaseEnd) {
+      return _creditSplit(owner_, address(0), l.ownerShareBps, gross);
+    }
+
+    uint256 elapsed = uint256(now_) - uint256(checkpoint);
+    uint256 leasedElapsed = uint256(l.leaseEnd) - uint256(checkpoint);
+    cut = (gross * mgmtBps) / 10000;
+    uint256 net = gross - cut;
+    uint256 leasedNet = (net * leasedElapsed) / elapsed;
+    uint256 renterOwnerCut = (leasedNet * l.ownerShareBps) / 10000;
+    uint256 renterNet = leasedNet - renterOwnerCut;
+    uint256 ownerNet = net - renterNet;
+    if (ownerNet > 0) _credit(owner_, ownerNet);
+    if (renterNet > 0) _credit(renter_, renterNet);
   }
 
   /// @dev Credit a kami's current delta immediately at its current terms. Used at
@@ -982,16 +1017,14 @@ contract KamiLeaseMarket {
   function _creditPending(uint32 tokenIndex) internal {
     Listing storage l = _listings[tokenIndex];
     if (!l.staked) return;
+    uint64 checkpoint = xpCheckpointAt[tokenIndex];
+    uint64 now_ = uint64(block.timestamp);
     uint256 xp = LibExperience.get(_comps(), l.kamiID);
     uint256 delta = xp > l.xpBase ? xp - l.xpBase : 0;
     l.xpBase = xp;
+    xpCheckpointAt[tokenIndex] = now_;
     if (delta == 0) return;
-    uint256 cut = _creditSplit(
-      _listingBeneficiary[tokenIndex],
-      _activeRenter(l),
-      l.ownerShareBps,
-      delta
-    );
+    uint256 cut = _creditTimed(tokenIndex, l, checkpoint, now_, delta);
     mgmtAccrued += cut;
     emit Settled(delta - cut, cut, delta);
   }
@@ -1028,6 +1061,7 @@ contract KamiLeaseMarket {
     delete pendingRenter[tokenIndex];
     delete pendingPod[tokenIndex];
     delete _listingBeneficiary[tokenIndex];
+    delete xpCheckpointAt[tokenIndex];
     delete _listings[tokenIndex];
     // A tail listing can be swapped into an already-processed slot. Rewind to
     // that slot; repeat visits are safe because settlement advances xpBase.

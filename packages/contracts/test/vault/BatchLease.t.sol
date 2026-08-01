@@ -142,7 +142,7 @@ contract BatchLeaseTest is SetupTemplate {
     /////////////////
     // BATCHLEASE PERIPHERY (v15)
 
-    function testLeaseBatchThirdPartySubmitterFundsTwoLeasesAtomically() public {
+    function testRetiredLeaseBatchCannotSubmitForNamedRenter() public {
         (
             RenterRoomPodFactory.Quote[] memory quotes,
             bytes[] memory quoteSigs,
@@ -150,19 +150,15 @@ contract BatchLeaseTest is SetupTemplate {
             uint256[] memory values
         ) = _twoSignedQuotes();
 
-        vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
-        vm.prank(charlie.owner);
-        address[] memory pods =
-            batchLease.leaseBatch{value: 2 * QUOTE_TOTAL}(quotes, quoteSigs, keeperSigs, values);
+        vm.deal(bob.owner, 2 * QUOTE_TOTAL);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotRenter.selector);
+        batchLease.leaseBatch{value: 2 * QUOTE_TOTAL}(quotes, quoteSigs, keeperSigs, values);
 
-        assertEq(pods.length, 2, "two pods deployed");
-        for (uint256 i; i < 2; ++i) {
-            assertTrue(pods[i].code.length > 0, "pod has code");
-            assertEq(_recordedRenter(quotes[i].tokenIndex), bob.owner, "renter is the signed quote.renter");
-            assertEq(market.pendingRenter(quotes[i].tokenIndex), bob.owner, "market attributes the lease to quote.renter");
-        }
+        assertEq(_recordedRenter(quotes[0].tokenIndex), address(0), "first lease not reserved");
+        assertEq(_recordedRenter(quotes[1].tokenIndex), address(0), "second lease not reserved");
         assertEq(address(batchLease).balance, 0, "periphery holds no funds");
-        assertEq(charlie.owner.balance, 0, "submitter paid exactly the sum");
+        assertEq(bob.owner.balance, 2 * QUOTE_TOTAL, "named renter keeps funds on revert");
     }
 
     function testLeaseBatchRejectsWrongTotal() public {
@@ -195,7 +191,7 @@ contract BatchLeaseTest is SetupTemplate {
         batchLease.leaseBatch{value: 2 * QUOTE_TOTAL}(quotes, quoteSigs, shortKeeperSigs, values);
     }
 
-    function testLeaseBatchOneBadQuoteRevertsEverything() public {
+    function testRetiredLeaseBatchRejectsBeforeQuoteValidation() public {
         (
             RenterRoomPodFactory.Quote[] memory quotes,
             bytes[] memory quoteSigs,
@@ -204,27 +200,27 @@ contract BatchLeaseTest is SetupTemplate {
         ) = _twoSignedQuotes();
         keeperSigs[1] = quoteSigs[1]; // wrong signer for the keeper slot
 
-        vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
-        vm.prank(charlie.owner);
-        vm.expectRevert(RenterRoomPodFactory.BadQuote.selector);
+        vm.deal(bob.owner, 2 * QUOTE_TOTAL);
+        vm.prank(bob.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotRenter.selector);
         batchLease.leaseBatch{value: 2 * QUOTE_TOTAL}(quotes, quoteSigs, keeperSigs, values);
 
-        assertEq(_recordedRenter(quotes[0].tokenIndex), address(0), "first lease rolled back too");
-        assertEq(charlie.owner.balance, 2 * QUOTE_TOTAL, "submitter keeps every wei on revert");
+        assertEq(_recordedRenter(quotes[0].tokenIndex), address(0), "no lease reserved");
+        assertEq(bob.owner.balance, 2 * QUOTE_TOTAL, "named renter keeps every wei");
     }
 
     /////////////////
     // NATIVE FACTORY ENTRYPOINT (v16 candidate)
 
-    function testNativeBatchThirdPartySubmitterFundsTwoLeases() public {
+    function testNativeBatchNamedRenterFundsTwoLeases() public {
         (
             RenterRoomPodFactory.Quote[] memory quotes,
             bytes[] memory quoteSigs,
             bytes[] memory keeperSigs,
         ) = _twoSignedQuotes();
 
-        vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
-        vm.prank(charlie.owner);
+        vm.deal(bob.owner, 2 * QUOTE_TOTAL);
+        vm.prank(bob.owner);
         address[] memory pods = renterPodFactory.createPodsAndRequestLeases{value: 2 * QUOTE_TOTAL}(
             quotes, quoteSigs, keeperSigs
         );
@@ -236,7 +232,7 @@ contract BatchLeaseTest is SetupTemplate {
         }
     }
 
-    function testNativeBatchRejectsWrongTotal() public {
+    function testNativeBatchThirdPartySubmitterIsRejected() public {
         (
             RenterRoomPodFactory.Quote[] memory quotes,
             bytes[] memory quoteSigs,
@@ -245,6 +241,24 @@ contract BatchLeaseTest is SetupTemplate {
 
         vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
         vm.prank(charlie.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotRenter.selector);
+        renterPodFactory.createPodsAndRequestLeases{value: 2 * QUOTE_TOTAL}(
+            quotes, quoteSigs, keeperSigs
+        );
+
+        assertEq(_recordedRenter(quotes[0].tokenIndex), address(0), "first lease not reserved");
+        assertEq(_recordedRenter(quotes[1].tokenIndex), address(0), "second lease not reserved");
+    }
+
+    function testNativeBatchRejectsWrongTotal() public {
+        (
+            RenterRoomPodFactory.Quote[] memory quotes,
+            bytes[] memory quoteSigs,
+            bytes[] memory keeperSigs,
+        ) = _twoSignedQuotes();
+
+        vm.deal(bob.owner, 2 * QUOTE_TOTAL);
+        vm.prank(bob.owner);
         vm.expectRevert(RenterRoomPodFactory.BadPayment.selector);
         renterPodFactory.createPodsAndRequestLeases{value: 2 * QUOTE_TOTAL - 1}(
             quotes, quoteSigs, keeperSigs
@@ -259,8 +273,8 @@ contract BatchLeaseTest is SetupTemplate {
         ) = _twoSignedQuotes();
         keeperSigs[0] = quoteSigs[0];
 
-        vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
-        vm.prank(charlie.owner);
+        vm.deal(bob.owner, 2 * QUOTE_TOTAL);
+        vm.prank(bob.owner);
         vm.expectRevert(RenterRoomPodFactory.BadQuote.selector);
         renterPodFactory.createPodsAndRequestLeases{value: 2 * QUOTE_TOTAL}(
             quotes, quoteSigs, keeperSigs

@@ -16,6 +16,7 @@ artifacts/
 broadcast/
 /cache/
 out/
+out-*/
 deployment/contracts/initStream.json
 deployment/contracts/GodSystem.s.sol
 deployment/contracts/InitWorld.s.sol

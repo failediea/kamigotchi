@@ -81,6 +81,7 @@ contract KamiVault {
 
   // payouts held for depositors that had no game account at settle time
   mapping(address => uint256) public owedMusu;
+  uint256 public owedMusuTotal; // gross MUSU reserved for all deferred payouts
 
   uint256 private locked = 1; // reentrancy guard
 
@@ -253,8 +254,12 @@ contract KamiVault {
     uint256 n = tokenIndices.length;
     uint256 m = carryHolders.length;
     uint256 feeBudget = (n + m + 1) * TRANSFER_FEE;
-    if (bal <= reserveMusu + feeBudget) return; // nothing meaningful to distribute
-    uint256 distributable = bal - reserveMusu - feeBudget;
+    // Deferred payouts are liabilities, not fresh revenue. Keep their full gross
+    // amount reserved: when claimed, TRANSFER_FEE is paid out of that claimant's
+    // gross balance rather than out of another depositor's funds.
+    uint256 reserved = owedMusuTotal + reserveMusu;
+    if (bal <= reserved || bal - reserved <= feeBudget) return;
+    uint256 distributable = bal - reserved - feeBudget;
 
     // ---- pass 1: per-kami XP deltas (+ carried deltas from withdrawn kamis)
     address[] memory payees = new address[](n + m);
@@ -303,13 +308,16 @@ contract KamiVault {
 
   /// @notice claim MUSU that was held because the depositor had no game account
   function claimOwed() external nonReentrant {
-    uint256 amount = owedMusu[msg.sender];
-    require(amount > 0, "KamiVault: nothing owed");
+    uint256 gross = owedMusu[msg.sender];
+    require(gross > 0, "KamiVault: nothing owed");
+    require(gross > TRANSFER_FEE, "KamiVault: owed below transfer fee");
     uint256 target = uint256(uint160(msg.sender));
     require(_isAccount(target), "KamiVault: register an account first");
     owedMusu[msg.sender] = 0;
-    _transferMusu(target, amount);
-    emit OwedClaimed(msg.sender, amount);
+    owedMusuTotal -= gross;
+    uint256 net = gross - TRANSFER_FEE;
+    _transferMusu(target, net);
+    emit OwedClaimed(msg.sender, net);
   }
 
   ///////////////////
@@ -340,7 +348,8 @@ contract KamiVault {
       _transferMusu(target, amount);
       emit Payout(to, amount, false);
     } else {
-      owedMusu[to] += amount; // held in vault inventory until claimOwed()
+      owedMusu[to] += amount; // gross claim; transfer fee is netted at claim time
+      owedMusuTotal += amount;
       emit Payout(to, amount, true);
     }
     return amount;

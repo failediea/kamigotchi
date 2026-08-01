@@ -17,6 +17,19 @@ export const TerminalGasReturnMode = Object.freeze({
   SKIP: "skip",
 });
 
+export const TerminalGasPullMode = Object.freeze({
+  CHECK_ONLY: "check-only",
+  FACTORY: "factory",
+});
+
+export function terminalGasPullMode(rawValue) {
+  const value = String(rawValue ?? TerminalGasPullMode.CHECK_ONLY).trim().toLowerCase();
+  if (value === TerminalGasPullMode.CHECK_ONLY || value === TerminalGasPullMode.FACTORY) {
+    return value;
+  }
+  throw new Error("TERMINAL_GAS_PULL_MODE must be check-only or factory");
+}
+
 export function terminalGasReturnMode(rawValue) {
   const value = String(rawValue ?? TerminalGasReturnMode.FACTORY).trim().toLowerCase();
   if (value === TerminalGasReturnMode.FACTORY || value === TerminalGasReturnMode.SKIP) {

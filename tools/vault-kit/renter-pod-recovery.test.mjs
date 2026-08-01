@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   EndingAction,
   StageZeroAction,
+  TerminalGasPullMode,
   TerminalGasReturnMode,
   endingAction,
   operatorGasHealth,
@@ -10,9 +12,11 @@ import {
   operatorGasTopUpAmount,
   stageZeroAction,
   terminalGasReturnMode,
+  terminalGasPullMode,
 } from "./renter-pod-recovery.mjs";
 
 const base = { actualAccID: 20n, podAccID: 20n, ownerAccID: 10n, staked: true, returning: false };
+const workerSource = readFileSync(new URL("./renter-pod-worker.mjs", import.meta.url), "utf8");
 
 test("ending action stops harvesting before finalization", () => {
   assert.equal(endingAction("HARVESTING"), EndingAction.STOP_HARVEST);
@@ -26,6 +30,33 @@ test("configures terminal gas return explicitly for v15 and v16", () => {
   assert.equal(terminalGasReturnMode("skip"), TerminalGasReturnMode.SKIP);
   assert.throws(() => terminalGasReturnMode("auto"), /must be factory or skip/);
   assert.throws(() => terminalGasReturnMode(""), /must be factory or skip/);
+});
+
+test("keeps terminal gas pulls disabled unless the factory supports them", () => {
+  assert.equal(terminalGasPullMode(undefined), TerminalGasPullMode.CHECK_ONLY);
+  assert.equal(terminalGasPullMode("check-only"), TerminalGasPullMode.CHECK_ONLY);
+  assert.equal(terminalGasPullMode("factory"), TerminalGasPullMode.FACTORY);
+  assert.throws(() => terminalGasPullMode("auto"), /must be check-only or factory/);
+});
+
+test("checks operator gas before every terminal pod send", () => {
+  const stage4 = workerSource.slice(
+    workerSource.indexOf("if (stage === 4)"),
+    workerSource.indexOf("if (stage === 5)")
+  );
+  const stage5 = workerSource.slice(
+    workerSource.indexOf("if (stage === 5)"),
+    workerSource.indexOf("// A deleted request")
+  );
+  assert.match(stage4, /ensureOperatorGas[\s\S]+sendSystem/);
+  assert.match(stage5, /ensureOperatorGas[\s\S]+sendSystem/);
+});
+
+test("uses the keeper after the stage-four operator returns its gas", () => {
+  assert.match(
+    workerSource,
+    /returnUnusedOperatorGas[\s\S]+factory\.connect\(keeper\)\.finalizePreparingCancellation/
+  );
 });
 
 test("recovers a finalized lease after local state loss", () => {

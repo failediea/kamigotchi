@@ -43,11 +43,13 @@ import {
 } from "./renter-pod-events.mjs";
 import {
   StageZeroAction,
+  TerminalGasPullMode,
   TerminalGasReturnMode,
   operatorGasHealth,
   operatorGasReturnAmount,
   stageZeroAction,
   terminalGasReturnMode,
+  terminalGasPullMode,
 } from "./renter-pod-recovery.mjs";
 import { advanceEndingLease } from "./renter-pod-ending.mjs";
 import { advancePreparingLease } from "./renter-pod-activation.mjs";
@@ -108,6 +110,9 @@ if (!Number.isSafeInteger(EVENT_CONFIRMATIONS) || EVENT_CONFIRMATIONS < 1 || EVE
 }
 const TERMINAL_GAS_RETURN_MODE = terminalGasReturnMode(
   process.env.TERMINAL_GAS_RETURN_MODE
+);
+const TERMINAL_GAS_PULL_MODE = terminalGasPullMode(
+  process.env.TERMINAL_GAS_PULL_MODE
 );
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
 const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
@@ -435,7 +440,7 @@ async function ingestEvents() {
   save();
 }
 
-async function ensureOperatorGas(tokenIndex, request, operator) {
+async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = true } = {}) {
   const [balance, feeData] = await Promise.all([
     provider.getBalance(operator.address),
     provider.getFeeData(),
@@ -450,12 +455,18 @@ async function ensureOperatorGas(tokenIndex, request, operator) {
   // another underfunded valve.
   const minimumActionWei = feeData.gasPrice * OPERATOR_ACTION_GAS_FLOOR;
   const reserve = feeData.gasPrice * OPERATOR_RESERVE_GAS_UNITS;
-  const health = operatorGasHealth(balance, request.gasBudget, reserve, minimumActionWei);
+  const health = operatorGasHealth(
+    balance,
+    allowPull ? request.gasBudget : 0n,
+    reserve,
+    minimumActionWei
+  );
   if (!health.canAffordAction) {
     throw new Error(
       `operator gas health failed for Kami #${tokenIndex}: ${operator.address} has ${balance} wei, `
         + `${request.gasBudget} wei escrow remains, projected ${health.projectedBalance} wei is `
         + `${health.shortfall} wei short of one action (${minimumActionWei} wei)`
+        + (allowPull ? "" : "; this deployed factory cannot pull escrow in a terminal stage")
     );
   }
   if (health.topUpAmount === 0n) return;
@@ -619,6 +630,9 @@ async function processJob(job) {
   if (stage === 4) {
     await stopStrategy(job);
     if (actualAccID === podAccID) {
+      await ensureOperatorGas(job.tokenIndex, request, operator, {
+        allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+      });
       await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
       return;
     }
@@ -627,8 +641,15 @@ async function processJob(job) {
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
+      if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.FACTORY) {
+        await ensureOperatorGas(job.tokenIndex, request, operator, {
+          allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+        });
+      }
       await returnUnusedOperatorGas(job.tokenIndex, operator);
-      await (await factory.connect(operator).finalizePreparingCancellation(job.tokenIndex)).wait();
+      // This factory entrypoint is permissionless. Use the durable keeper after
+      // the ephemeral operator has returned its remaining balance.
+      await (await factory.connect(keeper).finalizePreparingCancellation(job.tokenIndex)).wait();
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -639,10 +660,18 @@ async function processJob(job) {
   if (stage === 5) {
     await stopStrategy(job);
     if (actualAccID === podAccID) {
+      await ensureOperatorGas(job.tokenIndex, request, operator, {
+        allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+      });
       await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
+      if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.FACTORY) {
+        await ensureOperatorGas(job.tokenIndex, request, operator, {
+          allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+        });
+      }
       await returnUnusedOperatorGas(job.tokenIndex, operator);
       await (await factory.connect(keeper).finalizeGasRefund(job.tokenIndex)).wait();
       job.returned = true;
@@ -666,6 +695,7 @@ async function processJob(job) {
     });
     if (action === StageZeroAction.RETURN_FROM_POD) {
       await stopStrategy(job);
+      await ensureOperatorGas(job.tokenIndex, request, operator, { allowPull: false });
       await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
       save();
       return;
@@ -704,7 +734,7 @@ await startReservationServer();
 console.log(`operator reservations listening on http://${RESERVATION_HOST}:${RESERVATION_PORT}`);
 console.log(
   `renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, keeper ${keeper.address}, `
-    + `terminalGasReturn=${TERMINAL_GAS_RETURN_MODE}`
+    + `terminalGasReturn=${TERMINAL_GAS_RETURN_MODE}, terminalGasPull=${TERMINAL_GAS_PULL_MODE}`
 );
 for (;;) {
   const started = Date.now();

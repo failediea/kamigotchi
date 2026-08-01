@@ -44,6 +44,7 @@ contract PersonalRentalVaultFactory {
     mapping(address => address) public vaultOf;
     mapping(address => bool) public isVault;
     mapping(address => bool) public isPool;
+    mapping(address => uint256) public poolDeployNonce;
     address[] internal _vaults;
     address[] internal _pools;
 
@@ -159,15 +160,17 @@ contract PersonalRentalVaultFactory {
         string calldata accountName
     ) internal returns (address pool) {
         if (!isApprovedMarket(market)) revert InvalidMarket();
-        // Deterministic, salted by the caller. A plain CREATE clone lands at an
-        // address derived from this factory's nonce, which anyone can predict and
-        // claim in the game's global operator namespace — and because the failed
-        // initialize reverts without consuming the nonce, every retry landed on
-        // the same squatted address. Binding the salt to msg.sender and their own
-        // pool count means a squatter cannot camp the next address for everyone.
+        // The game has a global operator namespace, so a predictable clone address
+        // can be registered by a mempool observer before initialize() runs. The
+        // per-owner nonce makes successful deployments unique; prevrandao makes a
+        // reverted retry in a later block derive a fresh address even though the
+        // nonce increment rolls back with the revert. A block builder can still see
+        // and reorder the transaction, so this is liveness hardening, not secrecy:
+        // owners can retry in a later block after a squat.
+        uint256 nonce = poolDeployNonce[vaultOwner]++;
         pool = LibClone.cloneDeterministic(
             poolImplementation,
-            keccak256(abi.encode(msg.sender, accountName))
+            keccak256(abi.encode(vaultOwner, vault, nonce, accountName, block.prevrandao))
         );
         PersonalRentalPool(pool)
             .initialize(

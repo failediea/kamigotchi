@@ -125,11 +125,23 @@ contract AuditFixesTest is SetupTemplate {
     }
 
     function _submit(RenterRoomPodFactory.Quote memory q) internal {
+        bytes memory qs = _sign(q, QUOTE_SIGNER_KEY);
+        bytes memory ks = _sign(q, KEEPER_KEY);
         vm.deal(q.renter, QUOTE_TOTAL);
         vm.prank(q.renter);
         podFactory.createPodAndRequestLease{value: QUOTE_TOTAL}(
-            q, _sign(q, QUOTE_SIGNER_KEY), _sign(q, KEEPER_KEY)
+            q, qs, ks
         );
+    }
+
+    function _activate(RenterRoomPodFactory.Quote memory q) internal {
+        _submit(q);
+        vm.prank(keeper);
+        podFactory.markLeasePreparing(q.tokenIndex);
+        vm.prank(keeper);
+        podFactory.routePreparedKami(q.tokenIndex);
+        vm.prank(keeper);
+        podFactory.activateProvisionedLease(q.tokenIndex);
     }
 
     /////////////////
@@ -157,6 +169,45 @@ contract AuditFixesTest is SetupTemplate {
         uint32 tokenIndex = _listKami();
         _submit(_quote(tokenIndex, bob.owner, "okrent"));
         assertEq(market.pendingRenter(tokenIndex), bob.owner, "third party may still rent");
+    }
+
+    /////////////////
+    // RENTER AUTHORIZATION — signed quotes cannot be forced onto another wallet
+
+    function testSignedQuoteMustBeSubmittedByNamedRenter() public {
+        uint32 tokenIndex = _listKami();
+        RenterRoomPodFactory.Quote memory q = _quote(tokenIndex, bob.owner, "boundrenter");
+        bytes memory qs = _sign(q, QUOTE_SIGNER_KEY);
+        bytes memory ks = _sign(q, KEEPER_KEY);
+
+        vm.deal(charlie.owner, QUOTE_TOTAL);
+        vm.prank(charlie.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotRenter.selector);
+        podFactory.createPodAndRequestLease{value: QUOTE_TOTAL}(q, qs, ks);
+        assertEq(market.pendingRenter(tokenIndex), address(0), "stranger cannot reserve listing");
+    }
+
+    function testNativeBatchMustBeSubmittedByNamedRenter() public {
+        uint32 first = _listKami();
+        uint32 second = _listKami();
+        RenterRoomPodFactory.Quote[] memory quotes = new RenterRoomPodFactory.Quote[](2);
+        quotes[0] = _quote(first, bob.owner, "batchbound1");
+        quotes[1] = _quote(second, bob.owner, "batchbound2");
+        bytes[] memory quoteSigs = new bytes[](2);
+        bytes[] memory keeperSigs = new bytes[](2);
+        quoteSigs[0] = _sign(quotes[0], QUOTE_SIGNER_KEY);
+        quoteSigs[1] = _sign(quotes[1], QUOTE_SIGNER_KEY);
+        keeperSigs[0] = _sign(quotes[0], KEEPER_KEY);
+        keeperSigs[1] = _sign(quotes[1], KEEPER_KEY);
+
+        vm.deal(charlie.owner, 2 * QUOTE_TOTAL);
+        vm.prank(charlie.owner);
+        vm.expectRevert(RenterRoomPodFactory.NotRenter.selector);
+        podFactory.createPodsAndRequestLeases{value: 2 * QUOTE_TOTAL}(
+            quotes, quoteSigs, keeperSigs
+        );
+        assertEq(market.pendingRenter(first), address(0), "first reservation reverted");
+        assertEq(market.pendingRenter(second), address(0), "second reservation reverted");
     }
 
     /////////////////
@@ -240,46 +291,89 @@ contract AuditFixesTest is SetupTemplate {
     }
 
     /////////////////
-    // FINDING 13 — an expired renter must stop earning
+    // EXPIRY BOUNDARY — mixed intervals are split, not awarded wholesale
 
-    function testExpiredRenterStopsAccruing() public {
+    function testExpiryCrossingDeltaIsProratedAcrossTheBoundary() public {
         uint32 tokenIndex = _listKami();
-        _submit(_quote(tokenIndex, bob.owner, "expirepod"));
-        vm.prank(keeper);
-        podFactory.markLeasePreparing(tokenIndex);
-        vm.prank(keeper);
-        podFactory.routePreparedKami(tokenIndex);
-        vm.prank(keeper);
-        podFactory.activateProvisionedLease(tokenIndex);
+        _activate(_quote(tokenIndex, bob.owner, "crossingpod"));
 
         KamiLeaseMarket.Listing memory live = market.listings(tokenIndex);
-        assertEq(live.renter, bob.owner, "renter recorded");
-        assertGt(live.leaseEnd, block.timestamp, "term is live");
+        uint64 checkpoint = market.xpCheckpointAt(tokenIndex);
+        _fastForward(6 days);
+        _giveDelta(tokenIndex, 8_000);
+        _fastForward(2 days);
 
-        // credit a delta while the term is live -> renter gets their share
-        _giveDelta(tokenIndex, 10_000);
-        vm.prank(settler);
-        market.settle();
-        uint256 renterDuringTerm = market.owedMusu(bob.owner);
-        assertGt(renterDuringTerm, 0, "renter earns inside the term they paid for");
-
-        // past leaseEnd, with nobody having called finalizeLease, the split must
-        // fall back to the owner rather than keep paying a lapsed renter
-        _fastForward(8 days);
         uint256 ownerBefore = market.owedMusu(alice.owner);
-        _giveDelta(tokenIndex, 10_000);
-        _fastForward(1 days);
+        uint256 renterBefore = market.owedMusu(bob.owner);
         vm.prank(settler);
         market.settle();
 
-        assertEq(market.owedMusu(bob.owner), renterDuringTerm, "expired renter accrues nothing");
+        uint256 gross = 8_000;
+        uint256 net = gross - (gross * PLATFORM_BPS) / 10_000;
+        uint256 leasedNet =
+            (net * (uint256(live.leaseEnd) - uint256(checkpoint)))
+                / (block.timestamp - uint256(checkpoint));
+        uint256 renterNet = leasedNet - (leasedNet * OWNER_BPS) / 10_000;
+        uint256 ownerNet = net - renterNet;
+
+        assertEq(market.owedMusu(bob.owner) - renterBefore, renterNet, "pre-expiry share");
+        assertEq(market.owedMusu(alice.owner) - ownerBefore, ownerNet, "post-expiry share");
+        assertGt(renterNet, 0, "owner cannot take the whole mixed interval");
+        assertGt(ownerNet, 0, "renter cannot take the whole mixed interval");
+    }
+
+    function testDeltaEntirelyAfterExpiryBelongsToOwner() public {
+        uint32 tokenIndex = _listKami();
+        _activate(_quote(tokenIndex, bob.owner, "postexpirypod"));
+        KamiLeaseMarket.Listing memory live = market.listings(tokenIndex);
+
+        _setTime(live.leaseEnd);
+        vm.prank(settler);
+        market.settle(); // zero-delta checkpoint exactly at the boundary
+        uint256 ownerBefore = market.owedMusu(alice.owner);
+        uint256 renterBefore = market.owedMusu(bob.owner);
+
+        _giveDelta(tokenIndex, 10_000);
+        _fastForward(1 days + 1);
+        vm.prank(settler);
+        market.settle();
+
         uint256 gross = 10_000;
         uint256 net = gross - (gross * PLATFORM_BPS) / 10_000;
-        assertEq(market.owedMusu(alice.owner) - ownerBefore, net, "whole net goes to the owner");
+        assertEq(market.owedMusu(bob.owner), renterBefore, "expired renter accrues nothing");
+        assertEq(market.owedMusu(alice.owner) - ownerBefore, net, "post-expiry net is owner's");
     }
 
     /////////////////
     // FINDING 1 — the recovery rotation must survive an operator squat
+
+    function testHealthyActiveLeaseCannotEnterRecoveryAfterTwoDays() public {
+        uint32 tokenIndex = _listKami();
+        _activate(_quote(tokenIndex, bob.owner, "healthyrecovery"));
+        (, address podAddr,,,,) = podFactory.requests(tokenIndex);
+
+        _fastForward(2 days + 1);
+        vm.expectRevert(RenterRoomPodFactory.Grace.selector);
+        podFactory.enterPodRecovery(tokenIndex, bytes32(uint256(91)));
+        (,,,,, uint8 stage) = podFactory.requests(tokenIndex);
+        assertEq(stage, 3, "healthy lease remains ACTIVE");
+        assertFalse(RoomPod(podAddr).recoveryMode(), "healthy operator remains installed");
+    }
+
+    function testActiveLeaseRecoveryRequiresEndingGrace() public {
+        uint32 tokenIndex = _listKami();
+        _activate(_quote(tokenIndex, bob.owner, "endingrecovery"));
+        (, address podAddr,,,,) = podFactory.requests(tokenIndex);
+
+        _fastForward(7 days + 1);
+        market.endLease(tokenIndex);
+        vm.expectRevert(RenterRoomPodFactory.Grace.selector);
+        podFactory.enterPodRecovery(tokenIndex, bytes32(uint256(92)));
+
+        _fastForward(2 days + 1);
+        podFactory.enterPodRecovery(tokenIndex, bytes32(uint256(92)));
+        assertTrue(RoomPod(podAddr).recoveryMode(), "ending lease enters recovery after grace");
+    }
 
     function testRecoveryRotationIsRetryableWhenSquatted() public {
         uint32 tokenIndex = _listKami();

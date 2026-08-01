@@ -189,11 +189,10 @@ contract RenterRoomPodFactory {
         recoveryOpImpl = address(new PodRecoveryOperator());
     }
 
-    /// @notice Any submitter may fund a dual-signed quote; pod ownership,
-    /// refunds, cancel rights, and market attribution always follow the signed
-    /// quote.renter, so a batching periphery gains nothing by being msg.sender.
-    /// The zero-renter check preserves requests[].renter as the liveness
-    /// sentinel that ActiveRequest relies on.
+    /// @notice The dual-signed quote's renter must submit their own checkout.
+    /// Pod ownership, refunds, cancel rights, and market attribution all follow
+    /// that same identity. The zero-renter check preserves requests[].renter as
+    /// the liveness sentinel that ActiveRequest relies on.
     function createPodAndRequestLease(
         Quote calldata quote,
         bytes calldata quoteSignature,
@@ -211,9 +210,9 @@ contract RenterRoomPodFactory {
     /// @notice Fund several dual-signed quotes in ONE transaction — native
     /// batching for wallets without EIP-5792, no periphery contract needed.
     /// msg.value must equal the sum of every quote's funding; any failure
-    /// reverts the whole batch. The sum is checked before any pod deploys so
-    /// escrowed budgets of other leases can never even transiently back an
-    /// underfunded batch.
+    /// reverts the whole batch. Every quote must name msg.sender as renter.
+    /// The sum is checked before any pod deploys so escrowed budgets of other
+    /// leases can never even transiently back an underfunded batch.
     function createPodsAndRequestLeases(
         Quote[] calldata quotes,
         bytes[] calldata quoteSignatures,
@@ -251,6 +250,7 @@ contract RenterRoomPodFactory {
     {
         if (requests[quote.tokenIndex].renter != address(0)) revert ActiveRequest();
         if (quote.renter == address(0) || quote.operator == address(0)) revert BadQuote();
+        if (quote.renter != msg.sender) revert NotRenter();
         if (block.timestamp > quote.deadline) revert ExpiredQuote();
 
         bytes32 digest = quoteDigest(quote);
@@ -358,6 +358,7 @@ contract RenterRoomPodFactory {
         if (request.stage != PREPARING) revert BadStage();
         market.activateProvisionedLease(tokenIndex, _prefs[tokenIndex], request.termSecs);
         request.stage = ACTIVE;
+        request.requestedAt = uint64(block.timestamp); // exact paid-term start
         emit LeaseActivated(tokenIndex, request.renter, request.pod);
     }
 
@@ -430,15 +431,11 @@ contract RenterRoomPodFactory {
         if (priorStage == CANCEL_REQUESTED) {
             // The renter already waited PREPARING_GRACE before reaching this stage.
         } else if (priorStage == ACTIVE) {
-            // A timeout must hold INDEPENDENTLY. The old `&&` short-circuited the
-            // moment the settler called finalizeLease directly (leaseRenter -> 0
-            // without advancing the factory stage), letting anyone irreversibly
-            // burn a healthy pod with zero elapsed grace — killing pullGas and
-            // closing finalizeGasRefund with the kami still inside.
-            if (
-                !market.recoveryReady(tokenIndex)
-                    && block.timestamp < uint256(request.requestedAt) + FINALIZED_GRACE
-            ) revert Grace();
+            // ACTIVE recovery is valid only after the market itself proves that
+            // the lease is ending and its immutable grace has elapsed. A factory
+            // request timestamp is not an expiry signal: using it here let any
+            // caller destroy a healthy long-running lease after two days.
+            if (!market.recoveryReady(tokenIndex)) revert Grace();
         } else if (priorStage == FINALIZED) {
             if (block.timestamp < uint256(request.requestedAt) + FINALIZED_GRACE) revert Grace();
         } else {
@@ -494,7 +491,7 @@ contract RenterRoomPodFactory {
     /// the same renter, preventing pulls after finalization.
     function pullGas(uint32 tokenIndex, uint256 amount) external nonReentrant {
         Request storage request = requests[tokenIndex];
-        if (request.stage != PREPARING && request.stage != ACTIVE) revert BadStage();
+        if (request.stage < PREPARING) revert BadStage();
         if (request.stage == ACTIVE && market.leaseRenter(tokenIndex) != request.renter) revert BadStage();
         if (request.gasBudget < amount) revert BudgetTooLow();
         if (msg.sender != _operator(request.pod)) revert NotOperator();
@@ -539,11 +536,20 @@ contract RenterRoomPodFactory {
     function extendLeaseAndTopUp(uint32 tokenIndex, uint32 extraSecs) external payable nonReentrant {
         Request storage request = requests[tokenIndex];
         if (request.renter != msg.sender) revert NotRenter();
-        if (request.stage != ACTIVE) revert BadStage();
-        if (msg.value == 0) revert BudgetTooLow();
+        // The sealed market accepts extensions only from this factory, so the
+        // factory's activation timestamp is the authoritative expiry gate.
+        if (
+            request.stage != ACTIVE
+                || block.timestamp > uint256(request.requestedAt) + request.termSecs
+        ) revert BadStage();
+        // A renter extending the owner's custody lock must also fund a real
+        // operating reserve. Twelve million gas units/day covers the measured
+        // safe Rest V3 cadence plus terminal headroom; tx.gasprice binds the
+        // minimum to the same network price that accepted this transaction.
+        if (msg.value / extraSecs < uint256(tx.gasprice) * 139) revert BudgetTooLow();
         request.gasBudget += msg.value;
         market.extendLease(tokenIndex, extraSecs);
-        emit GasToppedUp(tokenIndex, msg.sender, msg.value);
+        request.termSecs += extraSecs;
     }
 
     /// @notice Once the market has finalized the lease, anyone may trigger the

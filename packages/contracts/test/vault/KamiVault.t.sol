@@ -221,6 +221,57 @@ contract KamiVaultTest is SetupTemplate {
     assertEq(_accountMusu(alice), aliceBefore, "should not distribute without earnings");
   }
 
+  function testDeferredPayoutStaysSolventAcrossSettlementsAndClaimsNetOfFee() public {
+    address lateRegistrant = _getNextUserAddress();
+    uint256 kamiID = _mintKami(alice);
+    _unstakeKami(kamiID);
+    uint32 tokenIndex = LibKami.getIndex(components, kamiID);
+
+    vm.prank(alice.owner);
+    _Kami721.transferFrom(alice.owner, lateRegistrant, uint256(tokenIndex));
+    vm.startPrank(lateRegistrant);
+    _Kami721.approve(address(vault), uint256(tokenIndex));
+    vault.deposit(tokenIndex);
+    vm.stopPrank();
+    _stakeIntoVault(tokenIndex);
+
+    _vaultHarvest(kamiID, 100_000);
+    vault.settle();
+
+    uint256 firstGross = vault.owedMusu(lateRegistrant);
+    assertGt(firstGross, TRANSFER_FEE, "deferred gross must fund its claim fee");
+    assertEq(vault.owedMusuTotal(), firstGross, "aggregate liability mismatch");
+    assertGe(vault.musuBalance(), firstGross, "first settlement insolvent");
+
+    // A later settlement must treat the first gross claim as reserved money,
+    // not as new revenue that can be allocated a second time.
+    _vaultHarvest(kamiID, 80_000);
+    vault.settle();
+
+    uint256 totalGross = vault.owedMusu(lateRegistrant);
+    assertGt(totalGross, firstGross, "second earning not accrued");
+    assertEq(vault.owedMusuTotal(), totalGross, "aggregate liability double-counted");
+    assertGe(vault.musuBalance(), totalGross, "repeat settlement spent a liability");
+
+    vm.prank(lateRegistrant);
+    _AccountRegisterSystem.executeTyped(lateRegistrant, "late-registrant");
+    uint256 target = uint256(uint160(lateRegistrant));
+    uint256 recipientBefore = LibInventory.getBalanceOf(components, target, MUSU_INDEX);
+    uint256 vaultBefore = vault.musuBalance();
+
+    vm.prank(lateRegistrant);
+    vault.claimOwed();
+
+    assertEq(
+      LibInventory.getBalanceOf(components, target, MUSU_INDEX) - recipientBefore,
+      totalGross - TRANSFER_FEE,
+      "claimant net payout"
+    );
+    assertEq(vaultBefore - vault.musuBalance(), totalGross, "claim consumed another user's funds");
+    assertEq(vault.owedMusu(lateRegistrant), 0, "claim not cleared");
+    assertEq(vault.owedMusuTotal(), 0, "aggregate liability not cleared");
+  }
+
   /////////////////
   // ADMIN BOUNDARIES
 
