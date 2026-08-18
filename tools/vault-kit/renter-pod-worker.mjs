@@ -440,7 +440,7 @@ async function ingestEvents() {
   save();
 }
 
-async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = true } = {}) {
+async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = true, required = true } = {}) {
   const [balance, feeData] = await Promise.all([
     provider.getBalance(operator.address),
     provider.getFeeData(),
@@ -462,12 +462,19 @@ async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = tr
     minimumActionWei
   );
   if (!health.canAffordAction) {
-    throw new Error(
+    const detail =
       `operator gas health failed for Kami #${tokenIndex}: ${operator.address} has ${balance} wei, `
         + `${request.gasBudget} wei escrow remains, projected ${health.projectedBalance} wei is `
         + `${health.shortfall} wei short of one action (${minimumActionWei} wei)`
-        + (allowPull ? "" : "; this deployed factory cannot pull escrow in a terminal stage")
-    );
+        + (allowPull ? "" : "; this deployed factory cannot pull escrow in a terminal stage");
+    if (required) throw new Error(detail);
+    // Advisory mode: the caller only has self-financing or keeper-signed work
+    // left, so a broke operator must not wedge terminal cleanup. Kami #5846
+    // proved the failure: 0.2e12 wei short of a 1.7M-gas "action" it never
+    // needed, retried every tick for days while finalizeGasRefund - which the
+    // KEEPER signs - waited behind the throw.
+    console.warn(`${detail}; continuing - remaining terminal work does not need the operator`);
+    return;
   }
   if (health.topUpAmount === 0n) return;
 
@@ -642,8 +649,13 @@ async function processJob(job) {
     }
     if (actualAccID === BigInt(listing.owner)) {
       if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.FACTORY) {
+        // Advisory only: returnUnusedOperatorGas prices its own transaction
+        // against the real balance and skips when unaffordable, and the call
+        // after it is keeper-signed. Requiring a full action here wedged
+        // terminal cleanup on dust (see ensureOperatorGas).
         await ensureOperatorGas(job.tokenIndex, request, operator, {
           allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+          required: false,
         });
       }
       await returnUnusedOperatorGas(job.tokenIndex, operator);
@@ -668,8 +680,13 @@ async function processJob(job) {
     }
     if (actualAccID === BigInt(listing.owner)) {
       if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.FACTORY) {
+        // Advisory only: returnUnusedOperatorGas prices its own transaction
+        // against the real balance and skips when unaffordable, and the call
+        // after it is keeper-signed. Requiring a full action here wedged
+        // terminal cleanup on dust (see ensureOperatorGas).
         await ensureOperatorGas(job.tokenIndex, request, operator, {
           allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
+          required: false,
         });
       }
       await returnUnusedOperatorGas(job.tokenIndex, operator);

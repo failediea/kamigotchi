@@ -52,6 +52,28 @@ test("checks operator gas before every terminal pod send", () => {
   assert.match(stage5, /ensureOperatorGas[\s\S]+sendSystem/);
 });
 
+test("terminal dust return never hard-requires a full action of operator gas", () => {
+  // Kami #5846: 0.2e12 wei short of a 1.7M-gas action it did not need, and the
+  // required check threw before the self-financing dust return and the
+  // keeper-signed refund could run - every 30s, for days. The gas-health call
+  // in both custody-is-home terminal branches must be advisory.
+  const stage4 = workerSource.slice(
+    workerSource.indexOf("if (stage === 4)"),
+    workerSource.indexOf("if (stage === 5)")
+  );
+  const stage5 = workerSource.slice(
+    workerSource.indexOf("if (stage === 5)"),
+    workerSource.indexOf("// A deleted request")
+  );
+  for (const block of [stage4, stage5]) {
+    const ownerBranch = block.slice(block.indexOf("listing.owner)"));
+    assert.match(ownerBranch, /ensureOperatorGas\([\s\S]*?required: false/);
+  }
+  // and the escape hatch only exists behind the option: a required failure
+  // still throws
+  assert.match(workerSource, /if \(required\) throw new Error\(detail\);/);
+});
+
 test("uses the keeper after the stage-four operator returns its gas", () => {
   assert.match(
     workerSource,
