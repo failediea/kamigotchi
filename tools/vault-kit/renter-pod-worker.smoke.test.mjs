@@ -218,6 +218,16 @@ test("real worker survives a same-batch cancel/re-rent, keeps other Kamis moving
     assert.equal(heartbeat.lastTickOk, true, output);
     assert.equal(heartbeat.lastBlock, LATEST - 12 + 1);
 
+    // No RENTER_ALLOWLIST in this env: the loud open-rentals banner is printed,
+    // and the launch guards line (grepped by the deploy runbook) keeps its
+    // prefix and ends with the per-renter lease cap.
+    assert.match(output, /WARNING: RENTER_ALLOWLIST is NOT SET - this worker runs OPEN RENTALS\./);
+    assert.match(output, /ALLOW_OPEN_RENTALS is not set/);
+    assert.match(
+      output,
+      /launch guards: allowlist=off, maxActiveLeases=20, maxLiveReservations=200, maxReservationsPerRenter=2, .*maxActiveLeasesPerRenter=2\n/
+    );
+
     const state = JSON.parse(readFileSync(stateFile, "utf8"));
     assert.doesNotMatch(output, /second active RoomPod event/);
     assert.doesNotMatch(output, /tick failed/);

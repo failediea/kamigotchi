@@ -17,8 +17,14 @@
  *   OPERATOR_RESERVATION_HOST, OPERATOR_RESERVATION_PORT,
  *   KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE,
  *   EVENT_CONFIRMATIONS (default 12; confirmed blocks only)
+ * The .env next to this file is loaded first (process env wins); one pair of
+ * matching surrounding quotes is stripped from each value. A malformed or
+ * missing setting does not crash-loop: the worker logs
+ * "[LEASE-ALERT] CONFIG_ERROR key=<KEY>" and waits, idle, for a fixed .env
+ * and a restart (renter-pod-config.mjs ConfigError).
  * Launch hardening (see renter-pod-config.mjs for defaults):
- *   RENTER_ALLOWLIST, MAX_ACTIVE_LEASES, MAX_LIVE_RESERVATIONS,
+ *   RENTER_ALLOWLIST, MAX_ACTIVE_LEASES, MAX_ACTIVE_LEASES_PER_RENTER,
+ *   MAX_LIVE_RESERVATIONS,
  *   MAX_RESERVATIONS_PER_RENTER, RESERVATION_TTL_SEC, TX_WAIT_TIMEOUT_MS,
  *   FETCH_TIMEOUT_MS, TICK_WATCHDOG_SEC, HEARTBEAT_STALE_SEC,
  *   ALERT_MIN_INTERVAL_SEC, STAGE_STUCK_ALERT_SEC,
@@ -30,13 +36,14 @@
  * Lease safety (THR-02/03/10; defaults in renter-pod-config.mjs):
  *   PREFS_FLOOR, PREFS_FLOOR_HP_LOW_MIN, PREFS_FLOOR_FARM_INTERVAL_MAX_SEC,
  *   PREFS_FLOOR_SAFETY_MARGIN_MIN, PREFS_FLOOR_FEED_PERCENT_MIN,
- *   PREFS_FLOOR_REST_PCT_OF_FARM, PREFS_FLOOR_FORCE_HP_FEED,
+ *   PREFS_FLOOR_REST_PCT_OF_FARM, PREFS_FLOOR_FAILSAFE_REST_MIN_SEC,
+ *   PREFS_FLOOR_FORCE_HP_FEED,
  *   EXIT_RESERVE_ACTIONS, EXIT_RESUME_HEADROOM_ACTIONS, PREFS_CADENCE_GUARD,
  *   STRATEGY_RESTART_MIN_INTERVAL_SEC, KAMIBOTS_STOP_MAX_FAILURES,
  *   KAMIBOTS_RETRY_MAX_SEC.
  * Alerts needing a human are single lines starting with "[LEASE-ALERT] ".
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,8 +56,14 @@ import {
   id as keccakId,
   solidityPackedKeccak256,
 } from "ethers";
-import { LeaseAlertCode, createLeaseAlerter } from "./renter-pod-alerts.mjs";
-import { OperatorTxPricing, hardeningConfigFromEnv } from "./renter-pod-config.mjs";
+import { LeaseAlertCode, createLeaseAlerter, formatLeaseAlert } from "./renter-pod-alerts.mjs";
+import {
+  OperatorTxPricing,
+  hardeningConfigFromEnv,
+  loadEnvFile,
+  workerRuntimeConfigFromEnv,
+} from "./renter-pod-config.mjs";
+import { OPERATOR_GAS_DEFAULTS } from "./renter-pod-lease-policy.mjs";
 import {
   RetiredJobAction,
   assertRequestStillOurs,
@@ -107,58 +120,62 @@ import { advancePreparingLease } from "./renter-pod-activation.mjs";
 import { operatorWalletForJob, purgeReturnedJobSecrets } from "./renter-pod-keys.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const envPath = join(here, ".env");
-if (existsSync(envPath)) {
-  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
-    const match = line.match(/^([A-Z_]+)=(.+)$/);
-    if (match && !process.env[match[1]]) process.env[match[1]] = match[2].trim();
-  }
+
+/**
+ * A bad setting must be FIXED, not retried: exiting would make systemd
+ * (Restart=always) restart into the same error every 10 s. Log one clear
+ * CONFIG_ERROR alert line naming the key, repeat it every 10 minutes so the
+ * alert scanner always sees it, and stay idle (no ticks, no reservation
+ * server, no heartbeat - the heartbeat check and a deploy verify both fail
+ * loudly). `systemctl restart` after fixing the .env recovers.
+ */
+function holdOnConfigError(error) {
+  const key = error?.key ?? "-";
+  const message = error instanceof Error ? error.message : String(error);
+  const line = () => formatLeaseAlert(LeaseAlertCode.CONFIG_ERROR, { key, err: message.slice(0, 200) });
+  console.error(`FATAL configuration error (${key}): ${message}`);
+  console.error("The worker will NOT run until this is fixed in .env and the unit is restarted.");
+  console.error(line());
+  setInterval(() => console.error(line()), 600_000);
+  return new Promise(() => {});
 }
 
-const required = (name) => {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-};
+let RUNTIME;
+let HARDENING;
+let TERMINAL_GAS_RETURN_MODE;
+let TERMINAL_GAS_PULL_MODE;
+try {
+  loadEnvFile(join(here, ".env"));
+  RUNTIME = workerRuntimeConfigFromEnv(process.env, {
+    actionGasFloorDefault: OPERATOR_GAS_DEFAULTS.actionGasFloor,
+    reserveGasUnitsDefault: OPERATOR_GAS_DEFAULTS.reserveGasUnits,
+  });
+  HARDENING = hardeningConfigFromEnv(process.env);
+  TERMINAL_GAS_RETURN_MODE = terminalGasReturnMode(process.env.TERMINAL_GAS_RETURN_MODE);
+  TERMINAL_GAS_PULL_MODE = terminalGasPullMode(process.env.TERMINAL_GAS_PULL_MODE);
+} catch (error) {
+  await holdOnConfigError(error);
+}
 
-const RPC = required("YOMINET_RPC");
-const WORLD = required("WORLD_ADDR");
-const MARKET = required("MARKET_ADDRESS");
-const FACTORY = required("RENTER_POD_FACTORY");
-const KEEPER_KEY = required("KEEPER_PRIVATE_KEY");
-const RESERVATION_TOKEN = required("OPERATOR_RESERVATION_TOKEN");
-if (RESERVATION_TOKEN.length < 32) throw new Error("OPERATOR_RESERVATION_TOKEN must be at least 32 characters");
+const RPC = RUNTIME.rpc;
+const WORLD = RUNTIME.world;
+const MARKET = RUNTIME.market;
+const FACTORY = RUNTIME.factory;
+const KEEPER_KEY = RUNTIME.keeperKey;
+const RESERVATION_TOKEN = RUNTIME.reservationToken;
 const LEGACY_OPERATOR_SEED = process.env.LEGACY_PROVISIONING_OPERATOR_SEED || "";
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const KAMISTATS = process.env.KAMISTATS_URL || "https://kamistats.com";
-const POLL_MS = Number(process.env.POLL_MS || 30_000);
+const POLL_MS = RUNTIME.pollMs;
 const STATE_FILE = process.env.WORKER_STATE_FILE || join(here, "renter-pod-worker-state.json");
-// Measured operating calls use ~1,611,833 gas. The default leaves a small
-// regression margin while still checking the current network gas price.
-const OPERATOR_ACTION_GAS_FLOOR = BigInt(process.env.OPERATOR_ACTION_GAS_FLOOR || "1700000");
-// Roughly seven measured actions, matching the worker's observed daily cadence.
-// The wei reserve is calculated from the live gas price instead of assuming
-// Yominet will remain fixed at 2.5 Mwei.
-const OPERATOR_RESERVE_GAS_UNITS = BigInt(process.env.OPERATOR_RESERVE_GAS_UNITS || "12000000");
-if (OPERATOR_ACTION_GAS_FLOOR <= 0n) {
-  throw new Error("OPERATOR_ACTION_GAS_FLOOR must be a positive integer");
-}
-if (OPERATOR_RESERVE_GAS_UNITS < OPERATOR_ACTION_GAS_FLOOR) {
-  throw new Error("OPERATOR_RESERVE_GAS_UNITS must cover at least one operator action");
-}
-const EVENT_CONFIRMATIONS = Number(process.env.EVENT_CONFIRMATIONS || 12);
-if (!Number.isSafeInteger(EVENT_CONFIRMATIONS) || EVENT_CONFIRMATIONS < 1 || EVENT_CONFIRMATIONS > 256) {
-  throw new Error("EVENT_CONFIRMATIONS must be an integer between 1 and 256");
-}
-const TERMINAL_GAS_RETURN_MODE = terminalGasReturnMode(
-  process.env.TERMINAL_GAS_RETURN_MODE
-);
-const TERMINAL_GAS_PULL_MODE = terminalGasPullMode(
-  process.env.TERMINAL_GAS_PULL_MODE
-);
+// Per-action gas floor and the one-day pullGas reserve (renter-pod-lease-policy.mjs
+// defaults). Both are priced at the live billed fee per gas, never at a
+// fixed 2.5 Mwei.
+const OPERATOR_ACTION_GAS_FLOOR = RUNTIME.operatorActionGasFloor;
+const OPERATOR_RESERVE_GAS_UNITS = RUNTIME.operatorReserveGasUnits;
+const EVENT_CONFIRMATIONS = RUNTIME.eventConfirmations;
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
-const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
-const HARDENING = hardeningConfigFromEnv(process.env);
+const RESERVATION_PORT = RUNTIME.reservationPort;
 const RESERVATION_FILE = process.env.RESERVATION_STATE_FILE || reservationFileFor(STATE_FILE);
 const HEARTBEAT_FILE = heartbeatPathFor(STATE_FILE);
 const HALT_FILE = process.env.WORKER_HALT_FILE || join(dirname(STATE_FILE), "HALT");
@@ -219,7 +236,7 @@ const POD_ABI = [
 const { state, save, saveReservations } = loadWorkerState({
   stateFile: STATE_FILE,
   reservationFile: RESERVATION_FILE,
-  startBlock: process.env.START_BLOCK,
+  startBlock: RUNTIME.startBlock,
   legacySeed: LEGACY_OPERATOR_SEED,
 });
 
@@ -271,6 +288,8 @@ const OPERATOR_ACTION_BILLED_GAS = billedActionGas(OPERATOR_ACTION_GAS_FLOOR);
 
 let lastIngestOkAt = null;
 let lastHeartbeat = null;
+// Consecutive batch-ingest failures across ticks (INGEST_ERROR debounce).
+const ingestHealth = { failures: 0, since: null };
 
 let idOwnsKami;
 let kamiStateComponent;
@@ -994,6 +1013,7 @@ async function tick() {
     save,
     onProgress: () => watchdog.progress(),
     startOffset: tickSequence++,
+    ingestHealth,
   });
   // Only a tick that ran to completion refreshes the heartbeat.
   writeHeartbeat({ tickMs: result.tickMs, lastTickOk: result.ingestOk });
@@ -1038,21 +1058,34 @@ console.log(
     + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}, `
     + `maxReservationsPerListing=${HARDENING.maxReservationsPerListing || "off"}, `
     + `logChunkBlocks=${HARDENING.logChunkBlocks}x${HARDENING.logChunksPerTick}, `
-    + `operatorTxPricing=${HARDENING.operatorTxPricing}`
+    + `operatorTxPricing=${HARDENING.operatorTxPricing}, `
+    + `maxActiveLeasesPerRenter=${HARDENING.maxActiveLeasesPerRenter}`
 );
 if (!HARDENING.renterAllowlist) {
-  console.warn(
-    "WARNING: RENTER_ALLOWLIST is off. Renter addresses on quote requests are not authenticated yet, "
-      + "so reservation caps can be filled by anyone who can reach the quote API. Keep an allowlist "
-      + "until the quote API verifies a renter signature."
-  );
+  const acknowledged = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_OPEN_RENTALS ?? "").trim());
+  const banner = "!".repeat(78);
+  for (const line of [
+    banner,
+    "WARNING: RENTER_ALLOWLIST is NOT SET - this worker runs OPEN RENTALS.",
+    "The keeper attests quotes for ANY renter the quote API sends (403 private-beta is off).",
+    "The soft launch requires RENTER_ALLOWLIST=0x..,0x.. (the same list as the web's",
+    "LEASE_RENTER_ALLOWLIST) in this .env, then a restart.",
+    acknowledged
+      ? "ALLOW_OPEN_RENTALS is set: open rentals were chosen explicitly."
+      : "ALLOW_OPEN_RENTALS is not set: open rentals were NOT acknowledged.",
+    banner,
+  ]) {
+    console.warn(line);
+  }
 }
 const FLOOR = HARDENING.prefsFloor;
 console.log(
   `lease safety: prefsFloor=${FLOOR ? `hpLow>=${FLOOR.hpThresholdLowMin},farm<=${FLOOR.farmIntervalMaxSec}s,`
     + `safetyMargin>=${FLOOR.safetyMarginMin},feed>=${FLOOR.feedPercentMin}%,rest>=${FLOOR.restPctOfFarmMin}%farm,`
+    + `failsafeRest>=max(${FLOOR.failsafeRestMinSec}s,rest),`
     + `hpFeed=${FLOOR.forceHpFeed ? "on" : "off"},no-${FLOOR.disallowedRisk}` : "off"}, `
     + `exitReserveActions=${HARDENING.exitReserveActions}, exitResumeHeadroomActions=${HARDENING.exitResumeHeadroomActions}, `
+    + `actionGasFloor=${OPERATOR_ACTION_GAS_FLOOR} (billed ${OPERATOR_ACTION_BILLED_GAS}), `
     + `cadenceGuard=${HARDENING.cadenceGuard ? "on" : "off"}, `
     + `strategyRestartMinIntervalSec=${HARDENING.strategyRestartMinIntervalMs / 1000}, `
     + `kamibotsStopMaxFailures=${HARDENING.kamibotsStopMaxFailures}, kamibotsRetryMaxSec=${HARDENING.kamibotsRetryMaxMs / 1000}`

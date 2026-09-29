@@ -1,0 +1,255 @@
+{
+  "version": 1,
+  "source": "kamigotchi tools/vault-kit/renter-pod-lease-policy.mjs (renter-pod worker)",
+  "kamibotsPrefLimits": {
+    "farmIntervalSec": {
+      "min": 1200,
+      "max": 72000,
+      "default": 1800
+    },
+    "restIntervalSec": {
+      "min": 900,
+      "max": 30000,
+      "default": 1800
+    },
+    "collectIntervalSec": {
+      "min": 0,
+      "max": 72000,
+      "default": 0
+    },
+    "scavengeIntervalSec": {
+      "min": 0,
+      "max": 72000,
+      "default": 0
+    },
+    "feedIntervalSec": {
+      "min": 1800,
+      "max": 72000,
+      "default": 3600
+    },
+    "feedPercent": {
+      "min": 1,
+      "max": 99,
+      "default": 50
+    },
+    "failsafeRestDurationSec": {
+      "min": 60,
+      "max": 72000,
+      "default": 600
+    },
+    "hpThresholdLow": {
+      "min": 5,
+      "max": 90
+    },
+    "hpThresholdHigh": {
+      "max": 100,
+      "minAboveLow": 5
+    },
+    "safetyMargin": {
+      "min": 0,
+      "max": 10
+    }
+  },
+  "prefsFloor": {
+    "hpThresholdLowMin": 45,
+    "farmIntervalMaxSec": 18000,
+    "safetyMarginMin": 5,
+    "feedPercentMin": 45,
+    "restPctOfFarmMin": 51,
+    "failsafeRestMinSec": 3600,
+    "forceHpBasedRest": true,
+    "forceFailsafeRest": true,
+    "forceHpFeed": true,
+    "disallowedRisk": "aggressive",
+    "replacementRisk": "balanced",
+    "farmIntervalSec": {
+      "min": 1200,
+      "max": 18000
+    },
+    "restIntervalRule": "harvestAndFeed (and harvestAndRest with useHpBasedRest=false, which the floor forbids): restInterval >= min(30000, ceil(farmInterval * 51 / 100))",
+    "restIntervalSec": {
+      "min": 900,
+      "max": 30000
+    },
+    "restIntervalMinAtMaxFarmSec": 9180,
+    "failsafeRestRule": "harvestAndFeed with failsafe on (forced): failsafeRestDuration >= min(72000, max(3600, restInterval))",
+    "failsafeRestMinAtDefaultsSec": 3600,
+    "hpRule": "useHpBasedRest forced on; hpThresholdLow >= 45; hpThresholdHigh >= min(100, hpThresholdLow + 5)",
+    "feedRule": "harvestAndFeed feeds on HP (enableFeedInterval=false); feedPercent >= 45",
+    "riskRule": "risk \"aggressive\" becomes \"balanced\"; safetyMargin >= 5"
+  },
+  "actionsPerDay": {
+    "formula": "rest_v3: cycle = REST_V3_MEASURED_CYCLE_SEC, else cycle = max(60,farm)+max(60,rest); actions = ceil(86400/cycle)*2 + 4; non-rest_v3 adds ceil(86400/collect) + ceil(86400/scavenge) for intervals > 0; harvestAndFeed with a feed timer adds ceil(86400/feedInterval). Computed on FLOORED prefs.",
+    "restV3MeasuredCycleSec": 26340
+  },
+  "gas": {
+    "defaultPricing": "eip1559",
+    "feePerGasFormula": {
+      "eip1559": "max(2 * baseFeePerGas + maxPriorityFeePerGas, gasPrice); maxPriorityFeePerGas = eth_maxPriorityFeePerGas or 1 gwei when the RPC returns none; no base fee -> gasPrice",
+      "legacy": "gasPrice"
+    },
+    "ethersDefaultPriorityFeeWei": "1000000000",
+    "actionGasFloor": "1700000",
+    "billedActionGasFormula": "units + floor(units / 10)  (Yominet charges 10% of unused gas)",
+    "billedActionGas": "1870000",
+    "reserveGasUnits": "12000000",
+    "pullGasTargetFormula": "reserveGasUnits * feePerGas",
+    "exitReserveActions": 3,
+    "exitStopTriggerActions": 4,
+    "exitResumeActions": 6,
+    "exitRule": "ACTIVE lease: strategy stopped when operatorBalance + escrow < exitStopTriggerActions * billedActionWei; restarted at >= exitResumeActions * billedActionWei",
+    "operatingBudgetExtraActions": 4,
+    "operatingBudgetFormula": "(ceil(actionsPerDay(flooredPrefs) * termSecs / 86400) + operatingBudgetExtraActions) * billedActionGas * feePerGas",
+    "setupAndHubRule": "price setupGasWei and hubGasWei at the same billed feePerGas",
+    "examples": [
+      {
+        "feeInputs": {
+          "gasPrice": "2500000",
+          "baseFeePerGas": "2500000",
+          "maxPriorityFeePerGas": "0"
+        },
+        "rawPrefs": {},
+        "termSecs": 86400,
+        "feePerGasWei": "5000000",
+        "billedActionWei": "9350000000000",
+        "exitStopTriggerWei": "37400000000000",
+        "exitResumeWei": "56100000000000",
+        "pullGasTargetWei": "60000000000000",
+        "actionsPerDay": 52,
+        "operatingActions": 52,
+        "operatingGasWei": "523600000000000"
+      },
+      {
+        "feeInputs": {
+          "gasPrice": "2500000",
+          "baseFeePerGas": "2500000",
+          "maxPriorityFeePerGas": "0"
+        },
+        "rawPrefs": {
+          "strategy": "harvestAndFeed",
+          "farmInterval": 72000,
+          "restInterval": 900
+        },
+        "termSecs": 86400,
+        "feePerGasWei": "5000000",
+        "billedActionWei": "9350000000000",
+        "exitStopTriggerWei": "37400000000000",
+        "exitResumeWei": "56100000000000",
+        "pullGasTargetWei": "60000000000000",
+        "actionsPerDay": 12,
+        "operatingActions": 12,
+        "operatingGasWei": "149600000000000"
+      },
+      {
+        "feeInputs": {
+          "gasPrice": "2500000",
+          "baseFeePerGas": "2500000",
+          "maxPriorityFeePerGas": "0",
+          "pricing": "legacy"
+        },
+        "rawPrefs": {},
+        "termSecs": 86400,
+        "feePerGasWei": "2500000",
+        "billedActionWei": "4675000000000",
+        "exitStopTriggerWei": "18700000000000",
+        "exitResumeWei": "28050000000000",
+        "pullGasTargetWei": "30000000000000",
+        "actionsPerDay": 52,
+        "operatingActions": 52,
+        "operatingGasWei": "261800000000000"
+      }
+    ]
+  },
+  "reservations": {
+    "maxActiveLeases": 20,
+    "maxActiveLeasesPerRenter": 2,
+    "maxLiveReservations": 200,
+    "maxReservationsPerRenter": 2,
+    "maxReservationsPerListing": 0,
+    "reservationTtlSec": 1200,
+    "reserveBody": "{ market, factory, nonce, renter, tokenIndex }  (tokenIndex optional but should be sent)",
+    "attestBody": "{ market, factory, quote }  (quote.renter and quote.tokenIndex required)",
+    "refusal429Body": "{ error, code: LEASE_CAP | RESERVATION_CAP, scope }",
+    "refusalScopes": {
+      "reservation": "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts",
+      "renter": "RESERVATION_CAP: this wallet holds maxActiveLeasesPerRenter leases (active + in checkout)",
+      "lease": "RESERVATION_CAP: this listing has maxReservationsPerListing open checkouts",
+      "market": "LEASE_CAP: market at maxActiveLeases; RESERVATION_CAP: maxLiveReservations checkouts in flight"
+    }
+  },
+  "renterAllowlist": {
+    "rules": [
+      "trim; strip one pair of matching surrounding quotes; trim",
+      "empty -> no allowlist",
+      "split on ','; trim entries; skip empty entries",
+      "each entry: 0x + 40 hex digits, any case (no checksum check), else hard error at startup",
+      "non-empty value without any address -> hard error",
+      "compare lowercased"
+    ],
+    "vectors": [
+      {
+        "input": "",
+        "result": null
+      },
+      {
+        "input": "   ",
+        "result": null
+      },
+      {
+        "input": "\"\"",
+        "result": null
+      },
+      {
+        "input": " 0x00000000000000000000000000000000000000Aa , 0x00000000000000000000000000000000000000bB ",
+        "result": [
+          "0x00000000000000000000000000000000000000aa",
+          "0x00000000000000000000000000000000000000bb"
+        ]
+      },
+      {
+        "input": "\"0x00000000000000000000000000000000000000AA,0x00000000000000000000000000000000000000aa,\"",
+        "result": [
+          "0x00000000000000000000000000000000000000aa"
+        ]
+      },
+      {
+        "input": "'0x00000000000000000000000000000000000000c1'",
+        "result": [
+          "0x00000000000000000000000000000000000000c1"
+        ]
+      },
+      {
+        "input": "0x52908400098527886E0F7030069857D2E4169EE7",
+        "result": [
+          "0x52908400098527886e0f7030069857d2e4169ee7"
+        ]
+      },
+      {
+        "input": "0x52908400098527886e0F7030069857D2E4169EE7",
+        "result": [
+          "0x52908400098527886e0f7030069857d2e4169ee7"
+        ]
+      },
+      {
+        "input": ",",
+        "error": "RENTER_ALLOWLIST"
+      },
+      {
+        "input": "0x00000000000000000000000000000000000000c1,nope",
+        "error": "RENTER_ALLOWLIST"
+      },
+      {
+        "input": "0x00000000000000000000000000000000000000c1 0x00000000000000000000000000000000000000c2",
+        "error": "RENTER_ALLOWLIST"
+      },
+      {
+        "input": "\"0x00000000000000000000000000000000000000c1",
+        "error": "RENTER_ALLOWLIST"
+      },
+      {
+        "input": "0x00000000000000000000000000000000000000c",
+        "error": "RENTER_ALLOWLIST"
+      }
+    ]
+  }
+}
