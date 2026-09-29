@@ -1,0 +1,15 @@
+# H7 / CON-01 / H2: top up ACTIVE v16 lease operator EOAs below the exit reserve.
+# NOT installed by default. Install with ../install-launch-ops.sh --component sponsor
+# only after the sponsor wallet is funded and SPONSOR_KEY_FILE / SPONSOR_ADDRESS are set.
+[Unit]
+Description=Kami lease v16 operator gas sponsor
+After=network-online.target
+Wants=network-online.target
+OnFailure=kami-lease-ops-onfailure@%n.service
+
+[Service]
+Type=oneshot
+Environment=LAUNCH_OPS_ENV=/etc/kami-lease-ops/launch-ops.env
+ExecStart=/root/kamigotchi/tools/launch-ops/keeper/lease-gas-sponsor.sh --apply
+TimeoutStartSec=900
+SyslogIdentifier=kami-lease-gas-sponsor
