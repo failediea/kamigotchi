@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Wallet, keccak256 } from "ethers";
-import { TxPendingError, TxTimeoutError, createTxTracker, isDefiniteBroadcastRejection } from "./renter-pod-tx.mjs";
+import {
+  TxPendingError,
+  TxTimeoutError,
+  createTxTracker,
+  isDefiniteBroadcastRejection,
+  isNonceHeldByMempool,
+} from "./renter-pod-tx.mjs";
 
 const FROM = "0x0000000000000000000000000000000000000abc";
 const OTHER_HASH = `0x${"ab".repeat(32)}`;
@@ -185,13 +191,173 @@ test("a null getTransaction alone never frees the job: rebroadcast, wait, then r
 
   clock = 6_000;
   assert.equal(await tracker.pendingFor("7:0x1"), null, "declared dropped after dropAfterMs");
-  assert.deepEqual(state.txNonceHints["7:0x1"], { from: FROM, nonce: 9, label: "pullGas", at: 6_000 });
+  const hint = state.txNonceHints["7:0x1"];
+  assert.deepEqual({ ...hint, prevRecord: undefined }, { from: FROM, nonce: 9, label: "pullGas", at: 6_000, prevRecord: undefined });
+  assert.equal(hint.prevRecord.hash, hash, "the dropped record is kept on the hint");
 
   // The node's pending count says 10 (it may still hold the original), but the
   // resend is pinned to nonce 9: the original and the retry cannot both mine.
   await tracker.send("7:0x1", "pullGas", { signer, request });
   assert.equal(signer.populated[0].nonce, 9);
+  assert.ok(state.txNonceHints["7:0x1"], "hint kept until the latest nonce passes it");
+
+  // Nonce 9 mined: the next send for this job drops the hint and uses the node nonce.
+  provider.latestNonce = 10;
+  await tracker.send("7:0x1", "pullGas", { signer, request });
+  assert.equal(signer.populated[1].nonce, 10);
   assert.equal(state.txNonceHints["7:0x1"], undefined);
+});
+
+/**
+ * Node that accepts txs into a mempool it hides from eth_getTransactionByHash
+ * and answers geth-style: "already known" for the same bytes, "replacement
+ * transaction underpriced" for other bytes at an occupied nonce. The mempool
+ * is keyed by nonce, like a real txpool for one sender.
+ */
+function hidingNode({ latestNonce = 9, acceptFirstButTimeOut = true } = {}) {
+  const pool = new Map(); // nonce -> hash
+  const node = {
+    pool,
+    latestNonce,
+    broadcasts: [],
+    getTransactionReceipt: async () => null,
+    getTransaction: async () => null,
+    getTransactionCount: async (_from, tag) => (tag === "pending" ? node.latestNonce + pool.size : node.latestNonce),
+    broadcastTransaction: async (raw) => {
+      const hash = keccak256(raw);
+      const nonce = JSON.parse(Buffer.from(raw.slice(2), "hex").toString()).nonce;
+      node.broadcasts.push({ hash, nonce });
+      if (pool.get(nonce) === hash) {
+        throw Object.assign(new Error('could not coalesce error (error={ "code": -32000, "message": "already known" })'), {
+          code: "UNKNOWN_ERROR",
+          error: { code: -32000, message: "already known" },
+        });
+      }
+      if (pool.has(nonce)) {
+        throw Object.assign(new Error("replacement fee too low"), { code: "REPLACEMENT_UNDERPRICED" });
+      }
+      pool.set(nonce, hash);
+      if (acceptFirstButTimeOut && pool.size === 1 && node.broadcasts.length === 1) {
+        throw Object.assign(new Error("request timeout"), { code: "TIMEOUT" });
+      }
+      return { hash, async wait() { throw timeoutError(); } };
+    },
+  };
+  return node;
+}
+
+test("final-verify repro: a hidden-mempool pullGas answered 'already known' is never declared dropped", async () => {
+  let clock = 0;
+  const state = {};
+  const node = hidingNode();
+  const tracker = createTxTracker({ state, provider: node, timeoutMs: 120_000, now: () => clock });
+  // 1. Accepted by the node, but the client-side broadcast times out.
+  await assert.rejects(tracker.send("7:0x1", "pullGas", { signer: fakeSigner({ nonce: 9 }), request }), /timeout/);
+  // 2-3. Every later check rebroadcasts; "already known" is proof it is pending.
+  for (clock = 30_000; clock <= 900_000; clock += 30_000) {
+    const pending = await tracker.pendingFor("7:0x1");
+    assert.ok(pending, `still pending at ${clock} ms`);
+    assert.equal(pending.unseenSince, undefined);
+  }
+  assert.equal(state.txNonceHints["7:0x1"], undefined, "never declared dropped");
+  const next = fakeSigner({ nonce: 10 });
+  await assert.rejects(tracker.send("7:0x1", "pullGas", { signer: next, request }), TxPendingError);
+  assert.equal(next.populated.length, 0);
+  assert.deepEqual([...node.pool.keys()], [9], "only one pullGas in the mempool");
+});
+
+test("final-verify repro: a resend refused as underpriced restores the original; nothing is ever signed at nonce+1", async () => {
+  let clock = 0;
+  const state = {};
+  const node = hidingNode();
+  // This node answers rebroadcasts with an opaque error (not "already known"),
+  // so the tracker cannot see the original and declares it dropped.
+  const realBroadcast = node.broadcastTransaction;
+  let opaqueRebroadcasts = true;
+  node.broadcastTransaction = async (raw) => {
+    const first = state.pendingTxs?.["7:0x1"];
+    if (opaqueRebroadcasts && first && keccak256(raw) === first.hash && node.broadcasts.length) {
+      node.broadcasts.push({ hash: first.hash, nonce: first.nonce });
+      throw Object.assign(new Error("503 upstream"), { code: "SERVER_ERROR" });
+    }
+    return realBroadcast(raw);
+  };
+  const tracker = createTxTracker({ state, provider: node, timeoutMs: 120_000, now: () => clock });
+  await assert.rejects(tracker.send("7:0x1", "pullGas", { signer: fakeSigner({ nonce: 9 }), request }), /timeout/);
+  const original = state.pendingTxs["7:0x1"].hash;
+  clock = 30_000;
+  assert.ok(await tracker.pendingFor("7:0x1"));
+  clock = 300_000; // > dropAfterMs (240 s) unseen
+  assert.equal(await tracker.pendingFor("7:0x1"), null, "declared dropped");
+  opaqueRebroadcasts = false;
+
+  // 4-5. The resend (new amount, new hash) is pinned to nonce 9 and refused as
+  // underpriced: the original is restored, the hint is kept.
+  const resend = fakeSigner({ nonce: 10 });
+  await assert.rejects(tracker.send("7:0x1", "pullGas", { signer: resend, request }), TxPendingError);
+  assert.equal(resend.populated[0].nonce, 9);
+  assert.equal(state.pendingTxs["7:0x1"].hash, original, "original record restored");
+  assert.equal(state.txNonceHints["7:0x1"].nonce, 9, "hint kept");
+
+  // 6. Next ticks: the restored original rebroadcasts as "already known" and
+  // keeps the job paused; no tx at nonce 10 is ever signed.
+  for (clock = 330_000; clock <= 1_200_000; clock += 30_000) {
+    assert.ok(await tracker.pendingFor("7:0x1"));
+    await assert.rejects(tracker.send("7:0x1", "pullGas", { signer: resend, request }), TxPendingError);
+  }
+  assert.equal(resend.populated.length, 1, "only the refused nonce-9 resend was ever signed");
+  assert.deepEqual([...node.pool.keys()], [9], "a single pullGas can mine");
+
+  // The original finally mines: the job is free and the hint is gone.
+  node.pool.clear();
+  node.latestNonce = 10;
+  assert.equal(await tracker.pendingFor("7:0x1"), null);
+  await tracker.send("7:0x1", "pullGas", { signer: resend, request }).catch(() => {});
+  assert.equal(resend.populated.at(-1).nonce, 10);
+  assert.equal(state.txNonceHints["7:0x1"], undefined);
+});
+
+test("a dormant record (unchecked for longer than dormantAfterMs, e.g. across a rollback) is never rebroadcast", async () => {
+  let clock = 3 * 60 * 60_000;
+  const provider = fakeProvider({ latestNonce: 9 });
+  provider.getTransaction = async () => null;
+  const raw = `0x${"34".repeat(40)}`;
+  const state = {
+    pendingTxs: { "7:0x1": { hash: keccak256(raw), nonce: 9, from: FROM, label: "move:12", sentAt: 0, raw } },
+  };
+  const alerts = [];
+  const tracker = createTxTracker({
+    state,
+    provider,
+    timeoutMs: 1_000,
+    dropAfterMs: 5_000,
+    now: () => clock,
+    alert: (code, details) => alerts.push({ code, details }),
+  });
+  assert.ok(await tracker.pendingFor("7:0x1"), "still unresolved: wait, but do not replay stale bytes");
+  assert.deepEqual(provider.broadcasts, []);
+  assert.equal(alerts.at(-1).details.state, "unseen-dormant");
+  clock += 1_000;
+  assert.ok(await tracker.pendingFor("7:0x1"));
+  assert.deepEqual(provider.broadcasts, [], "stays no-rebroadcast once dormant");
+  clock += 5_000;
+  assert.equal(await tracker.pendingFor("7:0x1"), null, "dropped after dropAfterMs");
+  assert.equal(state.txNonceHints["7:0x1"].nonce, 9, "its nonce is pinned for the re-derived send");
+
+  // A record checked recently is not dormant: it is rebroadcast as before.
+  const fresh = { pendingTxs: { a: { hash: keccak256(raw), nonce: 9, from: FROM, label: "x", sentAt: clock - 10_000, raw } } };
+  const freshTracker = createTxTracker({ state: fresh, provider, timeoutMs: 1_000, dropAfterMs: 5_000, now: () => clock });
+  await freshTracker.pendingFor("a");
+  assert.equal(provider.broadcasts.length, 1);
+  assert.throws(() => createTxTracker({ state: {}, provider, timeoutMs: 1_000, dropAfterMs: 5_000, dormantAfterMs: 5_000 }), /dormant/);
+});
+
+test("isNonceHeldByMempool recognises already-known and underpriced refusals only", () => {
+  assert.equal(isNonceHeldByMempool(Object.assign(new Error("x"), { code: "REPLACEMENT_UNDERPRICED" })), true);
+  assert.equal(isNonceHeldByMempool({ message: "could not coalesce", info: { error: { message: "already known" } } }), true);
+  assert.equal(isNonceHeldByMempool(new Error("known transaction: 0xabc")), true);
+  assert.equal(isNonceHeldByMempool(new Error("nonce too low")), false);
+  assert.equal(isNonceHeldByMempool(Object.assign(new Error("socket hang up"), { code: "NETWORK_ERROR" })), false);
 });
 
 test("a nonce hint from another address, or an already-consumed one, is ignored", async () => {

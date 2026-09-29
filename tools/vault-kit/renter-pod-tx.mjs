@@ -26,6 +26,22 @@ import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
  *     remembered (state.txNonceHints) and the next send for that job from the
  *     same address reuses it explicitly, so a late original and the retry can
  *     never both be mined.
+ *
+ * A node may hide mempool txs from eth_getTransactionByHash. Its refusals are
+ * then the only evidence that the tx still exists, so:
+ *   - a rebroadcast refused as "already known" (or as an underpriced
+ *     replacement, i.e. another tx holds the nonce) counts as SEEN: the tx is
+ *     still pending and is never declared dropped on that basis;
+ *   - a resend on a hinted nonce refused the same way restores the original
+ *     record (kept on the hint) instead of forgetting the nonce, and the hint
+ *     itself is kept until the account's "latest" nonce has passed it. A
+ *     second tx at nonce+1 can therefore never be signed while the original
+ *     may still mine.
+ * A record that lay DORMANT (not checked by this code for dormantAfterMs, e.g.
+ * across a rollback to the pre-hardening worker and back) is never
+ * rebroadcast: its bytes were derived from chain state that may be long gone.
+ * It is still resolved by receipt / nonce, and dropped after dropAfterMs with
+ * its nonce pinned for the next send.
  */
 export class TxPendingError extends Error {
   constructor(key, pending) {
@@ -69,11 +85,37 @@ export function isDefiniteBroadcastRejection(error) {
     .test(message);
 }
 
+function errorTexts(error) {
+  return [
+    error?.shortMessage,
+    error?.message,
+    error?.error?.message,
+    error?.info?.error?.message,
+  ].filter(Boolean).join(" | ");
+}
+
+/**
+ * The node refused a broadcast because a tx with this nonce from this sender
+ * is ALREADY in its mempool: either these exact bytes ("already known",
+ * "known transaction") or another tx it will not replace ("replacement
+ * transaction underpriced"). Either way the nonce is occupied by a tx that can
+ * still be mined, so nothing of ours is free to go out at a later nonce.
+ */
+export function isNonceHeldByMempool(error) {
+  if (error?.code === "REPLACEMENT_UNDERPRICED") return true;
+  return /already known|known transaction|alreadyknown|already exists|already in (the )?(mempool|tx ?pool)|replacement transaction underpriced|replacement fee too low/i
+    .test(errorTexts(error));
+}
+
+/** Default for records that were not checked by this tracker for this long. */
+export const DEFAULT_DORMANT_AFTER_MS = 60 * 60_000;
+
 export function createTxTracker({
   state,
   provider,
   timeoutMs,
   dropAfterMs = 2 * timeoutMs,
+  dormantAfterMs = DEFAULT_DORMANT_AFTER_MS,
   feeOverrides = async () => ({}),
   alert = () => {},
   persist = () => {},
@@ -81,6 +123,9 @@ export function createTxTracker({
 }) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("tx wait timeout must be positive");
   if (!Number.isFinite(dropAfterMs) || dropAfterMs <= 0) throw new Error("tx drop age must be positive");
+  if (!Number.isFinite(dormantAfterMs) || dormantAfterMs <= dropAfterMs) {
+    throw new Error("tx dormant age must exceed the drop age");
+  }
   state.pendingTxs ??= {};
   state.txNonceHints ??= {};
 
@@ -115,6 +160,12 @@ export function createTxTracker({
       clear(key);
       return null;
     }
+    // Dormant: nothing checked this record for dormantAfterMs (the worker was
+    // stopped or rolled back meanwhile). Decided BEFORE checkedAt is renewed.
+    const lastLook = Number(pending.checkedAt ?? pending.sentAt ?? 0);
+    if (!pending.noRebroadcast && now() - lastLook > dormantAfterMs) pending.noRebroadcast = "dormant";
+    pending.checkedAt = now();
+
     const known = await provider.getTransaction(pending.hash);
     if (known) {
       if (pending.unseenSince != null) {
@@ -136,32 +187,56 @@ export function createTxTracker({
       return null;
     }
 
-    if (pending.raw) {
+    if (pending.raw && !pending.noRebroadcast) {
       try {
         await provider.broadcastTransaction(pending.raw);
         pending.rebroadcasts = (Number(pending.rebroadcasts) || 0) + 1;
         delete pending.lastRebroadcastError;
       } catch (error) {
         pending.lastRebroadcastError = text(error);
+        if (isNonceHeldByMempool(error)) {
+          // The node still holds this tx (or another at its nonce) even though
+          // it will not show it: the same evidence as a non-null getTransaction.
+          delete pending.unseenSince;
+          pending.heldByMempoolAt = now();
+          persist();
+          pendingAlert(key, pending, { state: "still-pending", via: "rebroadcast-refused-known" });
+          return pending;
+        }
       }
     }
     pending.unseenSince ??= now();
     persist();
     const unseenMs = now() - Number(pending.unseenSince);
     if (unseenMs < dropAfterMs) {
-      pendingAlert(key, pending, { state: "unseen-rebroadcast", unseenSec: Math.floor(unseenMs / 1000) });
+      pendingAlert(key, pending, {
+        state: pending.noRebroadcast ? "unseen-dormant" : "unseen-rebroadcast",
+        unseenSec: Math.floor(unseenMs / 1000),
+      });
       return pending;
     }
 
     // Unseen for dropAfterMs with its nonce still free: dropped. The next send
-    // for this job from the same address reuses this nonce explicitly.
-    state.txNonceHints[key] = { from: pending.from, nonce: Number(pending.nonce), label: pending.label, at: now() };
+    // for this job from the same address reuses this nonce explicitly; the
+    // record is kept on the hint so a refused resend can restore it.
+    const { unseenSince: _unseen, ...prevRecord } = pending;
+    state.txNonceHints[key] = {
+      from: pending.from,
+      nonce: Number(pending.nonce),
+      label: pending.label,
+      at: now(),
+      prevRecord,
+    };
     delete state.pendingTxs[key];
     persist();
     return null;
   }
 
-  /** Explicit nonce for a resend after a declared drop (see pendingFor). */
+  /**
+   * Explicit nonce for a resend after a declared drop (see pendingFor). The
+   * hint lives until the account's "latest" nonce has passed it: only then is
+   * it certain that no tx of ours can still be mined at that nonce.
+   */
   async function hintedNonce(key, from) {
     const hint = state.txNonceHints[key];
     if (!hint) return undefined;
@@ -173,6 +248,24 @@ export function createTxTracker({
       return undefined;
     }
     return Number(hint.nonce);
+  }
+
+  /**
+   * A resend on a hinted nonce was refused because the nonce is still held in
+   * the mempool: the "dropped" original is alive. Put its record back (or,
+   * for a hint without one, the refused record, which stands for "nonce N is
+   * occupied") so the job stays paused until that nonce resolves.
+   */
+  function restoreHeldOriginal(key, hint, refused, error) {
+    const restored = { ...(hint.prevRecord ?? refused) };
+    delete restored.unseenSince;
+    restored.checkedAt = now();
+    restored.restoredAt = now();
+    restored.lastRebroadcastError = text(error);
+    state.pendingTxs[key] = restored;
+    persist();
+    pendingAlert(key, restored, { state: "resend-refused-original-pending", resendHash: refused.hash });
+    return new TxPendingError(key, restored);
   }
 
   /**
@@ -192,9 +285,13 @@ export function createTxTracker({
     // configured fee policy.
     const txRequest = { ...(await feeOverrides()), ...unsigned };
     const from = signer.address;
+    let hint = null;
     if (txRequest.nonce == null) {
       const nonce = await hintedNonce(key, from);
-      if (nonce !== undefined) txRequest.nonce = nonce;
+      if (nonce !== undefined) {
+        txRequest.nonce = nonce;
+        hint = state.txNonceHints[key];
+      }
     }
     const populated = await signer.populateTransaction(txRequest);
     const raw = await signer.signTransaction(populated);
@@ -207,7 +304,8 @@ export function createTxTracker({
       raw,
     };
     state.pendingTxs[key] = record;
-    if (state.txNonceHints[key]) delete state.txNonceHints[key];
+    // The nonce hint (if any) stays: hintedNonce drops it once the chain's
+    // "latest" nonce has passed it, never merely because we sent again.
     // Durable BEFORE broadcasting: whatever happens next, this tx is known.
     persist();
 
@@ -215,6 +313,9 @@ export function createTxTracker({
     try {
       response = await provider.broadcastTransaction(raw);
     } catch (error) {
+      if (hint && Number(hint.nonce) === record.nonce && isNonceHeldByMempool(error)) {
+        throw restoreHeldOriginal(key, hint, record, error);
+      }
       if (isDefiniteBroadcastRejection(error)) clear(key);
       // Otherwise (timeout, socket error) the node may have accepted it: keep
       // the record; the next tick resolves it via receipt / mempool / nonce.
