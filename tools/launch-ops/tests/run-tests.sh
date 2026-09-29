@@ -650,6 +650,12 @@ rc=0; guards > "$T/g5.out" 2>&1 || rc=$?
 expect_rc "$rc" 8 "an invalid allowlist entry refuses (the worker would not start)"
 expect_grep "$T/g5.out" "RENTER_ALLOWLIST entry 2 is not a 0x+40-hex address" "invalid entry named by position"
 expect_nogrep "$T/g5.out" "notanaddress" "invalid entry value not printed"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"export RENTER_ALLOWLIST="
+rc=0; guards > "$T/g5b.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "a later empty RENTER_ALLOWLIST line wins (worker loader is last-line-wins) -> refuse"
+reset_market "" "" "RENTER_ALLOWLIST="$'\n'"RENTER_ALLOWLIST=$ALLOW1"
+rc=0; guards > "$T/g5c.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "a later valid RENTER_ALLOWLIST line wins over an earlier empty one"
 reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=two"
 rc=0; guards > "$T/g6.out" 2>&1 || rc=$?
 expect_rc "$rc" 8 "a malformed numeric knob refuses before the restart"

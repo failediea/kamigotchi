@@ -249,14 +249,17 @@ if (!fs.existsSync(process.env.ENV_FILE)) problems.push("no .env in the market d
 else {
   const unquote = (v) => {
     const t = v.trim();
-    return t.length >= 2 && (t[0] === "\"" || t[0] === "\x27") && t[t.length - 1] === t[0] ? t.slice(1, -1).trim() : t;
+    return t.length >= 2 && (t[0] === "\"" || t[0] === "\x27") && t[t.length - 1] === t[0] ? t.slice(1, -1) : t;
   };
+  // Mirror renter-pod-config.mjs parseEnvText + loadEnvFile exactly: optional
+  // "export ", any-case keys, LAST line wins (a later empty line overrides an
+  // earlier value), and an empty final value means the key is not loaded.
+  const raw = {};
   for (const line of fs.readFileSync(process.env.ENV_FILE, "utf8").split(/\r?\n/)) {
-    const m = line.match(/^([A-Z_]+)=(.+)$/);
-    if (!m || env[m[1]] !== undefined) continue;
-    const v = unquote(m[2]);
-    if (v) env[m[1]] = v;
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+    if (m) raw[m[1]] = unquote(m[2]);
   }
+  for (const [k, v] of Object.entries(raw)) if (v) env[k] = v;
 }
 let renters = 0;
 const list = String(env.RENTER_ALLOWLIST ?? "").trim().replace(/^["\x27]|["\x27]$/g, "");
