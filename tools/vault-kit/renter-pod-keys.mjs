@@ -22,7 +22,11 @@ export function initializeOperatorKeyState(state) {
   return state;
 }
 
-export function reserveRandomOperator(state, nonce, { now = Date.now(), walletFactory = Wallet.createRandom } = {}) {
+export function reserveRandomOperator(
+  state,
+  nonce,
+  { now = Date.now(), walletFactory = Wallet.createRandom, renter } = {}
+) {
   initializeOperatorKeyState(state);
   const key = requireNonce(nonce);
   const existing = state.reservations[key];
@@ -39,11 +43,20 @@ export function reserveRandomOperator(state, nonce, { now = Date.now(), walletFa
     operator: wallet.address,
     operatorKey: wallet.privateKey,
     createdAt: now,
+    // Optional: recorded so per-renter caps and the attestation renter check
+    // can be enforced. Legacy reservations simply lack it.
+    ...(renter ? { renter: String(renter).toLowerCase() } : {}),
   };
   return { operator: wallet.address, createdAt: now };
 }
 
-export function claimOperatorReservation(state, nonce, expectedOperator) {
+/**
+ * Resolve the operator key for an on-chain pod. With `remove: false` the
+ * reservation is left in place so the caller can delete it only after the job
+ * holding the key has been durably saved (crash between the two writes then
+ * leaves the key in both files, never in neither).
+ */
+export function claimOperatorReservation(state, nonce, expectedOperator, { remove = true } = {}) {
   initializeOperatorKeyState(state);
   const key = requireNonce(nonce);
   const reservation = state.reservations[key];
@@ -52,7 +65,7 @@ export function claimOperatorReservation(state, nonce, expectedOperator) {
   if (wallet.address.toLowerCase() !== String(expectedOperator).toLowerCase()) {
     throw new Error("RoomPod operator reservation does not match the on-chain event");
   }
-  delete state.reservations[key];
+  if (remove) delete state.reservations[key];
   return wallet.privateKey;
 }
 
