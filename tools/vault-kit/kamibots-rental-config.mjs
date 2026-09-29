@@ -6,6 +6,25 @@ const RISK = {
 
 const FOOD_IDS = new Set([11301, 11302, 11303, 11304, 11311, 11312, 11313, 11314]);
 
+/**
+ * Kamibots' own accepted ranges for the renter-tunable fields (seconds, or
+ * percent for HP values). normalizeKamibotsPrefs clamps every renter value
+ * into these; the web quote API and UI mirror them (see renter-pod-lease-policy.mjs).
+ */
+export const KAMIBOTS_PREF_LIMITS = Object.freeze({
+  farmIntervalSec: Object.freeze({ min: 20 * 60, max: 1200 * 60, default: 30 * 60 }),
+  restIntervalSec: Object.freeze({ min: 15 * 60, max: 500 * 60, default: 30 * 60 }),
+  collectIntervalSec: Object.freeze({ min: 0, max: 1200 * 60, default: 0 }),
+  scavengeIntervalSec: Object.freeze({ min: 0, max: 1200 * 60, default: 0 }),
+  feedIntervalSec: Object.freeze({ min: 30 * 60, max: 1200 * 60, default: 60 * 60 }),
+  feedPercent: Object.freeze({ min: 1, max: 99, default: 50 }),
+  failsafeRestDurationSec: Object.freeze({ min: 60, max: 1200 * 60, default: 10 * 60 }),
+  hpThresholdLow: Object.freeze({ min: 5, max: 90 }),
+  hpThresholdHigh: Object.freeze({ max: 100, minAboveLow: 5 }),
+  safetyMargin: Object.freeze({ min: 0, max: 10 }),
+});
+const L = KAMIBOTS_PREF_LIMITS;
+
 const clampInt = (value, min, max, fallback) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -41,13 +60,14 @@ export function normalizeKamibotsPrefs(input, options) {
   const useHpBasedRest = raw.useHpBasedRest === undefined
     ? preset.useHpBasedRest
     : raw.useHpBasedRest === true || raw.useHpBasedRest === 1;
-  const hpThresholdLow = clampInt(raw.hpThresholdLow, 5, 90, preset.hpThresholdLow);
+  const hpThresholdLow = clampInt(raw.hpThresholdLow, L.hpThresholdLow.min, L.hpThresholdLow.max, preset.hpThresholdLow);
   const hpThresholdHigh = clampInt(
     raw.hpThresholdHigh,
-    hpThresholdLow + 5,
-    100,
-    Math.max(hpThresholdLow + 5, preset.hpThresholdHigh)
+    hpThresholdLow + L.hpThresholdHigh.minAboveLow,
+    L.hpThresholdHigh.max,
+    Math.max(hpThresholdLow + L.hpThresholdHigh.minAboveLow, preset.hpThresholdHigh)
   );
+  const limit = (value, range) => clampInt(value, range.min, range.max, range.default);
 
   return {
     risk,
@@ -57,28 +77,28 @@ export function normalizeKamibotsPrefs(input, options) {
     useHpBasedRest,
     hpThresholdLow,
     hpThresholdHigh,
-    farmInterval: clampInt(raw.farmInterval, 20 * 60, 1200 * 60, 30 * 60),
-    restInterval: clampInt(raw.restInterval, 15 * 60, 500 * 60, 30 * 60),
-    collectInterval: clampInt(raw.collectInterval, 0, 1200 * 60, 0),
-    scavengeInterval: clampInt(raw.scavengeInterval, 0, 1200 * 60, 0),
+    farmInterval: limit(raw.farmInterval, L.farmIntervalSec),
+    restInterval: limit(raw.restInterval, L.restIntervalSec),
+    collectInterval: limit(raw.collectInterval, L.collectIntervalSec),
+    scavengeInterval: limit(raw.scavengeInterval, L.scavengeIntervalSec),
     enableFeedInterval: raw.enableFeedInterval === undefined
       ? true
       : raw.enableFeedInterval === true || raw.enableFeedInterval === 1,
-    feedInterval: clampInt(raw.feedInterval, 30 * 60, 1200 * 60, 60 * 60),
-    feedPercent: clampInt(raw.feedPercent, 1, 99, 50),
+    feedInterval: limit(raw.feedInterval, L.feedIntervalSec),
+    feedPercent: limit(raw.feedPercent, L.feedPercent),
     food,
     enableFailsafeRest: raw.enableFailsafeRest === undefined
       ? true
       : raw.enableFailsafeRest === true || raw.enableFailsafeRest === 1,
-    failsafeRestDuration: clampInt(raw.failsafeRestDuration, 60, 1200 * 60, 10 * 60),
+    failsafeRestDuration: limit(raw.failsafeRestDuration, L.failsafeRestDurationSec),
     autoCollect: raw.autoCollect === undefined
       ? true
       : raw.autoCollect === true || raw.autoCollect === 1,
     reviveOnDeath: legacyRez || raw.reviveOnDeath === true || raw.reviveOnDeath === 1,
     safetyMargin: clampInt(
       raw.safetyMargin,
-      0,
-      10,
+      L.safetyMargin.min,
+      L.safetyMargin.max,
       risk === "safe" ? 7 : risk === "aggressive" ? 2 : 5
     ),
   };
@@ -121,6 +141,11 @@ export function normalizeKamibotsPrefs(input, options) {
  *   The measured Kamibots cycle rests 147 min per 292 min farmed (50.3%);
  *   a 300-min farm with the 15-min minimum rest drained HP cycle over cycle.
  * - failsafe rest stays forced on: if food cannot be used it rests.
+ * - failsafeRestMinSec 60 min: that failsafe rest lasts at least this long
+ *   AND at least the (floored) rest timer. A fresh pod account holds no food,
+ *   so every "feed below 45% HP" fails; with the old 60 s minimum the Kami
+ *   rested one minute and farmed on, hovering at the 45% floor instead of
+ *   recovering.
  * startBodyFloorViolations() re-checks the exact body sent to Kamibots.
  */
 export const LEASE_PREFS_FLOOR = Object.freeze({
@@ -129,6 +154,7 @@ export const LEASE_PREFS_FLOOR = Object.freeze({
   safetyMarginMin: 5,
   feedPercentMin: 45,
   restPctOfFarmMin: 51,
+  failsafeRestMinSec: 60 * 60,
   forceHpBasedRest: true,
   forceFailsafeRest: true,
   forceHpFeed: true,
@@ -137,7 +163,7 @@ export const LEASE_PREFS_FLOOR = Object.freeze({
 });
 
 /** Kamibots' own rest timer ceiling (normalizeKamibotsPrefs clamps to it). */
-const REST_INTERVAL_MAX_SEC = 500 * 60;
+const REST_INTERVAL_MAX_SEC = L.restIntervalSec.max;
 
 /** Minimum rest timer for a farm timer under a floor (seconds). */
 export function minRestIntervalSec(farmIntervalSec, floor = LEASE_PREFS_FLOOR) {
@@ -145,16 +171,27 @@ export function minRestIntervalSec(farmIntervalSec, floor = LEASE_PREFS_FLOOR) {
   return Math.min(REST_INTERVAL_MAX_SEC, Math.ceil((Number(farmIntervalSec) * pct) / 100));
 }
 
+/**
+ * Minimum Harvest & Feed failsafe rest for a floored prefs object (seconds):
+ * max(floor.failsafeRestMinSec, restInterval), within Kamibots' own range.
+ */
+export function minFailsafeRestSec(restIntervalSec, floor = LEASE_PREFS_FLOOR) {
+  const floorMin = Number(floor.failsafeRestMinSec) || 0;
+  const rest = Number(restIntervalSec) || 0;
+  return Math.min(L.failsafeRestDurationSec.max, Math.max(floorMin, rest));
+}
+
 /** Stable identity of a floor. A strategy started under a different floor is
  * restarted without waiting for the restart debounce. */
 export function leasePrefsFloorSignature(floor = LEASE_PREFS_FLOOR) {
   return [
-    "floor2",
+    "floor3",
     floor.hpThresholdLowMin,
     floor.farmIntervalMaxSec,
     floor.safetyMarginMin,
     floor.feedPercentMin,
     floor.restPctOfFarmMin,
+    floor.failsafeRestMinSec ?? 0,
     floor.forceHpBasedRest ? 1 : 0,
     floor.forceFailsafeRest ? 1 : 0,
     floor.forceHpFeed ? 1 : 0,
@@ -209,6 +246,11 @@ export function applyLeasePrefsFloor(prefs, floor = LEASE_PREFS_FLOOR) {
     const minRest = minRestIntervalSec(next.farmInterval, floor);
     if (Number(next.restInterval) < minRest) set("restInterval", minRest);
   }
+  // Only Harvest & Feed sends failsafeRestDuration to Kamibots.
+  if (next.strategy === "harvestAndFeed" && next.enableFailsafeRest && floor.failsafeRestMinSec) {
+    const minFailsafe = minFailsafeRestSec(next.restInterval, floor);
+    if (Number(next.failsafeRestDuration) < minFailsafe) set("failsafeRestDuration", minFailsafe);
+  }
   return { prefs: next, clamped };
 }
 
@@ -250,6 +292,13 @@ export function startBodyFloorViolations(body, floor = LEASE_PREFS_FLOOR) {
       need(Number(config.feedPercent) >= floor.feedPercentMin, `feedPercent ${config.feedPercent} < ${floor.feedPercentMin}`);
     }
     if (floor.forceFailsafeRest) need(config.enableFailsafeRest === true, "harvestAndFeed without failsafe rest");
+    if (config.enableFailsafeRest === true && floor.failsafeRestMinSec) {
+      const minFailsafe = minFailsafeRestSec(config.restInterval, floor);
+      need(
+        Number(config.failsafeRestDuration) >= minFailsafe,
+        `failsafeRestDuration ${config.failsafeRestDuration} < ${minFailsafe}`
+      );
+    }
   }
   return violations;
 }

@@ -81,7 +81,8 @@ test("Harvest & Feed keeps failsafe rest, HP-based feeding floor and a capped fa
   });
   const body = buildKamibotsStartBody(pod, 8, prefs);
   assert.equal(body.config.enableFailsafeRest, true);
-  assert.equal(body.config.failsafeRestDuration, 10 * 60);
+  // Failsafe rest >= max(60 min, rest timer); the rest timer is floored to 51% of 300 min.
+  assert.equal(body.config.failsafeRestDuration, Math.ceil(300 * 60 * 0.51));
   assert.equal(body.config.feedPercent, 45);
   assert.equal(body.config.farmInterval, 300 * 60);
 });
