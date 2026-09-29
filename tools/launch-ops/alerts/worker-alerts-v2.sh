@@ -18,6 +18,8 @@
 #              FEE_FLOAT_MIN_CLAIMS; backingShortfall() > 0 on both v16 markets;
 #              per-job stage age (PREPARING too long, expired-but-not-ending,
 #              ending past the 2-day grace) and operator gas below the exit reserve
+#              (stages 3-5, and stage 0 while the listing is not re-leased: the
+#              custody return is operator-signed with allowPull=false)
 #   ingress    lease-musu / lease-vipp answer something other than 404
 #   tls        certificate expires in < TLS_MIN_DAYS days
 #   host       disk use > DISK_MAX_PCT, MemAvailable < MEM_MIN_MB
@@ -113,10 +115,23 @@ if [ "$MODE" = apply ]; then
   chmod 700 "$STATE" "$PERSIST_DIR" 2>/dev/null || true
 fi
 
+# Small state files are written atomically (tmp + mv) and read defensively: an
+# empty or corrupt file (e.g. a kill at TimeoutStartSec mid-write) reads as 0
+# instead of aborting the whole run under set -e.
+num_file() { # file -> digits only, 0 when missing/empty/garbage
+  local v
+  v=$(cat "$1" 2>/dev/null || true)
+  v=${v//[^0-9]/}
+  printf '%s' "${v:-0}"
+}
+write_atomic() { # file value
+  printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
+}
+
 # Persistent per-condition counters (e.g. "seen on N consecutive runs").
 # In dry-run the counters are read but never written.
-counter_get() { cat "$PERSIST_DIR/count-$1" 2>/dev/null || echo 0; }
-counter_set() { [ "$MODE" = apply ] && printf '%s\n' "$2" > "$PERSIST_DIR/count-$1"; return 0; }
+counter_get() { num_file "$PERSIST_DIR/count-$1"; }
+counter_set() { [ "$MODE" = apply ] && write_atomic "$PERSIST_DIR/count-$1" "$2"; return 0; }
 SEEN_COUNTERS=""
 COUNT=0
 counter_hit() { # key -> sets COUNT to the new consecutive count (no subshell: SEEN_COUNTERS must persist)
@@ -147,7 +162,7 @@ notify() { # key title body [priority]
   local key="$1" title="$2" body="$3" prio="${4:-default}" last
   key=$(printf '%s' "$key" | tr -c 'A-Za-z0-9_.-' '_')
   FIRED=$((FIRED + 1))
-  last=$(cat "$STATE/$key" 2>/dev/null || echo 0)
+  last=$(num_file "$STATE/$key")
   if [ $((NOW - last)) -lt "$COOLDOWN_SECS" ]; then
     log "ALERT (cooldown, not re-sent) [$key] $title: $body"
     return 0
@@ -156,7 +171,7 @@ notify() { # key title body [priority]
     log "[dry-run] WOULD ALERT [$key] $title: $body"
     return 0
   fi
-  echo "$NOW" > "$STATE/$key"
+  write_atomic "$STATE/$key" "$NOW"
   log "ALERT SENT [$key] $title: $body"
   send_ntfy "$title" "$body" "$prio"
 }
@@ -200,8 +215,8 @@ fi
 log "worker-alerts-v2 mode=$MODE markets=[$V16_MARKETS] rpc=$RPC"
 
 # ---- self gap -----------------------------------------------------------------
-last_ok=$(cat "$PERSIST_DIR/alerts-last-ok" 2>/dev/null || echo "")
-if [ -n "$last_ok" ] && [ $((NOW - last_ok)) -gt "$SELF_GAP_SEC" ]; then
+last_ok=$(num_file "$PERSIST_DIR/alerts-last-ok")
+if [ "$last_ok" != 0 ] && [ $((NOW - last_ok)) -gt "$SELF_GAP_SEC" ]; then
   notify "self-gap" "alerts were not running" \
     "[LEASE-ALERT] ALERTS_GAP last successful alert run was $((NOW - last_ok))s ago (> ${SELF_GAP_SEC}s). Monitoring was blind in between."
 fi
@@ -284,11 +299,34 @@ done
 hb_field() { # file key -> first scalar value for "key"
   tr -d '\n' < "$1" | sed -nE "s/.*\"$2\"[[:space:]]*:[[:space:]]*([-0-9.]+|true|false|null).*/\\1/p"
 }
+# Worker-state reads use jq, else node (the box has node for the workers).
+NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
+[ -x "$NODE_BIN" ] || NODE_BIN=$(command -v node 2>/dev/null || true)
 HAVE_JQ=1
-if ! command -v jq >/dev/null 2>&1; then
+if ! command -v jq >/dev/null 2>&1 && [ -z "$NODE_BIN" ]; then
   HAVE_JQ=0
-  notify "no-jq" "alerts degraded: jq missing" "[LEASE-ALERT] ALERTS_DEGRADED jq is not installed on $(hostname); worker state (job errors, stage age, operator gas) is not being checked"
+  notify "no-jq" "alerts degraded: jq missing" "[LEASE-ALERT] ALERTS_DEGRADED neither jq nor node is available on $(hostname); worker state (job errors, stage age, operator gas) is not being checked"
 fi
+state_jobs() { # state_file errors|all -> TSV per non-returned job (errors: token, error; all: token, operator, pod)
+  if command -v jq >/dev/null 2>&1; then
+    if [ "$2" = errors ]; then
+      jq -r '.jobs // {} | to_entries[] | .value | select((.returned // false) != true and (.error // "") != "") | [(.tokenIndex|tostring), (.error|tostring|gsub("[\t\n]";" "))] | @tsv' "$1"
+    else
+      jq -r '.jobs // {} | to_entries[] | .value | select((.returned // false) != true) | [(.tokenIndex|tostring), (.operator // ""), (.pod // "")] | @tsv' "$1"
+    fi
+    return
+  fi
+  "$NODE_BIN" -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    for (const j of Object.values(s.jobs || {})) {
+      if (!j || j.returned === true) continue;
+      if (process.argv[2] === "errors") {
+        if (j.error == null || j.error === "") continue;
+        console.log(String(j.tokenIndex) + "\t" + String(j.error).replace(/[\t\n]/g, " "));
+      } else {
+        console.log([String(j.tokenIndex), j.operator || "", j.pod || ""].join("\t"));
+      }
+    }' "$1" "$2"
+}
 
 # ---- heartbeat / state per v16 worker ---------------------------------------------------------
 state_file_for() { # market dir -> absolute state file path (reads only WORKER_STATE_FILE from .env)
@@ -357,7 +395,7 @@ for m in $V16_MARKETS; do
       notify "joberr-$m-$tok" "lease #$tok erroring ($m)" \
         "[LEASE-ALERT] STAGE_STUCK market=$m token=$tok error on $c consecutive checks: $(cut -c1-180 <<<"$err")" high
     fi
-  done < <(jq -r '.jobs // {} | to_entries[] | .value | select((.returned // false) != true and (.error // "") != "") | [(.tokenIndex|tostring), (.error|tostring|gsub("[\t\n]";" "))] | @tsv' "$sf" 2>/dev/null || true)
+  done < <(state_jobs "$sf" errors 2>/dev/null || true)
 
   # chain-side stage age + operator gas for every non-returned job
   maddr=$(market_addr "$m")
@@ -393,12 +431,19 @@ for m in $V16_MARKETS; do
           "[LEASE-ALERT] STAGE_STUCK market=$m token=$tok ending for more than the 2-day ENDING_GRACE; permissionless recovery is now open" high
       fi
     fi
-    if [ -n "$EXIT_RESERVE_WEI" ] && { [ "$stage" = 3 ] || [ "$stage" = 4 ] || [ "$stage" = 5 ]; }; then
+    gas_check=0
+    case "$stage" in
+      3|4|5) gas_check=1 ;;
+      # stage 0: request cleared, custody return still owed by a non-returned job;
+      # only when the token is listed here and not re-leased (else a stale job)
+      0) [ "$(word "$lst" 0)" != "$(printf '%064d' 0)" ] && [ "$(word "$lst" 8)" = "$(printf '%064d' 0)" ] && gas_check=1 ;;
+    esac
+    if [ -n "$EXIT_RESERVE_WEI" ] && [ "$gas_check" = 1 ]; then
       bal=$(rpc_result eth_getBalance "[\"$op\",\"latest\"]" || true)
       if [ -n "$bal" ]; then
         balw=$(hex2dec "$bal")
         pullable=$escrow
-        [ "$stage" = 3 ] || pullable=0 # v16 pullGas is PREPARING/ACTIVE only
+        [ "$stage" = 3 ] || pullable=0 # v16 pullGas is PREPARING/ACTIVE only (stage 0: allowPull=false)
         if [ $((balw + pullable)) -lt "$EXIT_RESERVE_WEI" ]; then
           notify "opgas-$m-$tok" "lease #$tok operator gas low ($m)" \
             "[LEASE-ALERT] ESCROW_LOW market=$m token=$tok stage=$stage operator=$op balance=${balw} escrow=${escrow} exitReserve=${EXIT_RESERVE_WEI} wei (gas sponsor?)" high
@@ -407,7 +452,7 @@ for m in $V16_MARKETS; do
         CHECK_ERRORS=$((CHECK_ERRORS + 1))
       fi
     fi
-  done < <(jq -r '.jobs // {} | to_entries[] | .value | select((.returned // false) != true) | [(.tokenIndex|tostring), (.operator // ""), (.pod // "")] | @tsv' "$sf" 2>/dev/null || true)
+  done < <(state_jobs "$sf" all 2>/dev/null || true)
 done
 counter_reset_unseen "tickfail-"
 counter_reset_unseen "joberr-"
@@ -492,7 +537,7 @@ if [ "$mem_mb" -lt "$MEM_MIN_MB" ]; then
 fi
 
 if [ "$MODE" = apply ]; then
-  printf '%s\n' "$NOW" > "$PERSIST_DIR/alerts-last-ok"
+  write_atomic "$PERSIST_DIR/alerts-last-ok" "$NOW"
 fi
 log "done: $FIRED condition(s) firing, $CHECK_ERRORS chain read error(s), mode=$MODE"
 exit 0

@@ -24,15 +24,18 @@ Nothing in this directory has been applied to the VPS. Every script:
 | `keeper/lease-expiry-keeper.sh` + unit/timer | VPS (timer) | permissionless `endLease` after `leaseEnd` | H7 / CON-01 |
 | `keeper/lease-gas-sponsor.sh` + unit/timer | VPS (timer) | tops up ACTIVE lease operator EOAs below the exit reserve | H7 / CON-01 / H2 / MP-5 |
 | `lease-transition-gate.sh` | VPS (read-only) | is any v16 lease mid-transition? | deploy safety |
+| `cleanup-secret-backups.sh` | VPS, **OWNER** | shreds unused `.env.bak*` secret copies, removes world-write bits, prunes old deploy backups | VPS-12 |
 | `deploy-worker-patch.sh` + `deploy/remote-install-worker-code.sh` | operator machine (WSL) + VPS | installs a worker sha into both v16 dirs, one market at a time, with auto-rollback | checklist step 5 |
 | `harden-ssh.sh` | VPS, **OWNER only** | key-only SSH, ufw, fail2ban | H6 / VPS-5 |
 | `launch-ops.env.example` | VPS | every knob, with its default | |
-| `tests/run-tests.sh` | anywhere | shimmed tests for alerts, gate, sponsor, keeper | |
+| `tests/run-tests.sh` + `tests/fake-rpc.mjs` | anywhere | shimmed tests for every script here (fake chain on 127.0.0.1) | |
 
 ## Step 0: put the tools on the VPS (OWNER approves)
 
 `/root/kamigotchi` on the VPS is **not** a git checkout. Ship the committed tree from WSL
-(never from a Windows `git archive`, which loses the executable bits and adds CRLF):
+(never from a Windows checkout, which adds CRLF). Every script is committed as `100755`, so
+`git archive` ships it executable; `install-launch-ops.sh` enforces the mode anyway, and the
+ops units run their script as `/bin/bash <script>`, so a lost exec bit cannot stop them:
 
 ```bash
 # from WSL, in the worktree or any clone that has this branch
@@ -89,30 +92,45 @@ cd /home/matrix/wt-launch-ops/tools/launch-ops
 ```
 
 With `--apply`, the script:
-- **Stages and tests.** It runs `node --test *.test.mjs` on the box in `/root/launch-ops-staging/worker-<ts>`. If
-  the tests fail, nothing live changes.
+- **Stages and tests.** It uploads `code/` (the files that get installed) and `full/` (the whole
+  `tools/vault-kit` tree of the ref, so tests that read `test-fixtures/` work) to
+  `/root/launch-ops-staging/worker-<ts>`, checks the two agree byte for byte, and runs
+  `node --test *.test.mjs` in `full/`. If the tests fail, nothing live changes.
+- **Skips markets that already run the ref.** A market whose file plan has no NEW/CHANGED runtime
+  file (test files and `*.env.example` alone do not count) is not restarted, so a re-run is a no-op.
 - **Deploys one market at a time.** The order is **musu first** (0 jobs), then vipp. For each market it:
   - re-runs the gate;
-  - backs up the whole directory;
+  - backs up the **code files** plus `state-snapshot/` (state file + reservation store, mode 600;
+    they hold operator keys). `.env` is not copied: a deploy never changes it;
   - copies **code files only** (`renter-pod-*.mjs`, `kamibots-rental-config*.mjs`, `*.env.example`);
-  - restarts the unit;
-  - verifies for 120 s.
+  - creates `HALT` (only if absent; `VERIFY_HALT=0` disables): the patched worker answers 503 to
+    new quotes, so no quote is signed while the install can still roll back;
+  - restarts the unit and verifies for 120 s, then removes the `HALT` it created.
 - **Verify criteria.** The unit must be active and port 8791/8792 bound. `heartbeat.json` must have
   `ts >= restart` and be at most 120 s old. There must be no `[LEASE-ALERT]` line and no automatic restart.
-- **Auto-rollback.** On a verify failure, that market's code is restored and restarted, and the next market is not touched.
-- **Files it never touches:** `.env*`, the worker state, `*.reservations.json`, `heartbeat.json`, `HALT`, `node_modules`.
+- **Auto-rollback** (exit 4). On a verify failure: stop the unit; wait up to
+  `ROLLBACK_PENDING_WAIT_SEC` (300) until every `state.pendingTxs` entry is mined or dropped
+  (the old worker has no tx tracker and would re-send it); merge the reservation store back into
+  the state file's `reservations` (the old worker reads only that) and rename the store to
+  `*.reservations.json.rolled-back-<ts>`; restore the code; start. If a tx is still in flight
+  (exit 5) or the merge conflicts (exit 6), the **patched** code is started again with `HALT`
+  kept and a human decides. The next market is never touched.
+- **Files it never touches:** `.env*`, `heartbeat.json`, `node_modules`. The state file is only
+  rewritten by a rollback's reservation merge (atomic, same mode), and `HALT` only when the deploy created it.
 - **Dependencies.** It refuses if `tools/vault-kit/package.json` dependencies differ from the VPS
   copy, because there is no `npm install` on the box.
 - `TERMINAL_GAS_RETURN_MODE` / `TERMINAL_GAS_PULL_MODE` live in `.env`, so they are unchanged
   (currently return=skip, pull unset = check-only).
 
-Rollback: `./deploy-worker-patch.sh --rollback <ts> [--markets "vipp"]`
-- It restores the code files from `/root/launch-ops-backups/worker-<ts>/` and restarts. A heartbeat
-  is not required, because older code does not write one.
-- **It refuses while live reservations sit in `renter-pod-worker-state.reservations.json`,**
-  because the pre-patch worker cannot read that file. Stop new quotes first with
-  `touch <market dir>/HALT` (the patched worker then answers 503), wait `RESERVATION_TTL_SEC`
-  (1200 s), then retry.
+Rollback: `./deploy-worker-patch.sh --rollback <ts> [--markets "vipp"] [--force]`
+- **It runs the transition gate first** for each market and refuses unless it prints SAFE.
+- **It refuses while the patched worker has a tx in flight** (`state.pendingTxs`), without stopping anything.
+- Otherwise it does what the auto-rollback does: stop, wait for pendingTxs, merge the reservation
+  store back into the state file, restore the code files from `/root/launch-ops-backups/worker-<ts>/`,
+  start. A heartbeat is not required, because older code does not write one.
+- `--force` skips the gate verdict and the pendingTxs wait (the merge still runs). Use it only when
+  you accept a possible duplicate tx.
+- To stop new quotes before a rollback: `touch <market dir>/HALT` (the patched worker answers 503).
 
 Note: the live `renter-pod-recovery.mjs` and `renter-pod-worker.env.example` differ from git only
 in line endings (the live copies are CRLF). The dry run labels them `eol-only`.
@@ -162,8 +180,16 @@ What `--component alerts` installs:
 - `/etc/kami-lease-ops/launch-ops.env` (mode 600). The `NTFY_TOPIC` value is migrated from the
   live `tools/alerts/worker-alerts.sh` and is not printed.
 
+**Checks after `--apply`** (any failure exits non-zero and prints the rollback command):
+- every installed script is executable. A file whose content is unchanged but whose mode is wrong
+  is chmod-ed (`CHMOD` in the plan) and recorded in the manifest, so SRC == DEST installs work;
+- each installed script's `--dry-run` exits 0;
+- **alerts:** `kami-worker-alerts.service` is started once through systemd and must end with
+  `Result=success`. This is exactly the timer's run, so it may push conditions that are firing now.
+  The keeper and sponsor services are never started by the installer (their `--apply` sends txs).
+
 The old script file stays in place. **Rollback:** `./install-launch-ops.sh --rollback /root/launch-ops-backups/ops-<ts>`.
-It restores the baseline unit, which runs the old script again.
+It restores the baseline unit, which runs the old script again (and restores any file mode it changed).
 
 Fire-test the alerts once (checklist step 10). This sends a real WORKER_STALL push without
 touching the production cooldown state:
@@ -194,12 +220,15 @@ worker rewrites every tick.
 - **Candidates:** leases with `renter != 0`, not ending, and `now > leaseEnd + EXPIRY_GRACE_SEC` (600 s).
   The grace lets the worker's own `endLease` go first.
 - **Sending:** each call is simulated with `eth_call` before it is sent. At most `EXPIRY_MAX_TX_PER_RUN`
-  (5) calls per run, each waited at most `TX_WAIT_TIMEOUT_MS`.
+  (5) calls per run, each waited at most `TX_WAIT_TIMEOUT_MS`. A broadcast that is not confirmed in
+  time stops the run; the next run resolves it first.
 
 **Gas sponsor** (every 15 min):
 - **Candidates:** only non-returned worker jobs that pass all of these:
-  - the on-chain pod matches the job;
-  - the stage is in `SPONSOR_STAGES` (default `3`, ACTIVE);
+  - the stage is in `SPONSOR_STAGES` (default `0 3 4 5`: ACTIVE, the terminal stages 4-5 where
+    v16 `pullGas` reverts, and stage 0 where the custody return is operator-signed with `allowPull=false`);
+  - stages 3-5: the on-chain request pod matches the job. Stage 0 (request cleared): the token is
+    listed on this market and the listing is not re-leased (`renter == 0`); otherwise the job is stale;
   - the operator is a plain EOA;
   - the operator's balance is below `EXIT_RESERVE_ACTIONS × OPERATOR_ACTION_GAS_FLOOR × gasPrice` (3 × 1.7M × 2.5 Mwei = 1.275e13 wei).
 - **Top-up amount:** up to `SPONSOR_TARGET_GAS_UNITS × gasPrice` (3e13 wei).
@@ -208,14 +237,31 @@ worker rewrites every tick.
   - `SPONSOR_MAX_PER_DAY_WEI` 3e14, over a rolling 24 h;
   - `SPONSOR_WALLET_FLOOR_WEI` 2e14, a hard floor;
   - `SPONSOR_MAX_TX_PER_RUN` 3.
-- **Ledger:** every transfer is recorded in `/var/lib/kami-lease-ops/sponsor-ledger.tsv`.
+- **Ledger:** `/var/lib/kami-lease-ops/sponsor-ledger.tsv`. The signer appends the row right after
+  broadcasting and **before** waiting, so a transfer that times out, or a run killed by systemd,
+  still counts toward both caps. Dropped transfers stay counted (conservative).
 
 **Both timers:**
-- They share one `flock`, so they never race on the sponsor nonce.
+- They share one `flock`, so they never race on the sponsor nonce. A run that finds the lock
+  taken logs the skip and exits 0 (no OnFailure push); the next timer run retries.
+- **In-flight guard.** Before sending, `--apply` resolves every ledger row that has no result yet
+  (receipt: mined/reverted; unknown to the node: dropped) and compares the sponsor's `pending` and
+  `latest` nonce. While any sponsor tx is still in flight it sends nothing and logs
+  `[LEASE-ALERT] TX_TIMEOUT source=sponsor|expiry-keeper inflight=N`.
 - Any condition that needs a human is logged as a `[LEASE-ALERT]` line, which alerts v2 picks up from their journals.
 
 **Rollback** (on-chain there is nothing to undo): run `systemctl disable --now kami-lease-expiry-keeper.timer kami-lease-gas-sponsor.timer`,
 or run `./install-launch-ops.sh --rollback <dir>`.
+
+**OWNER: clean up secret copies (VPS-12).** Read the dry run first; a shred cannot be undone.
+```bash
+./cleanup-secret-backups.sh                       # dry run: names, modes and sizes only
+./cleanup-secret-backups.sh --apply               # shred unreferenced .env.*bak* files, drop group/world write, *.bak* -> 600
+./cleanup-secret-backups.sh --prune-days 14 --apply   # also delete worker deploy backups/staging older than 14 days
+```
+The live `.env` is never touched, and a `.env` backup that a unit file references is kept.
+Today (read-only dry run) it would shred `.env.bak-stackA` in both v16 dirs and fix the mode of the
+777 `renter-pod-worker.mjs*` files.
 
 ### 7. OWNER: fund and set up
 - **Keeper** `0x0d0294C57B01ED7189b8A9ba354cf77b935abcDc`: top up to about 0.002 ETH. The alert fires below `KEEPER_MIN_WEI` (4e14).
@@ -255,7 +301,7 @@ is the same as before (`/run/kami-worker-alerts`); run counters and the last-run
 | Tick failures | `lastTickOk=false` on `TICK_FAIL_RUNS` (2) consecutive checks | WORKER_STALL |
 | Job error | a non-returned job keeps `error` set on `JOB_ERROR_RUNS` (2) consecutive checks | STAGE_STUCK |
 | Stage age | PREPARING for more than 6 h; ACTIVE more than 1 h past `leaseEnd` and not ending; ending past the 2-day grace (`recoveryReady`) | STAGE_STUCK |
-| Operator gas | a job's operator balance plus pullable escrow is below the exit reserve (stages 3-5) | ESCROW_LOW |
+| Operator gas | a job's operator balance plus pullable escrow is below the exit reserve (stages 3-5, and stage 0 while the token is listed and not re-leased; only stage 3 counts escrow as pullable) | ESCROW_LOW |
 | Keeper | balance below `KEEPER_MIN_WEI` | KEEPER_LOW |
 | VIPP float | `feeFloatClaimsLeft()` below `FEE_FLOAT_MIN_CLAIMS` | FEE_FLOAT_LOW |
 | Backing | `backingShortfall()` above 0 on either v16 market | BACKING_SHORTFALL |
@@ -264,10 +310,18 @@ is the same as before (`/run/kami-worker-alerts`); run counters and the last-run
 | TLS | the certificate expires in less than `TLS_MIN_DAYS` (14) | TLS_EXPIRY |
 | Host | `/` more than 85 % used; `MemAvailable` below 100 MB | HOST_DISK / HOST_MEMORY |
 | Self | the previous successful run is more than 30 min old | ALERTS_GAP |
-| jq missing | worker-state checks cannot run | ALERTS_DEGRADED |
+| jq and node missing | worker-state checks cannot run (node is the fallback when jq is absent) | ALERTS_DEGRADED |
 
-Every push body starts with `[LEASE-ALERT] <CODE>`. The codes beyond the shared worker contract
-are ops-side only. Anything that greps for the prefix sees them all.
+### Alert codes
+Every push body, and every ops-script line that needs a human, starts with `[LEASE-ALERT] <CODE>`
+followed by `key=value` details (`source=` names the ops script). Anything that greps for the prefix sees them all.
+- **Shared worker contract:** WORKER_STALL, INGEST_ERROR, DEAD_KAMI, ESCROW_LOW, EXIT_RESERVE_STOP,
+  RESERVATION_CAP, LEASE_CAP, STRATEGY_RESTART_STORM, TX_TIMEOUT, STAGE_STUCK. The ops scripts
+  reuse ESCROW_LOW (sponsor caps, low sponsor/operator balance), TX_TIMEOUT (keeper/sponsor
+  tx in flight or unconfirmed, blocked deploy rollback) and STAGE_STUCK (expired leases, stage age).
+- **Ops-only codes** (host and chain health, not emitted by the worker): UNIT_DOWN, UNIT_FAILED,
+  KEEPER_LOW, FEE_FLOAT_LOW, BACKING_SHORTFALL, RPC_UNREACHABLE, INGRESS_DOWN, TLS_EXPIRY,
+  HOST_DISK, HOST_MEMORY, ALERTS_GAP, ALERTS_DEGRADED.
 
 ## Tests
 
@@ -275,8 +329,15 @@ are ops-side only. Anything that greps for the prefix sees them all.
 bash tools/launch-ops/tests/run-tests.sh                                        # local; jq-dependent state tests SKIP without jq
 LAUNCH_OPS_TEST_REMOTE=root@68.183.190.126 bash tools/launch-ops/tests/run-tests.sh   # state tests over ssh, read-only
 ```
-- **What is shimmed:** `systemctl`, `journalctl` and ntfy.
-- **What is real:** chain reads use the public RPC, with read-only calls only.
+- **What is shimmed:** `systemctl`, `journalctl`, `ss`, `id` (root only for the installer, the
+  deploy VPS half and the cleanup) and ntfy.
+- **What is real:** chain reads use the public RPC (read-only calls) or `tests/fake-rpc.mjs` on
+  127.0.0.1 (a fake chain for stage-0, cap, in-flight and rollback cases). The keeper/sponsor
+  `--apply` tests use a placeholder key file and a fake `ethers` dir, and assert that
+  `eth_sendRawTransaction` / `eth_chainId` were never called: nothing is ever signed.
+- **The deploy staging test** builds the staging tree of `launch/worker-hardening` with
+  `deploy-worker-patch.sh --local-stage` and runs its vault-kit suite through the VPS half
+  (`--action test`), plus a control run on the old code-only layout, which must fail.
 - **The remote mode** pipes each script to `bash -s` and passes the fixture in the
   `LAUNCH_OPS_TEST_STATE_JSON` env var. It writes no file on the VPS and signs nothing.
   That variable is a test hook only; never set it in production.
@@ -286,8 +347,10 @@ LAUNCH_OPS_TEST_REMOTE=root@68.183.190.126 bash tools/launch-ops/tests/run-tests
   only compare them against thresholds, so a sponsor wallet above about 1.15 ETH still passes the floor check.
 - **The gas sponsor only sees jobs the worker has ingested.** An ACTIVE lease the worker has not
   ingested yet is covered by gate rule C2 and by the `STAGE_STUCK` alerts instead.
-- **Terminal-stage wedges are opt-in.** Set `SPONSOR_STAGES="3 4 5"` if you want the sponsor to
-  also fund stages 4-5 (terminal wedges, MP-5).
+- **Stage-0 sponsoring cannot see custody.** The sponsor cannot read where the kami sits (that
+  needs world reads), so a stage-0 job whose worker action is WAIT/COMPLETE may still be funded
+  once, bounded by the per-lease cap.
 - **No off-box probe.** An external uptime probe and DigitalOcean backups are OWNER actions (VPS-3, VPS-4).
-- **Backups hold secrets.** The worker backup dirs contain copies of `.env` and the state files.
-  They are mode 700 under `/root/launch-ops-backups`. Prune them once a deploy is stable (VPS-12).
+- **Backups hold secrets.** Worker deploy backups hold state snapshots (operator keys), mode 600
+  under a mode-700 `/root/launch-ops-backups`; `.env` is no longer copied. Prune them with
+  `cleanup-secret-backups.sh --prune-days N --apply` once a deploy is stable (VPS-12).
