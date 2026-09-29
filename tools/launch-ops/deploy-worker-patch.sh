@@ -17,11 +17,21 @@
 #      (renter-pod-*.mjs, kamibots-rental-config*.mjs, *.env.example)
 #   2. refuse if tools/vault-kit/package.json dependencies differ from the VPS copy
 #      (no npm install on the box) unless --allow-dep-change
+#   2b. launch guards per market .env (read-only, counts only): refuse unless
+#      RENTER_ALLOWLIST is non-empty and valid (soft launch fails CLOSED), or the
+#      deploy runs with ALLOW_OPEN_RENTALS=true (or --allow-open-rentals); numeric
+#      worker knobs must parse. The install appends MAX_ACTIVE_LEASES_PER_RENTER=2
+#      to .env when absent (the only .env write a deploy makes)
 #   3. mid-transition gate (lease-transition-gate.sh, read-only) for all markets
-#   4. upload to /root/launch-ops-staging/worker-<TS>/: code/ (what gets installed)
-#      and full/ (the whole tools/vault-kit tree of the ref, so tests that read
-#      test-fixtures/ work) and run the vault-kit tests in full/ (node --test
-#      *.test.mjs); nothing live changes if they fail
+#   4. test the staged tree: code/ (what gets installed) and full/ (the whole
+#      tools/vault-kit tree of the ref, so tests that read test-fixtures/ work).
+#      --tests box    on the VPS, niced (nice 19, ionice idle, --test-concurrency=1),
+#                     refused while MemAvailable < TEST_MIN_MEM_MB (300)
+#      --tests local  off-box, here, with the local vault-kit node_modules (ethers
+#                     version must equal the VPS one unless --allow-dep-change)
+#      --tests auto   (default) box when the VPS has TEST_MIN_MEM_MB available, else local
+#      Then upload code/ + full/ to /root/launch-ops-staging/worker-<TS>/. Nothing live
+#      changes if the tests fail
 #   5. per market, ONE AT A TIME (default order: musu, the market with 0 jobs, then vipp),
 #      skipping a market whose file plan has no NEW/CHANGED runtime file (*.test.mjs and
 #      *.env.example alone do not count; idempotent re-run):
@@ -37,8 +47,9 @@
 #      restores the code; see deploy/remote-install-worker-code.sh), exit non-zero
 #      (the next market is not touched)
 #
-# Dry-run does steps 1-3 plus a per-file diff against the live copies. It writes
-# nothing locally except a temp dir, and nothing on the VPS.
+# Dry-run does steps 1-3 (with the launch guards) plus a per-file diff against the
+# live copies, and says where the tests would run. It writes nothing locally except
+# a temp dir, and nothing on the VPS.
 # Rollback: --rollback <TS> first runs the transition gate per market (refuses unless
 # --force), then restores code files from the backup of that run (heartbeat not
 # required, since older code does not write one), with the same pendingTxs wait and
@@ -58,6 +69,9 @@ VERIFY_HALT="${VERIFY_HALT:-1}"
 ROLLBACK_PENDING_WAIT_SEC="${ROLLBACK_PENDING_WAIT_SEC:-300}"
 FORCE=0
 LOCAL_STAGE=""
+TEST_WHERE="${DEPLOY_TESTS:-auto}"
+TEST_MIN_MEM_MB="${TEST_MIN_MEM_MB:-300}"
+ALLOW_OPEN_RENTALS="${ALLOW_OPEN_RENTALS:-false}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?}"; shift ;;
@@ -67,14 +81,19 @@ while [ $# -gt 0 ]; do
     --host) HOST="${2:?}"; shift ;;
     --markets) MARKETS="${2:?}"; shift ;;
     --allow-dep-change) ALLOW_DEP_CHANGE=1 ;;
+    --allow-open-rentals) ALLOW_OPEN_RENTALS=true ;;
+    --tests) TEST_WHERE="${2:?}"; shift ;;
     --no-require-heartbeat) REQUIRE_HEARTBEAT=0 ;;
     --force) FORCE=1 ;;
     --local-stage) LOCAL_STAGE="${2:?}"; shift ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+case "$TEST_WHERE" in auto|box|local) ;; *) echo "--tests auto|box|local" >&2; exit 2 ;; esac
+[[ "$TEST_MIN_MEM_MB" =~ ^[0-9]+$ ]] || { echo "TEST_MIN_MEM_MB must be a number" >&2; exit 2; }
+case "$ALLOW_OPEN_RENTALS" in true|1) AOR=1 ;; *) AOR=0 ;; esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(git -C "$HERE" rev-parse --show-toplevel)}"
@@ -186,22 +205,59 @@ if [ -z "$TODO" ]; then
   exit 0
 fi
 
+# 2b. launch guards (read-only; counts only, never values)
+log "launch guards (read-only; ALLOW_OPEN_RENTALS=$([ "$AOR" = 1 ] && echo true || echo false)):"
+for m in $TODO; do
+  rc=0; remote "--action guards --market $m --allow-open-rentals $AOR" < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
+  [ "$rc" = 0 ] || die "launch guards refused $m (exit $rc): fix the market .env (see above) or, to open rentals on purpose, re-run with ALLOW_OPEN_RENTALS=true. Nothing was changed."
+done
+
 # 3. gate
 log "mid-transition gate (read-only):"
 rc=0; gate $TODO || rc=$?
 [ "$rc" = 0 ] || die "gate refused (exit $rc): a v16 lease is mid-transition or state is unreadable. Nothing was changed."
 
+# where the staged tests run (never unguarded next to the live workers)
+if [ "$TEST_WHERE" = auto ]; then
+  mem=$("${SSH[@]}" "awk '/^MemAvailable:/{print int(\$2/1024)}' /proc/meminfo" 2>/dev/null || echo 0)
+  [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
+  if [ "$mem" -ge "$TEST_MIN_MEM_MB" ]; then TEST_WHERE=box; else TEST_WHERE=local; fi
+  log "tests: auto -> $TEST_WHERE (VPS MemAvailable ${mem} MB, box needs >= ${TEST_MIN_MEM_MB} MB)"
+fi
+
 if [ "$MODE" != apply ]; then
-  log "[dry-run] would stage to /root/launch-ops-staging/worker-$TS, run tests, then install [$TODO] one at a time"
+  log "[dry-run] would run the vault-kit tests ($TEST_WHERE), stage to /root/launch-ops-staging/worker-$TS, then install [$TODO] one at a time"
   exit 0
 fi
 
-# 4. stage + test on the box
+# 4. test (off-box or guarded on the box) + stage
+local_tests() {
+  local node nm c lv rv
+  node=$(command -v node) || die "--tests local needs node on this machine"
+  nm="${LOCAL_NODE_MODULES:-}"
+  for c in "$REPO/tools/vault-kit/node_modules" /home/matrix/kamigotchi/tools/vault-kit/node_modules; do
+    [ -n "$nm" ] || { [ -d "$c" ] && nm="$c"; } || true
+  done
+  [ -n "$nm" ] && [ -d "$nm/ethers" ] || die "--tests local: no vault-kit node_modules with ethers here (set LOCAL_NODE_MODULES)"
+  ver() { python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])'; }
+  lv=$(ver < "$nm/ethers/package.json")
+  rv=$("${SSH[@]}" "cat $REMOTE_ROOT/vault-kit/node_modules/ethers/package.json" | ver) || rv="unknown"
+  log "off-box tests: node $("$node" -v) here (the VPS runs v20.20.0), ethers $lv here / $rv on the VPS"
+  [ "$lv" = "$rv" ] || [ "$ALLOW_DEP_CHANGE" = 1 ] || die "ethers differs (here $lv, VPS $rv): off-box tests would not prove the box. Use --tests box, or --allow-dep-change"
+  NODE_BIN="$node" NODE_MODULES="$nm" bash "$HERE/deploy/remote-install-worker-code.sh" --action test --staging "$WORK/stage" --min-mem-mb 0 \
+    || die "tests failed off-box; nothing live changed"
+  rm -f "$WORK/stage/full/node_modules" "$WORK/stage/code/node_modules" "$WORK/stage/test.log"
+}
+[ "$TEST_WHERE" != local ] || local_tests
 STAGE="/root/launch-ops-staging/worker-$TS"
 tar -C "$WORK/stage" -czf "$WORK/stage.tgz" code full
 "${SSH[@]}" "mkdir -p $STAGE && chmod 700 /root/launch-ops-staging $STAGE && tar -xzf - -C $STAGE" < "$WORK/stage.tgz"
 printf '%s\n' "$SHA" | "${SSH[@]}" "cat > $STAGE/SHA"
-remote "--action test --staging $STAGE" < "$HERE/deploy/remote-install-worker-code.sh" || die "tests failed on the VPS; nothing live changed (staging kept at $STAGE)"
+if [ "$TEST_WHERE" = box ]; then
+  rc=0; remote "--action test --staging $STAGE --min-mem-mb $TEST_MIN_MEM_MB" < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
+  [ "$rc" != 9 ] || die "VPS memory guard refused the on-box test run; re-run with --tests local. Nothing live changed (staging kept at $STAGE)"
+  [ "$rc" = 0 ] || die "tests failed on the VPS; nothing live changed (staging kept at $STAGE)"
+fi
 
 # 5. one market at a time (markets with nothing NEW/CHANGED were dropped above)
 for m in $TODO; do
@@ -209,9 +265,9 @@ for m in $TODO; do
   rc=0; gate "$m" || rc=$?
   [ "$rc" = 0 ] || die "gate refused for $m (exit $rc); stopping. Markets already done stay on $SHA."
   rc=0
-  remote "--action install --market $m --staging $STAGE --backup-dir /root/launch-ops-backups/worker-$TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --require-heartbeat $REQUIRE_HEARTBEAT --verify-halt $VERIFY_HALT --pending-wait $ROLLBACK_PENDING_WAIT_SEC" \
+  remote "--action install --market $m --staging $STAGE --backup-dir /root/launch-ops-backups/worker-$TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --require-heartbeat $REQUIRE_HEARTBEAT --verify-halt $VERIFY_HALT --pending-wait $ROLLBACK_PENDING_WAIT_SEC --allow-open-rentals $AOR" \
     < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
-  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back, 5/6 = auto-rollback blocked: the patched code runs again with HALT kept). Not continuing."
+  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back, 5/6 = auto-rollback blocked: the patched code runs again with HALT kept, 8 = launch guards refused, nothing changed). Not continuing."
   log "== $m now runs $SHA"
 done
 log "deployed $SHA to [$TODO]. Rollback: $0 --rollback $TS --markets \"$TODO\""

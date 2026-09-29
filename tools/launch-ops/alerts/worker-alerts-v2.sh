@@ -93,6 +93,7 @@ PREPARING_MAX_SEC="${PREPARING_MAX_SEC:-21600}"
 EXPIRED_UNENDED_MAX_SEC="${EXPIRED_UNENDED_MAX_SEC:-3600}"
 EXIT_RESERVE_ACTIONS="${EXIT_RESERVE_ACTIONS:-3}"
 OPERATOR_ACTION_GAS_FLOOR="${OPERATOR_ACTION_GAS_FLOOR:-1700000}"
+OPERATOR_TX_PRICING="${OPERATOR_TX_PRICING:-eip1559}" # must match the worker .env (default eip1559)
 LEASE_HOSTS="${LEASE_HOSTS-lease-musu.kamistats.com lease-vipp.kamistats.com}" # empty = skip ingress/TLS
 INGRESS_EXPECT_CODE="${INGRESS_EXPECT_CODE:-404}"
 TLS_MIN_DAYS="${TLS_MIN_DAYS:-14}"
@@ -100,6 +101,13 @@ DISK_MAX_PCT="${DISK_MAX_PCT:-85}"
 MEM_MIN_MB="${MEM_MIN_MB:-100}"
 SELF_GAP_SEC="${SELF_GAP_SEC:-1800}"
 NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+
+for knob in RPC_TIMEOUT_SEC ERR_THRESHOLD COOLDOWN_SECS HEARTBEAT_STALE_SEC TICK_FAIL_RUNS JOB_ERROR_RUNS \
+    KEEPER_MIN_WEI FEE_FLOAT_MIN_CLAIMS PREPARING_MAX_SEC EXPIRED_UNENDED_MAX_SEC EXIT_RESERVE_ACTIONS \
+    OPERATOR_ACTION_GAS_FLOOR TLS_MIN_DAYS DISK_MAX_PCT MEM_MIN_MB SELF_GAP_SEC; do
+  [[ "${!knob}" =~ ^[0-9]+$ ]] || { echo "worker-alerts-v2: $knob must be a non-negative integer without quotes (got '${!knob}')" >&2; exit 2; }
+done
+case "$OPERATOR_TX_PRICING" in eip1559|legacy) ;; *) echo "worker-alerts-v2: OPERATOR_TX_PRICING must be eip1559 or legacy" >&2; exit 2 ;; esac
 
 market_dir() { printf '%s/vault-kit-v16-%s' "$KAMI_ROOT" "$1"; }
 market_addr() { if [ "$1" = musu ]; then printf '%s' "$MUSU_MARKET"; else printf '%s' "$VIPP_MARKET"; fi; }
@@ -233,17 +241,38 @@ for u in $INFRA_UNITS $SELF_TIMER; do
 done
 
 # ---- per worker journal checks --------------------------------------------------------
-lease_alert_scan() { # unit lines -> one notify per distinct [LEASE-ALERT] code
-  local unit="$1" la codes code cnt last prio
+# Per-lease codes are keyed per (unit, code, token): a DEAD_KAMI for token B within
+# the cooldown of one for token A is a NEW condition and is pushed. Other codes (and
+# per-lease lines without token=) keep one key per (unit, code).
+PER_LEASE_CODES="${PER_LEASE_CODES:-DEAD_KAMI ESCROW_LOW EXIT_RESERVE_STOP STAGE_STUCK TX_TIMEOUT}"
+lease_alert_scan() { # unit lines -> one notify per distinct [LEASE-ALERT] code (per token for per-lease codes)
+  local unit="$1" la codes code lines toks tok tlines cnt last prio key
   la=$(grep -F '[LEASE-ALERT]' <<<"$2" || true)
   [ -n "$la" ] || return 0
   codes=$(sed -nE 's/.*\[LEASE-ALERT\] ([A-Z0-9_]+).*/\1/p' <<<"$la" | sort -u)
   for code in $codes; do
-    cnt=$(grep -cF "[LEASE-ALERT] $code" <<<"$la" || true)
-    last=$(grep -F "[LEASE-ALERT] $code" <<<"$la" | tail -1 | sed -E 's/.*(\[LEASE-ALERT\])/\1/' | cut -c1-220)
+    lines=$(grep -F "[LEASE-ALERT] $code" <<<"$la" || true)
     prio=high
     case "$code" in LEASE_CAP|RESERVATION_CAP) prio=default ;; esac
-    notify "la-$unit-$code" "$code on $unit" "$cnt line(s). Last: $last" "$prio"
+    toks="-"
+    case " $PER_LEASE_CODES " in
+      *" $code "*) toks=$(sed -nE 's/.*[[:space:]]token=([0-9]+).*/\1/p' <<<"$lines" | sort -un)
+                   grep -vqE '[[:space:]]token=[0-9]+' <<<"$lines" && toks="$toks -" ;;
+    esac
+    for tok in $toks; do
+      if [ "$tok" = - ]; then
+        tlines=$(grep -vE '[[:space:]]token=[0-9]+' <<<"$lines" || true)
+        [ "$toks" = - ] && tlines=$lines
+        key="la-$unit-$code"
+      else
+        tlines=$(grep -E "[[:space:]]token=$tok([^0-9]|\$)" <<<"$lines" || true)
+        key="la-$unit-$code-$tok"
+      fi
+      [ -n "$tlines" ] || continue
+      cnt=$(grep -c . <<<"$tlines" || true)
+      last=$(tail -1 <<<"$tlines" | sed -E 's/.*(\[LEASE-ALERT\])/\1/' | cut -c1-220)
+      notify "$key" "$code on $unit" "$cnt line(s). Last: $last" "$prio"
+    done
   done
 }
 
@@ -339,10 +368,39 @@ state_file_for() { # market dir -> absolute state file path (reads only WORKER_S
   printf '%s' "$v"
 }
 
+# Exit reserve priced exactly like the worker (renter-pod-safety.mjs): the fee per gas
+# the worker is BILLED at, max(2 x baseFee + priority, gasPrice) for the default
+# OPERATOR_TX_PRICING=eip1559, times the billed action gas (OPERATOR_ACTION_GAS_FLOOR
+# + 10% unused-gas charge), times EXIT_RESERVE_ACTIONS. Below it the worker cannot
+# pay its own exit (stop harvest, finalize, KamiSend home).
+rpc_raw() { # method params -> raw JSON reply (non-zero unless it carries a "result")
+  local out
+  out=$(curl -sS -m "$RPC_TIMEOUT_SEC" -X POST -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$RPC" 2>/dev/null) || return 1
+  grep -q '"result"' <<<"$out" || return 1
+  printf '%s' "$out"
+}
+billed_fee_per_gas() { # -> FEE_PER_GAS (same rule as keeper/lease-gas-sponsor.sh); non-zero on read failure
+  local gp blk bf base pr mf
+  gp=$(rpc_result eth_gasPrice '[]') || return 1
+  FEE_PER_GAS=$(hex2dec "$gp")
+  [ "$OPERATOR_TX_PRICING" != legacy ] || return 0
+  blk=$(rpc_raw eth_getBlockByNumber '["latest",false]') || return 1
+  bf=$(tr -d '\n' <<<"$blk" | sed -nE 's/.*"baseFeePerGas"[[:space:]]*:[[:space:]]*"(0x[0-9a-fA-F]+)".*/\1/p')
+  [ -n "$bf" ] || return 0
+  base=$(hex2dec "$bf")
+  [ "$base" -gt 0 ] || return 0
+  if pr=$(rpc_result eth_maxPriorityFeePerGas '[]'); then pr=$(hex2dec "$pr"); else pr=1000000000; fi
+  mf=$((2 * base + pr))
+  [ "$mf" -le "$FEE_PER_GAS" ] || FEE_PER_GAS=$mf
+}
 EXIT_RESERVE_WEI=""
-gas_price=$(rpc_result eth_gasPrice '[]' || true)
-if [ -n "$gas_price" ]; then
-  EXIT_RESERVE_WEI=$(( $(hex2dec "$gas_price") * OPERATOR_ACTION_GAS_FLOOR * EXIT_RESERVE_ACTIONS ))
+FEE_PER_GAS=""
+if billed_fee_per_gas; then
+  EXIT_RESERVE_WEI=$(( FEE_PER_GAS * (OPERATOR_ACTION_GAS_FLOOR + OPERATOR_ACTION_GAS_FLOOR / 10) * EXIT_RESERVE_ACTIONS ))
+  log "operator exit reserve ${EXIT_RESERVE_WEI} wei (feePerGas=${FEE_PER_GAS} pricing=${OPERATOR_TX_PRICING})"
+else
+  CHECK_ERRORS=$((CHECK_ERRORS + 1))
 fi
 
 for m in $V16_MARKETS; do

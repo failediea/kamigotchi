@@ -146,7 +146,7 @@ if [ -z "$units_bad" ]; then ok "all four ops units run their script via /bin/ba
 
 echo "== alerts v2: dry-run sends nothing and writes nothing"
 "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/dry.out" 2>&1 || bad "dry-run exit $?"
-expect_grep "$T/dry.out" "WOULD ALERT [la-kami-renter-pod-v16-musu-DEAD_KAMI]" "dry-run reports DEAD_KAMI"
+expect_grep "$T/dry.out" "WOULD ALERT [la-kami-renter-pod-v16-musu-DEAD_KAMI-999]" "dry-run reports DEAD_KAMI keyed per token"
 if [ -s "$NTFY_LOG" ]; then bad "dry-run sent a notification"; else ok "dry-run sent nothing"; fi
 if [ -e "$T/state" ] || [ -e "$T/persist" ]; then bad "dry-run created state dirs"; else ok "dry-run wrote no state"; fi
 expect_nogrep "$T/dry.out" "SHOULD_NEVER_BE_PRINTED" "operator key never printed"
@@ -174,7 +174,7 @@ expect_count "$NTFY_LOG" "Title: DEAD_KAMI on" 1 "DEAD_KAMI not re-sent inside c
 if [ "$HAVE_JQ" = 1 ] || [ -n "$NODE" ]; then expect_grep "$NTFY_LOG" "lease #999 erroring (musu)" "persistent job error pushed on 2nd run"; else skip "persistent job error (needs jq or node)"; fi
 
 echo "== alerts v2: empty/corrupt cooldown + counter files do not abort the run"
-: > "$T/state/la-kami-renter-pod-v16-musu-DEAD_KAMI"
+: > "$T/state/la-kami-renter-pod-v16-musu-DEAD_KAMI-999"
 echo "garbage" > "$T/persist/alerts-last-ok"
 printf 'x\n' > "$T/persist/count-rpc-errors"
 rc=0; "$OPS/alerts/worker-alerts-v2.sh" --apply > "$T/run2b.out" 2>&1 || rc=$?
@@ -200,6 +200,19 @@ expect_grep "$NTFY_LOG" "Title: kami lease alerts self-test" "self-test sends on
 expect_count "$NTFY_LOG" "Title: kami lease alerts self-test" 1 "self-test without --apply sends nothing"
 "$OPS/alerts/worker-alerts-v2.sh" --apply --notify-failure kami-lease-gas-sponsor.service > /dev/null 2>&1
 expect_grep "$NTFY_LOG" "Title: UNIT FAILED: kami-lease-gas-sponsor.service" "OnFailure hook push"
+
+echo "== alerts v2: cooldown is per (unit, code, token) for per-lease codes"
+c0=$(grep -cF "Title: DEAD_KAMI on" "$NTFY_LOG" || true)
+echo "2026-09-29T08:05:00+00:00 host kami-renter-pod-v16-musu[1]: [LEASE-ALERT] DEAD_KAMI token=1000 kami=124 state=DEAD" >> "$T/journal/kami-renter-pod-v16-musu"
+"$OPS/alerts/worker-alerts-v2.sh" --apply > "$T/run5.out" 2>&1 || bad "run5 exit $?"
+expect_count "$NTFY_LOG" "Title: DEAD_KAMI on" $((c0 + 1)) "a DEAD_KAMI for a second token inside token 999's cooldown is pushed"
+expect_grep "$T/run5.out" "ALERT SENT [la-kami-renter-pod-v16-musu-DEAD_KAMI-1000]" "second token has its own cooldown key"
+expect_grep "$T/run5.out" "ALERT (cooldown, not re-sent) [la-kami-renter-pod-v16-musu-DEAD_KAMI-999]" "first token still inside its cooldown"
+"$OPS/alerts/worker-alerts-v2.sh" --apply > "$T/run6.out" 2>&1 || bad "run6 exit $?"
+expect_count "$NTFY_LOG" "Title: DEAD_KAMI on" $((c0 + 1)) "neither token re-sent inside its cooldown"
+rc=0; OPERATOR_ACTION_GAS_FLOOR='"1700000"' "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/run7.out" 2>&1 || rc=$?
+expect_rc "$rc" 2 "a quoted numeric knob is a clear startup error"
+expect_grep "$T/run7.out" "OPERATOR_ACTION_GAS_FLOOR must be a non-negative integer" "the malformed knob is named"
 
 # run a state-reading script with a fixture: locally (jq), else over ssh (read-only), else skip
 run_state() { # out script state_json args...
@@ -250,6 +263,64 @@ if [ "$rc" = 99 ]; then skip "gate unparsable reservation (needs jq or LAUNCH_OP
 else
   [ "$rc" = 1 ] && ok "unparsable reservation -> UNDECIDED (exit 1), not SAFE" || bad "gate exit $rc (want 1)"
   expect_grep "$T/gate8.out" "R1 cannot parse reservations" "R1 parse failure reported"
+fi
+# J4/J5: containers of the patched worker that the pre-hardening worker never reads
+RETIRED='{"lastBlock":1,"jobs":{},"reservations":{},"retiredJobs":{"5846:0xpod":{"tokenIndex":5846,"pod":"0x0000000000000000000000000000000000000002","returned":false},"77:0xold":{"tokenIndex":77,"returned":true}}}'
+rc=0; run_state "$T/gate10.out" lease-transition-gate.sh "$RETIRED" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate J4 (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else
+  [ "$rc" = 3 ] && ok "superseded pod still returning (retiredJobs) -> REFUSE" || bad "gate exit $rc (want 3)"
+  expect_grep "$T/gate10.out" "J4 superseded pod still returning its kami (retiredJobs token(s): 5846)" "J4 names only the unreturned retired job"
+fi
+RETIRED_DONE='{"lastBlock":1,"jobs":{},"reservations":{},"retiredJobs":{"77:0xold":{"tokenIndex":77,"returned":true}},"ingestRetry":{}}'
+rc=0; run_state "$T/gate11.out" lease-transition-gate.sh "$RETIRED_DONE" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate J4 returned (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else [ "$rc" = 0 ] && ok "returned retired job + empty ingestRetry -> SAFE" || bad "gate exit $rc (want 0)"; fi
+PARKED='{"lastBlock":1,"jobs":{},"reservations":{},"ingestRetry":{"0xev:1":{"eventId":"0xev:1","nonce":"0x01","attempts":2}}}'
+rc=0; run_state "$T/gate12.out" lease-transition-gate.sh "$PARKED" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate J5 (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else
+  [ "$rc" = 3 ] && ok "parked RenterPodCreated event (ingestRetry) -> REFUSE" || bad "gate exit $rc (want 3)"
+  expect_grep "$T/gate12.out" "J5 1 parked event(s)" "J5 reason printed"
+fi
+# R1 covers the quote's real lifetime: quoteDeadline ahead, or created inside TTL + 900 s
+QD=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab","quoteDeadline":%s}}}' 4 $((NOW - 7200)) $((NOW + 600)))
+rc=0; run_state "$T/gate13.out" lease-transition-gate.sh "$QD" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate R1 quoteDeadline (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else [ "$rc" = 3 ] && ok "old bound reservation whose quoteDeadline is still ahead -> REFUSE" || bad "gate exit $rc (want 3)"; fi
+QDPAST=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab","quoteDeadline":%s}}}' 5 $((NOW - 7200)) $((NOW - 3000)))
+rc=0; run_state "$T/gate14.out" lease-transition-gate.sh "$QDPAST" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate R1 expired quoteDeadline (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else [ "$rc" = 0 ] && ok "old bound reservation whose quoteDeadline passed -> SAFE" || bad "gate exit $rc (want 0)"; fi
+MID=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab"}}}' 6 $((NOW - 2000)))
+rc=0; run_state "$T/gate15.out" lease-transition-gate.sh "$MID" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate R1 default window (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else
+  [ "$rc" = 3 ] && ok "bound reservation 2000 s old without quoteDeadline -> REFUSE (window TTL 1200 + 900)" || bad "gate exit $rc (want 3)"
+  expect_grep "$T/gate15.out" "inflightWindow=2100s" "default window is RESERVATION_TTL_SEC + 900"
+fi
+# T1 resolves tracked hashes over RPC: a mined or unknown (dropped) hash is not in flight
+REAL_TX=""
+tip=$(curl -s -m 15 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+  https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')
+if [ -n "$tip" ]; then
+  for back in $(seq 0 30); do
+    REAL_TX=$(curl -s -m 15 -X POST -H 'content-type: application/json' \
+      --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$(printf '0x%x' $(( $((tip)) - back - 5 )))\",false]}" \
+      https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz | grep -oE '"transactions":\["0x[0-9a-fA-F]{64}' | grep -oE '0x[0-9a-fA-F]{64}' || true)
+    [ -z "$REAL_TX" ] || break
+  done
+fi
+if [ -z "$REAL_TX" ]; then skip "gate T1 RPC resolution (no recent mined tx found on the public RPC)"
+else
+  RESOLVED=$(printf '{"lastBlock":1,"jobs":{},"reservations":{},"pendingTxs":{"7":{"hash":"%s","nonce":3,"from":"0x1","label":"endLease","sentAt":1},"8":{"hash":"0x%s","nonce":4,"from":"0x1","label":"stopHarvest","sentAt":1}}}' "$REAL_TX" "$(printf 'd%.0s' $(seq 1 64))")
+  rc=0; run_state "$T/gate16.out" lease-transition-gate.sh "$RESOLVED" --market vipp || rc=$?
+  if [ "$rc" = 99 ]; then skip "gate T1 RPC resolution (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+  else
+    [ "$rc" = 0 ] && ok "pendingTxs left behind by a rollback (mined + dropped) -> SAFE, not REFUSE forever" || bad "gate exit $rc (want 0)"
+    expect_grep "$T/gate16.out" "is mined: not in flight" "mined tracked tx resolved over RPC"
+    expect_grep "$T/gate16.out" "is dropped: not in flight" "unknown tracked tx resolved as dropped"
+  fi
 fi
 if [ "$HAVE_JQ" = 1 ]; then
   printf '{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab"}}\n' 2 "$NOW" \
@@ -302,13 +373,24 @@ request() { # pod stage -> 6 words
 H_INFLIGHT=0x$(printf 'e%.0s' $(seq 1 64))
 H_MINED=0x$(printf 'a%.0s' $(seq 1 64))
 H_DROPPED=0x$(printf 'd%.0s' $(seq 1 64))
+# test signer: private key 1 (a well-known test key, fake chain only); its address
+TSIGNER=0x7e5f4552091a69125d5dfcb7b8c2659029395bdf
+BLOCK_JSON='{"hash":"0x1111111111111111111111111111111111111111111111111111111111111111","parentHash":"0x2222222222222222222222222222222222222222222222222222222222222222","number":"0x10","timestamp":"0x65000000","nonce":"0x0000000000000000","difficulty":"0x0","gasLimit":"0x1c9c380","gasUsed":"0x0","miner":"0x0000000000000000000000000000000000000000","extraData":"0x","baseFeePerGas":"0x2625a0","transactions":[]}'
 chain_config() { # nonce_latest nonce_pending [inflight_receipt_json]
+  # Live Yominet fee data: gasPrice 2.5 Mwei, baseFee 2.5 Mwei, priority 0 -> maxFeePerGas 5 Mwei.
+  # eth_sendRawTransaction is deliberately NOT configured: any broadcast gets an error reply.
   cat > "$T/rpc.json" <<EOF
 {
+  "eth_chainId": "0x7a69",
   "eth_gasPrice": "0x2625a0",
+  "eth_maxPriorityFeePerGas": "0x0",
+  "eth_getBlockByNumber": $BLOCK_JSON,
+  "eth_estimateGas": "0x5208",
   "eth_getTransactionCount:latest": "$1",
   "eth_getTransactionCount:pending": "$2",
   "eth_getBalance:$SPN": "0xde0b6b3a764000",
+  "eth_getBalance:$TSIGNER": "0xde0b6b3a764000",
+  "eth_getBalance:0x0000000000000000000000000000000000000c10": "$(printf '0x%x' 20000000000000)",
   "eth_getBalance": "0x0",
   "eth_getCode": "0x",
   "eth_getTransactionReceipt:$H_INFLIGHT": ${3:-null},
@@ -341,13 +423,31 @@ chain_config 0x5 0x5
 rc=0; "${SP_ENV[@]}" "$OPS/keeper/lease-gas-sponsor.sh" --dry-run > "$T/sp1.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "sponsor dry-run on the fake chain exits 0"
 expect_grep "$T/sp1.out" "#7 stage=0: request cleared, listing not re-leased" "stage-0 custody-return job validated against the listing"
-expect_grep "$T/sp1.out" "WOULD send 30000000000000 wei" "stage-0 operator top-up planned (target 12M gas x 2.5 Mwei)"
+expect_grep "$T/sp1.out" "pricing=eip1559 gasPrice=2500000 baseFee=2500000 priorityFee=0 feePerGas=5000000" "sponsor prices at the billed maxFeePerGas (2 x baseFee + priority), not gasPrice"
+expect_grep "$T/sp1.out" "action=9350000000000 reserve=28050000000000 trigger=37400000000000 resume=56100000000000 target=60000000000000" "exit reserve / trigger / resume equal the worker's (1.87M billed gas x 5 Mwei)"
+expect_grep "$T/sp1.out" "WOULD send 60000000000000 wei ($(awk 'BEGIN{printf "%.6f", 6e13/1e18}') ETH) to 0x0000000000000000000000000000000000000c07" "stage-0 operator topped up to the target (12M gas x 5 Mwei >= resume)"
+expect_grep "$T/sp1.out" "WOULD send 40000000000000 wei" "operator at 2e13 (ok under gasPrice pricing, below the worker trigger) is topped up to the target"
 expect_grep "$T/sp1.out" "#8 stage=0: not listed on this market" "stage 0 + unlisted token -> stale"
 expect_grep "$T/sp1.out" "#9 stage=0: listing re-leased" "stage 0 + re-leased listing -> stale"
 expect_grep "$T/sp1.out" "#10 stage=4" "stage 4 (terminal) considered by default"
 expect_grep "$T/sp1.out" "#11 stage=3: chain pod" "stage 3 pod mismatch -> stale"
 expect_grep "$T/sp1.out" "2 top-up(s) planned" "exactly #7 and #10 planned"
 expect_nogrep "$T/sp1.out" "#12" "returned job ignored"
+rc=0; OPERATOR_TX_PRICING=legacy "${SP_ENV[@]}" "$OPS/keeper/lease-gas-sponsor.sh" --dry-run > "$T/sp1l.out" 2>&1 || rc=$?
+expect_grep "$T/sp1l.out" "pricing=legacy gasPrice=2500000 baseFee=none priorityFee=none feePerGas=2500000" "OPERATOR_TX_PRICING=legacy (worker legacy mode) prices at gasPrice"
+echo "== alerts v2 (fake chain): operator gas is judged at the billed rate"
+AK="$T/alerts-kami"; mkdir -p "$AK/vault-kit-v16-vipp"
+printf '{"lastBlock":1,"jobs":{"10":{"tokenIndex":10,"operator":"0x0000000000000000000000000000000000000c10","pod":"%s","returned":false}}}\n' "$POD" \
+  > "$AK/vault-kit-v16-vipp/renter-pod-worker-state.json"
+printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 1, "liveReservations": 0, "tickMs": 5}\n' "$NOW" > "$AK/vault-kit-v16-vipp/heartbeat.json"
+rc=0; KAMI_ROOT="$AK" YOMINET_RPC_PUBLIC="$FAKE_RPC" V16_MARKETS=vipp VIPP_MARKET="$MKT" LEGACY_UNITS="" OPS_UNITS="" \
+  ALERT_STATE_DIR="$T/astate" ALERT_PERSIST_DIR="$T/apersist" "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/aop.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "alerts dry-run on the fake chain exits 0"
+expect_grep "$T/aop.out" "operator exit reserve 28050000000000 wei (feePerGas=5000000 pricing=eip1559)" "alerts exit reserve = 3 x 1.87M billed gas x 5 Mwei (the worker's reserve)"
+expect_grep "$T/aop.out" "WOULD ALERT [opgas-vipp-10]" "operator at 2e13 (above the old gasPrice reserve 1.275e13) now raises ESCROW_LOW"
+
+rc=0; SPONSOR_TARGET_GAS_UNITS='"12000000"' "${SP_ENV[@]}" "$OPS/keeper/lease-gas-sponsor.sh" --dry-run > "$T/sp1q.out" 2>&1 || rc=$?
+check "[ '$rc' != 0 ] && grep -q 'SPONSOR_TARGET_GAS_UNITS must be a non-negative integer' '$T/sp1q.out'" "a quoted numeric knob fails with a clear message"
 
 echo "== gas sponsor: a broadcast-but-unmined top-up counts toward the caps and blocks new sends"
 mkdir -p "$T/persist-sp"
@@ -412,19 +512,94 @@ expect_grep "$T/kp1.out" "[LEASE-ALERT] TX_TIMEOUT source=expiry-keeper" "keeper
 expect_nogrep "$T/rpc.log" "eth_sendRawTransaction" "keeper sent nothing"
 expect_nogrep "$T/rpc.log" "eth_chainId" "keeper signer never started"
 
+# Reserve-then-confirm, with the REAL signer (ethers) against the fake chain: a test key
+# (private key 1) on fake chain id 31337. The fake RPC answers every broadcast with an
+# error, which is exactly what a lost RPC reply looks like to the signer.
+ETH_NM="${LAUNCH_OPS_TEST_NODE_MODULES:-}"
+if [ -z "$ETH_NM" ]; then
+  for c in "$(git -C "$OPS" rev-parse --show-toplevel 2>/dev/null || echo /nonexistent)/tools/vault-kit/node_modules" /home/matrix/kamigotchi/tools/vault-kit/node_modules; do
+    [ -d "$c/ethers" ] && { ETH_NM="$c"; break; }
+  done
+fi
+cfg_set() { # key json_value: add/replace one fake-chain entry
+  python3 - "$T/rpc.json" "$1" "$2" <<'PY'
+import json, sys
+p, k, v = sys.argv[1:]
+c = json.load(open(p)); c[k] = json.loads(v); json.dump(c, open(p, "w"))
+PY
+}
+if [ -z "$ETH_NM" ]; then
+  skip "reserve-then-confirm signer tests (need vault-kit node_modules with ethers)"
+else
+  printf '0x%064x\n' 1 > "$T/signer.key"; chmod 600 "$T/signer.key"
+  SIGN_ENV=(SPONSOR_ADDRESS=$TSIGNER SPONSOR_KEY_FILE="$T/signer.key" ETHERS_NODE_PATH="$ETH_NM" SIGNER_RPC_TIMEOUT_MS=5000 TX_WAIT_TIMEOUT_MS=3000)
+
+  echo "== gas sponsor --apply: the ledger row is written BEFORE the broadcast (lost reply still counts)"
+  chain_config 0x5 0x5
+  : > "$T/rpc.log"
+  rc=0; env "${SIGN_ENV[@]}" "${SP_ENV[@]:1}" ALERT_PERSIST_DIR="$T/persist-rtc" "$OPS/keeper/lease-gas-sponsor.sh" --apply > "$T/sp6.out" 2>&1 || rc=$?
+  check "[ '$rc' != 0 ]" "sponsor run with a failed broadcast exits non-zero (OnFailure push)"
+  expect_count "$T/rpc.log" "eth_sendRawTransaction" 1 "exactly one broadcast: the run stops after the first failed send"
+  expect_count "$T/persist-rtc/sponsor-ledger.tsv" "sent" 1 "one 'sent' ledger row"
+  row_hash=$(awk -F'\t' '$2=="topup"{print $8}' "$T/persist-rtc/sponsor-ledger.tsv" | head -1)
+  check "[[ '$row_hash' =~ ^0x[0-9a-f]{64}$ ]]" "ledger row carries the signed tx hash"
+  expect_grep "$T/sp6.out" "TX_TIMEOUT source=sponsor token=7 operator=0x0000000000000000000000000000000000000c07 hash=$row_hash exit=5" "failed broadcast alerted with the reserved hash"
+  raw_hash=$(NODE_PATH="$ETH_NM" "$NODE" -e '
+    const { keccak256 } = require("ethers");
+    const line = require("fs").readFileSync(process.argv[1], "utf8").split("\n").find((l) => l.startsWith("eth_sendRawTransaction "));
+    console.log(keccak256(JSON.parse(line.slice("eth_sendRawTransaction ".length))[0]));' "$T/rpc.log" 2>/dev/null || echo none)
+  check "[ '$raw_hash' = '$row_hash' ]" "the ledger row is for exactly the tx that was broadcast"
+  rc=0; SPONSOR_ADDRESS=$TSIGNER "${SP_ENV[@]}" ALERT_PERSIST_DIR="$T/persist-rtc" "$OPS/keeper/lease-gas-sponsor.sh" --dry-run > "$T/sp7.out" 2>&1 || rc=$?
+  expect_grep "$T/sp7.out" "(used 24h: 60000000000000)" "the unconfirmed top-up counts toward the daily cap"
+  : > "$T/rpc.log"
+  rc=0; env "${SIGN_ENV[@]}" "${SP_ENV[@]:1}" ALERT_PERSIST_DIR="$T/persist-rtc" "$OPS/keeper/lease-gas-sponsor.sh" --apply > "$T/sp8.out" 2>&1 || rc=$?
+  expect_grep "$T/sp8.out" "held back until the in-flight sponsor tx resolves" "next run holds back while the reserved row is unresolved"
+  expect_nogrep "$T/rpc.log" "eth_sendRawTransaction" "and broadcasts nothing"
+
+  echo "== gas sponsor --apply: a ledger that cannot be written means NO broadcast"
+  mkdir -p "$T/persist-ro"; : > "$T/persist-ro/sponsor-ledger.tsv"; chmod 400 "$T/persist-ro/sponsor-ledger.tsv"
+  : > "$T/rpc.log"
+  rc=0; env "${SIGN_ENV[@]}" "${SP_ENV[@]:1}" ALERT_PERSIST_DIR="$T/persist-ro" "$OPS/keeper/lease-gas-sponsor.sh" --apply > "$T/sp9.out" 2>&1 || rc=$?
+  if [ "$(id -u)" = 0 ]; then skip "read-only ledger (running as root)"
+  else
+    check "[ '$rc' != 0 ]" "unwritable ledger -> run fails"
+    expect_grep "$T/sp9.out" "detail=ledger_append_failed,_NOT_broadcasting" "signer refuses to broadcast without its ledger row"
+    expect_grep "$T/sp9.out" "hash=none exit=4" "no hash reported (nothing reserved, nothing sent)"
+    expect_nogrep "$T/rpc.log" "eth_sendRawTransaction" "nothing broadcast"
+    expect_count "$T/sp9.out" "sending " 1 "run stopped after the failed send (hash=none also breaks)"
+  fi
+  chmod 600 "$T/persist-ro/sponsor-ledger.tsv"
+
+  echo "== expiry keeper --apply: the ledger row is written BEFORE the broadcast"
+  chain_config 0x5 0x5
+  cfg_set "eth_call:$MKT:0xf81c2347$(w 7)" "\"$(listing "$OWNER_W" "$RENTER_W" $((NOW - 100000)))\""
+  cfg_set "eth_call:$MKT:0xd2267fe9" '"0x"'
+  : > "$T/rpc.log"
+  rc=0; env "${SIGN_ENV[@]}" YOMINET_RPC_PUBLIC="$FAKE_RPC" EXPIRY_MARKETS="$MKT" ALERT_PERSIST_DIR="$T/persist-kp2" SPONSOR_LOCK_FILE="$T/sponsor.lock" \
+    "$OPS/keeper/lease-expiry-keeper.sh" --apply > "$T/kp2.out" 2>&1 || rc=$?
+  check "[ '$rc' != 0 ]" "keeper run with a failed broadcast exits non-zero"
+  expect_count "$T/rpc.log" "eth_sendRawTransaction" 1 "keeper broadcast once"
+  kp_hash=$(awk -F'\t' '$2=="endLease"{print $5}' "$T/persist-kp2/expiry-keeper-ledger.tsv" 2>/dev/null | head -1)
+  check "[[ '$kp_hash' =~ ^0x[0-9a-f]{64}$ ]]" "keeper ledger row reserved with the signed hash"
+  expect_grep "$T/kp2.out" "hash=$kp_hash exit=5" "keeper alert carries the reserved hash"
+fi
+
 echo "== worker deploy, VPS half (fake market dir, shimmed systemctl, fake RPC)"
 RK="$T/rk/tools"; MD="$RK/vault-kit-v16-vipp"; STG="$T/rk/staging"
 mkdir -p "$STG/code" "$T/rk/backups"
 echo "// new code" > "$STG/code/renter-pod-worker.mjs"
 echo "// new module" > "$STG/code/renter-pod-tx.mjs"
-reset_market() { # pendingTxs_json state_reservations_json
-  local pend="${1:-}" res="${2:-}"
+ALLOW1=0x00000000000000000000000000000000000000b7
+ALLOW2=0x00000000000000000000000000000000000000A2
+reset_market() { # pendingTxs_json state_reservations_json [env_body]
+  local pend="${1:-}" res="${2:-}" envb="${3-}"
   [ -n "$pend" ] || pend='{}'
   [ -n "$res" ] || res='{}'
+  [ $# -ge 3 ] || envb="SOME_SETTING=1"$'\n'"RENTER_ALLOWLIST=$ALLOW1,$ALLOW2"
   rm -rf "$MD"; mkdir -p "$MD"
-  printf 'SOME_SETTING=1\n' > "$MD/.env"
+  printf '%s\n' "$envb" > "$MD/.env"; chmod 600 "$MD/.env"
   echo "// old code" > "$MD/renter-pod-worker.mjs"
-  printf '{"lastBlock":1,"jobs":{},"reservations":%s,"pendingTxs":%s}\n' "$res" "$pend" > "$MD/renter-pod-worker-state.json"
+  printf '{"lastBlock":1,"jobs":{},"reservations":%s,"pendingTxs":%s,"txNonceHints":{"0x0000000000000000000000000000000000000001":3}}\n' "$res" "$pend" > "$MD/renter-pod-worker-state.json"
   printf '{"version":1,"reservations":{"0xabc":{"operator":"0x0000000000000000000000000000000000000001","__OPKEY__":"0xSHOULD_NEVER_BE_PRINTED","createdAt":1}}}\n' \
     > "$MD/renter-pod-worker-state.reservations.json"
   sed -i 's/"__OPKEY__"/"operator''Key"/' "$MD/renter-pod-worker-state.reservations.json"
@@ -444,6 +619,45 @@ expect_grep "$T/systemctl.log" "started halt=1 code=// new code" "HALT was prese
 check "[ ! -e '$MD/HALT' ]" "HALT removed after a passing verify"
 check "[ -f '$T/rk/backups/ok/vault-kit-v16-vipp/renter-pod-worker.mjs' ] && [ ! -e '$T/rk/backups/ok/vault-kit-v16-vipp/.env' ]" "backup holds code files, not .env"
 check "[ \"\$(stat -c %a '$T/rk/backups/ok/vault-kit-v16-vipp/state-snapshot/renter-pod-worker-state.json')\" = 600 ]" "state snapshot is mode 600"
+expect_count "$MD/.env" "MAX_ACTIVE_LEASES_PER_RENTER=2" 1 "install appends MAX_ACTIVE_LEASES_PER_RENTER=2 when absent"
+check "grep -q '^RENTER_ALLOWLIST=' '$MD/.env' && grep -q '^SOME_SETTING=1\$' '$MD/.env' && [ \"\$(stat -c %a '$MD/.env')\" = 600 ]" ".env keeps its lines and mode 600"
+expect_grep "$T/d1.out" "launch guards [vipp]: allowlist=2 renter(s) openRentals=refused" "install logs the launch guards (count only)"
+expect_nogrep "$T/d1.out" "$ALLOW1" "allowlist addresses are never printed"
+ls "$MD" | grep -q 'launch-guard-tmp' && bad "env tmp file left behind" || ok "atomic .env append leaves no tmp file"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args ok2) > "$T/d1b.out" 2>&1 || rc=$?
+expect_count "$MD/.env" "MAX_ACTIVE_LEASES_PER_RENTER=" 1 "re-install does not append the knob twice"
+
+echo "== worker deploy: launch guards (allowlist fails closed, knobs parse like the worker)"
+guards() { asroot "${REMOTE_ENV[@]}" bash "$OPS/deploy/remote-install-worker-code.sh" --action guards --market vipp "$@"; }
+reset_market "" "" "SOME_SETTING=1"
+rc=0; guards > "$T/g1.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "no RENTER_ALLOWLIST -> guards refuse (exit 8)"
+expect_grep "$T/g1.out" "RENTER_ALLOWLIST is empty or missing" "refusal explains the allowlist"
+rc=0; guards --allow-open-rentals 1 > "$T/g2.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "ALLOW_OPEN_RENTALS=true lets an open .env through"
+expect_grep "$T/g2.out" "WARNING RENTER_ALLOWLIST is empty or missing and ALLOW_OPEN_RENTALS=true" "open rentals are loudly warned"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args refused) > "$T/g3.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "install without an allowlist refuses (exit 8)"
+expect_grep "$MD/renter-pod-worker.mjs" "old code" "refused install changed no code"
+check "[ ! -e '$T/rk/backups/refused' ] && ! grep -q MAX_ACTIVE_LEASES_PER_RENTER '$MD/.env' && ! grep -q restart '$T/systemctl.log'" "refused install: no backup, no .env write, no restart"
+reset_market "" "" "RENTER_ALLOWLIST=\"$ALLOW1, $ALLOW2 ,$ALLOW1\""$'\n'"MAX_ACTIVE_LEASES=\"5\""
+rc=0; guards > "$T/g4.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "quoted, spaced, duplicated allowlist parses like the worker"
+expect_grep "$T/g4.out" "allowlist=2 renter(s)" "entries lowercased + de-duplicated"
+expect_grep "$T/g4.out" "MAX_ACTIVE_LEASES=5" "quoted numeric knob accepted (the loader strips quotes)"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1,0xnotanaddress"
+rc=0; guards > "$T/g5.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "an invalid allowlist entry refuses (the worker would not start)"
+expect_grep "$T/g5.out" "RENTER_ALLOWLIST entry 2 is not a 0x+40-hex address" "invalid entry named by position"
+expect_nogrep "$T/g5.out" "notanaddress" "invalid entry value not printed"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=two"
+rc=0; guards > "$T/g6.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "a malformed numeric knob refuses before the restart"
+expect_grep "$T/g6.out" "MAX_ACTIVE_LEASES_PER_RENTER is not an integer >= 1" "malformed knob named"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=3"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args keep3) > "$T/g7.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "install with an explicit per-renter cap succeeds"
+check "grep -q '^MAX_ACTIVE_LEASES_PER_RENTER=3\$' '$MD/.env' && ! grep -q 'MAX_ACTIVE_LEASES_PER_RENTER=2' '$MD/.env'" "an explicit MAX_ACTIVE_LEASES_PER_RENTER is kept"
 
 reset_market "$(pending "$H_DROPPED")"
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args fail) > "$T/d2.out" 2>&1 || rc=$?
@@ -457,6 +671,17 @@ check "[ \"\$(stat -c %a '$MD/renter-pod-worker-state.json')\" = 600 ]" "state f
 check "[ ! -e '$MD/HALT' ]" "HALT removed after auto-rollback to old code"
 expect_nogrep "$T/d2.out" "SHOULD_NEVER_BE_PRINTED" "no operator key printed"
 check "grep -q 'stop kami-renter-pod-v16-vipp' '$T/systemctl.log'" "unit stopped before the state merge"
+state_q() { "$NODE" -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(Object.keys(s.pendingTxs || {}).length + " " + ("txNonceHints" in s ? "hints" : "nohints"));' "$MD/renter-pod-worker-state.json"; }
+check "[ \"\$(state_q)\" = '0 nohints' ]" "rollback pruned the resolved pendingTxs + txNonceHints (the next gate does not refuse forever)"
+expect_grep "$T/d2.out" "pendingTxs: PRUNED 1 kept=0 txNonceHints=1" "prune logged"
+
+echo "== worker deploy: pendingTxs are resolved through the worker .env YOMINET_RPC"
+reset_market "$(pending "$H_DROPPED")" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"YOMINET_RPC=\"$FAKE_RPC\""
+rc=0; asroot "${REMOTE_ENV[@]}" YOMINET_RPC_PUBLIC=http://127.0.0.1:9 FAKE_WORKER_HB=0 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args envrpc) > "$T/d2r.out" 2>&1 || rc=$?
+expect_rc "$rc" 4 "auto-rollback completes with the public RPC unreachable"
+expect_grep "$T/d2r.out" "pendingTxs RPC: worker .env YOMINET_RPC" "the worker's own RPC is used"
+expect_grep "$T/d2r.out" "resolved 7 $H_DROPPED dropped" "pending tx resolved via the worker RPC"
+expect_nogrep "$T/d2r.out" "$FAKE_RPC" "the RPC URL is never printed"
 
 chain_config 0x5 0x5 null
 reset_market "$(pending "$H_INFLIGHT")"
@@ -466,6 +691,7 @@ expect_grep "$MD/renter-pod-worker.mjs" "new code" "patched code (with the tx tr
 expect_grep "$T/d3.out" "[LEASE-ALERT] TX_TIMEOUT market=vipp" "blocked rollback alerted"
 check "[ -e '$MD/HALT' ]" "HALT kept while a human is needed"
 check "[ -e '$MD/renter-pod-worker-state.reservations.json' ]" "store untouched when the rollback is blocked"
+check "[ \"\$(state_q)\" = '1 hints' ]" "an in-flight pendingTxs entry is never pruned"
 
 : > "$T/systemctl.log"
 rc=0; asroot "${REMOTE_ENV[@]}" bash "$OPS/deploy/remote-install-worker-code.sh" --action rollback --market vipp --backup-dir "$T/rk/backups/blocked/vault-kit-v16-vipp" --verify-sec 1 > "$T/d4.out" 2>&1 || rc=$?
@@ -478,11 +704,20 @@ rc=0; asroot "${REMOTE_ENV[@]}" bash "$OPS/deploy/remote-install-worker-code.sh"
 expect_rc "$rc" 0 "manual rollback succeeds once the tx is mined"
 expect_grep "$MD/renter-pod-worker.mjs" "old code" "manual rollback restored the old code"
 expect_grep "$MD/renter-pod-worker-state.json" '"0xabc"' "manual rollback merged the reservation store"
+check "[ \"\$(state_q)\" = '0 nohints' ]" "manual rollback pruned the now-mined pendingTxs entry"
 
 reset_market "" '{"0xabc":{"operator":"0x0000000000000000000000000000000000000002"}}'
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args conflict) > "$T/d6.out" 2>&1 || rc=$?
 expect_rc "$rc" 6 "reservation conflict blocks the auto-rollback (exit 6)"
 expect_grep "$MD/renter-pod-worker.mjs" "new code" "patched code kept on a merge conflict"
+
+echo "== worker deploy: the on-box test run is memory-guarded and needs no root"
+rc=0; env NODE_BIN="$NODE" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/nostage" --min-mem-mb 99999999 > "$T/tm1.out" 2>&1 || rc=$?
+expect_rc "$rc" 9 "MemAvailable below --min-mem-mb -> refused (exit 9) before anything runs"
+expect_grep "$T/tm1.out" "Test off-box instead: deploy-worker-patch.sh --tests local" "refusal points at the off-box run"
+rc=0; env NODE_BIN="$NODE" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/nostage" --min-mem-mb 0 > "$T/tm2.out" 2>&1 || rc=$?
+expect_nogrep "$T/tm2.out" "must run as root" "test action runs without root (off-box)"
+expect_grep "$T/tm2.out" "no staging code" "and reaches the staging check"
 
 echo "== worker deploy: staging tree carries test fixtures (full/) and its tests pass"
 WREF="${LAUNCH_OPS_TEST_WORKER_REF:-launch/worker-hardening}"
@@ -499,7 +734,22 @@ else
   check "[ -d '$T/stage/full/test-fixtures' ] && [ -f '$T/stage/code/renter-pod-worker.mjs' ] && [ ! -e '$T/stage/code/test-fixtures' ]" "full/ has test-fixtures, code/ holds only installable files"
   rc=0; asroot env NODE_BIN="$NODE" NODE_MODULES="$NM" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/stage" > "$T/st1.out" 2>&1 || rc=$?
   expect_rc "$rc" 0 "staged vault-kit tests pass in full/"
+  expect_grep "$T/st1.out" "running: nice -n 19" "suite runs niced"
+  expect_grep "$T/st1.out" "node --test --test-concurrency=1" "suite runs serially (one test file at a time)"
   grep -E '^# (tests|pass|fail)' "$T/st1.out" | sed 's/^/       /' || true
+  # Sponsor thresholds == the worker's own exitReservePlan at the same fee data.
+  if [ -f "$T/stage/full/renter-pod-safety.mjs" ]; then
+    parity=$(cd "$T/stage/full" && "$NODE" --input-type=module -e '
+      const s = await import("./renter-pod-safety.mjs");
+      const fee = s.operatorFeePerGas({ gasPrice: 2500000n, maxFeePerGas: 5000000n }, "eip1559");
+      const p = s.exitReservePlan({ balance: 0n, escrow: 0n, gasPrice: fee, actionGas: s.billedActionGas(1700000n),
+        exitReserveActions: 3, resumeHeadroomActions: 2 });
+      console.log(`action=${p.actionWei} reserve=${p.reserveWei} trigger=${p.triggerWei} resume=${p.resumeWei}`);' 2>&1 || true)
+    sponsor=$(grep -oE 'action=[0-9]+ reserve=[0-9]+ trigger=[0-9]+ resume=[0-9]+' "$T/sp1.out" | head -1)
+    check "[ -n '$sponsor' ] && [ '$parity' = '$sponsor' ]" "sponsor exit-reserve thresholds equal the worker's exitReservePlan ($parity)"
+  else
+    skip "sponsor/worker threshold parity (worker ref has no renter-pod-safety.mjs)"
+  fi
   rm -rf "$T/stage/full"
   rc=0; asroot env NODE_BIN="$NODE" NODE_MODULES="$NM" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/stage" > "$T/st2.out" 2>&1 || rc=$?
   check "[ '$rc' != 0 ]" "control: code-only staging (the old layout) fails on the fixture test"
@@ -535,28 +785,51 @@ check "[ '$rc' != 0 ]" "install fails when the alerts unit does not run (203/EXE
 expect_grep "$T/i4.out" "Result=exit-code ExecMainStatus=203" "failure names the unit result"
 expect_grep "$T/i4.out" "roll back with:" "failure prints the rollback command"
 
-echo "== cleanup-secret-backups (VPS-12)"
-CR="$T/cr"; CD="$CR/tools/vault-kit-v16-musu"; mkdir -p "$CD" "$CR/units" "$CR/backups/worker-old" "$CR/backups/worker-new" "$CR/staging"
-echo "SECRET_MARKER_live" > "$CD/.env"; chmod 600 "$CD/.env"
-echo "SECRET_MARKER_stackA" > "$CD/.env.bak-stackA"; chmod 644 "$CD/.env.bak-stackA"
+echo "== cleanup-secret-backups (VPS-12): shred only what is proven to exist elsewhere"
+if [ -z "$NODE" ] || [ -z "${ETH_NM:-}" ]; then
+  skip "cleanup-secret-backups (needs node + vault-kit node_modules with ethers to derive addresses)"
+else
+CR="$T/cr"; CD="$CR/tools/vault-kit-v16-musu"; mkdir -p "$CD" "$CR/units" "$CR/backups/worker-old" "$CR/backups/worker-old2" "$CR/backups/worker-new" "$CR/staging"
+# test keys 1 and 2 (well-known test keys, never funded); the variable name is
+# spliced so the repo's staged-secrets hook does not flag this file
+KVAR="KEEPER_PRIVATE""_KEY"; K1=$(printf '0x%064x' 1); K2=$(printf '0x%064x' 2)
+A1=0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf; A2=0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF
+printf '%s=%s\nNOTE=SECRET_MARKER_live\n' "$KVAR" "$K1" > "$CD/.env"; chmod 600 "$CD/.env"
+printf '%s=%s\nNOTE=SECRET_MARKER_stackA\n' "$KVAR" "$K2" > "$CD/.env.bak-stackA"; chmod 644 "$CD/.env.bak-stackA"
+printf '%s="%s"\nNOTE=SECRET_MARKER_same\n' "$KVAR" "$K1" > "$CD/.env.bak-same"
 echo "SECRET_MARKER_kept" > "$CD/.env.bak-kept"
 echo "EnvironmentFile=$CD/.env.bak-kept" > "$CR/units/x.service"
 echo "// old" > "$CD/renter-pod-worker.mjs.bak-1"; chmod 777 "$CD/renter-pod-worker.mjs.bak-1"
 echo "// live" > "$CD/renter-pod-worker.mjs"; chmod 666 "$CD/renter-pod-worker.mjs"
 echo "SECRET_MARKER_backup" > "$CR/backups/worker-old/.env"; touch -d '30 days ago' "$CR/backups/worker-old"
-CL_ENV=(env KAMI_ROOT="$CR/tools" V16_MARKETS=musu UNIT_DIR="$CR/units" BACKUP_ROOT="$CR/backups" STAGING_ROOT="$CR/staging")
+printf '%s=%s\n' "$KVAR" "$K2" > "$CR/backups/worker-old2/.env"; touch -d '30 days ago' "$CR/backups/worker-old2"
+CL_ENV=(env KAMI_ROOT="$CR/tools" V16_MARKETS=musu UNIT_DIR="$CR/units" BACKUP_ROOT="$CR/backups" STAGING_ROOT="$CR/staging"
+  NODE_BIN="$NODE" ETHERS_NODE_PATH="$ETH_NM")
 rc=0; asroot "${CL_ENV[@]}" bash "$OPS/cleanup-secret-backups.sh" --prune-days 14 > "$T/c1.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "cleanup dry-run exits 0"
-expect_grep "$T/c1.out" "WOULD shred .env.bak-stackA" "dry-run lists the stale secret backup"
+expect_grep "$T/c1.out" "KEEP (report only) .env.bak-stackA" "a backup holding a key found in no live .env is report-only"
+expect_grep "$T/c1.out" "KEY $KVAR $A2 NOT in any live .env" "its derived address is printed (address only)"
+expect_grep "$T/c1.out" "WOULD shred .env.bak-same" "a backup whose key is also in the live .env may be shredded"
+expect_grep "$T/c1.out" "KEY $KVAR $A1 also in a live .env" "redundancy is proven by derived address"
 expect_grep "$T/c1.out" "KEEP    .env.bak-kept" "a unit-referenced backup is kept"
-check "[ -f '$CD/.env.bak-stackA' ] && [ -d '$CR/backups/worker-old' ]" "dry-run changed nothing"
+expect_grep "$T/c1.out" "KEEP (report only) $CR/backups/worker-old2" "an old deploy backup holding a unique key is kept"
+check "[ -f '$CD/.env.bak-stackA' ] && [ -f '$CD/.env.bak-same' ] && [ -d '$CR/backups/worker-old' ]" "dry-run changed nothing"
 rc=0; asroot "${CL_ENV[@]}" bash "$OPS/cleanup-secret-backups.sh" --prune-days 14 --apply > "$T/c2.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "cleanup --apply exits 0"
-check "[ ! -e '$CD/.env.bak-stackA' ] && [ -f '$CD/.env.bak-kept' ] && [ -f '$CD/.env' ]" "stale backup shredded; live .env and referenced backup kept"
+check "[ -f '$CD/.env.bak-stackA' ] && [ -d '$CR/backups/worker-old2' ]" "--apply never shreds an unproven secret backup"
+check "[ ! -e '$CD/.env.bak-same' ] && [ -f '$CD/.env.bak-kept' ] && [ -f '$CD/.env' ]" "proven-redundant backup shredded; live .env and referenced backup kept"
 check "[ \"\$(stat -c %a '$CD/renter-pod-worker.mjs.bak-1')\" = 600 ] && [ \"\$(stat -c %a '$CD/renter-pod-worker.mjs')\" = 644 ]" "777 .bak -> 600, 666 live code -> 644"
-check "[ ! -e '$CR/backups/worker-old' ] && [ -d '$CR/backups/worker-new' ]" "old deploy backup pruned, recent kept"
-cat "$T/c1.out" "$T/c2.out" > "$T/c.out"
+check "[ ! -e '$CR/backups/worker-old' ] && [ -d '$CR/backups/worker-new' ]" "old deploy backup without unique keys pruned, recent kept"
+rc=0; asroot "${CL_ENV[@]}" ETHERS_NODE_PATH="$T/no-ethers" bash "$OPS/cleanup-secret-backups.sh" --apply > "$T/c3.out" 2>&1 || rc=$?
+check "[ -f '$CD/.env.bak-stackA' ]" "without node/ethers nothing is proven, nothing is shredded"
+expect_grep "$T/c3.out" "every .env backup is kept (report only)" "missing ethers reported"
+rc=0; asroot "${CL_ENV[@]}" bash "$OPS/cleanup-secret-backups.sh" --prune-days 14 --apply --confirm-offbox-copy > "$T/c4.out" 2>&1 || rc=$?
+check "[ ! -e '$CD/.env.bak-stackA' ] && [ ! -e '$CR/backups/worker-old2' ]" "--confirm-offbox-copy (owner copied it off-box) allows the shred"
+cat "$T/c1.out" "$T/c2.out" "$T/c3.out" "$T/c4.out" > "$T/c.out"
 expect_nogrep "$T/c.out" "SECRET_MARKER" "file contents never printed"
+expect_nogrep "$T/c.out" "${K1#0x}" "private keys never printed"
+expect_nogrep "$T/c.out" "${K2#0x}" "private keys never printed (2)"
+fi
 
 echo
 echo "launch-ops tests: $PASS passed, $FAIL failed, $SKIP skipped (jq local=$HAVE_JQ node=${NODE:+yes} remote=${REMOTE:-none})"

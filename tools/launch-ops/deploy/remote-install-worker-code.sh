@@ -6,16 +6,34 @@
 #                      files from STAGING/code, create HALT for the verify window (only
 #                      if absent), restart, verify, auto-rollback on failure
 #   --action rollback  restore code files from BACKUP_DIR (no heartbeat needed)
+#   --action guards    read-only: check the market .env launch guards (below); exit 8
+#                      when the deploy must be refused. Prints counts, never values.
 #   --action test      run the vault-kit tests in STAGING/full (the whole vault-kit tree
 #                      of the ref, so test fixtures in subdirectories exist) or, for an
 #                      old staging dir without full/, in STAGING/code. Nothing live changes.
+#                      Runs niced (nice 19, ionice idle, --test-concurrency=1) and refuses
+#                      (exit 9) while MemAvailable < --min-mem-mb (default 300; 0 = off),
+#                      so it cannot OOM the live workers. Does not need root (off-box runs).
+#
+# Launch guards (checked by --action guards and again by --action install, which
+# refuses with exit 8 before touching anything):
+#   - RENTER_ALLOWLIST in the market .env must be non-empty (soft launch is allowlisted
+#     and fails CLOSED) unless --allow-open-rentals 1 (deploy: ALLOW_OPEN_RENTALS=true);
+#     every entry must be a 0x + 40-hex address, parsed exactly like the worker
+#     (first non-empty line wins, trimmed, surrounding quotes stripped, comma separated);
+#   - numeric worker knobs present in .env must be positive integers (the worker
+#     would otherwise refuse to boot and the verify would roll back);
+#   - install only: MAX_ACTIVE_LEASES_PER_RENTER=2 is appended when absent (atomic,
+#     same mode/owner; the only .env write a deploy ever makes).
 #
 # Every rollback (manual or automatic) does, in order:
 #   1. stop the unit;
 #   2. wait (up to --pending-wait sec) until every state.pendingTxs entry is mined or
 #      dropped. The pre-hardening worker has no tx tracker and would re-send the same
 #      action. Still in flight at the deadline -> the CURRENT code is started again,
-#      nothing is restored, exit 5 (a human decides; --force skips this wait);
+#      nothing is restored, exit 5 (a human decides; --force skips this wait). Once all
+#      are resolved, the resolved entries (and txNonceHints) are pruned from the state
+#      file, so the next deploy's gate T1 does not see them as in flight forever;
 #   3. merge the reservation store (<state>.reservations.json, written by the patched
 #      worker) back into the state file's "reservations", then rename the store to
 #      <store>.rolled-back-<ts>. The pre-hardening worker only reads reservations from
@@ -25,9 +43,12 @@
 #   4. restore the backed-up code files and start the unit; verify.
 #
 # Only code files are ever written: names must match renter-pod-*.mjs,
-# kamibots-rental-config*.mjs or *.env.example. .env* and node_modules are never
-# touched. The state file is only rewritten by the reservation merge of a rollback
-# (atomic, same mode/owner), and HALT only when this script created it.
+# kamibots-rental-config*.mjs or *.env.example. node_modules is never touched, and
+# .env only gets the one guard line above. The state file is only rewritten by a
+# rollback (pendingTxs prune + reservation merge; atomic, same mode/owner), and HALT
+# only when this script created it.
+# RPC for the pendingTxs checks: the market .env YOMINET_RPC (the node the worker
+# sends through; never printed), else YOMINET_RPC_PUBLIC, else the public RPC.
 # Backups hold code files plus state-snapshot/ (state + reservation store, mode 600:
 # they contain operator keys). .env is NOT copied (a deploy never changes it).
 { # one block: safe to pipe into `bash -s`
@@ -35,6 +56,7 @@ set -euo pipefail
 
 ACTION="" MARKET="" STAGING="" BACKUP_DIR="" VERIFY_SEC=120 REQUIRE_HEARTBEAT=1
 VERIFY_HALT=1 FORCE=0 PENDING_WAIT_SEC="${ROLLBACK_PENDING_WAIT_SEC:-300}"
+ALLOW_OPEN_RENTALS="${ALLOW_OPEN_RENTALS:-0}" MIN_MEM_MB="${TEST_MIN_MEM_MB:-300}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --action) ACTION="$2"; shift ;;
@@ -45,25 +67,39 @@ while [ $# -gt 0 ]; do
     --require-heartbeat) REQUIRE_HEARTBEAT="$2"; shift ;;
     --verify-halt) VERIFY_HALT="$2"; shift ;;
     --pending-wait) PENDING_WAIT_SEC="$2"; shift ;;
+    --allow-open-rentals) ALLOW_OPEN_RENTALS="$2"; shift ;;
+    --min-mem-mb) MIN_MEM_MB="$2"; shift ;;
     --force) FORCE=1 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+case "$ALLOW_OPEN_RENTALS" in 1|true) ALLOW_OPEN_RENTALS=1 ;; *) ALLOW_OPEN_RENTALS=0 ;; esac
 
 KAMI_ROOT="${KAMI_ROOT:-/root/kamigotchi/tools}"
 NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
 NODE_MODULES="${NODE_MODULES:-$KAMI_ROOT/vault-kit/node_modules}"
 RPC="${YOMINET_RPC_PUBLIC:-https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz}"
+RPC_SRC="public default"
 PENDING_POLL_SEC="${PENDING_POLL_SEC:-10}"
 TS_NOW=$(date -u +%Y%m%dT%H%M%SZ)
 log() { printf '%s [remote %s] %s\n' "$(date -u +%FT%TZ)" "${MARKET:-test}" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
-[ "$(id -u)" = 0 ] || die "must run as root"
 
 is_code() { case "$1" in renter-pod-*.mjs|kamibots-rental-config*.mjs|*.env.example) return 0 ;; *) return 1 ;; esac; }
 
 if [ "$ACTION" = test ]; then
+  # Off-box runs (deploy-worker-patch.sh --tests local) need no root. On the VPS the
+  # suite runs next to the live workers: memory guard first, then niced + serial.
+  [[ "$MIN_MEM_MB" =~ ^[0-9]+$ ]] || die "--min-mem-mb must be a number"
+  if [ "$MIN_MEM_MB" -gt 0 ] && [ -r /proc/meminfo ]; then
+    avail_mb=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024 ))
+    if [ "$avail_mb" -lt "$MIN_MEM_MB" ]; then
+      log "ERROR: MemAvailable ${avail_mb} MB < ${MIN_MEM_MB} MB: not running the test suite next to the live workers (it peaks ~135 MB RSS). Test off-box instead: deploy-worker-patch.sh --tests local" >&2
+      exit 9
+    fi
+    log "memory guard: MemAvailable ${avail_mb} MB >= ${MIN_MEM_MB} MB"
+  fi
   [ -d "$STAGING/code" ] || die "no staging code at $STAGING/code"
   TESTDIR="$STAGING/code"
   if [ -d "$STAGING/full" ]; then
@@ -77,8 +113,10 @@ if [ "$ACTION" = test ]; then
   fi
   ln -sfn "$NODE_MODULES" "$TESTDIR/node_modules"
   cd "$TESTDIR"
-  log "running: node --test *.test.mjs (in $TESTDIR)"
-  if timeout 600 "$NODE_BIN" --test ./*.test.mjs > "$STAGING/test.log" 2>&1; then
+  LOWPRI=(nice -n 19)
+  command -v ionice >/dev/null 2>&1 && LOWPRI+=(ionice -c 3)
+  log "running: ${LOWPRI[*]} node --test --test-concurrency=1 *.test.mjs (in $TESTDIR)"
+  if timeout 900 "${LOWPRI[@]}" "$NODE_BIN" --test --test-concurrency=1 ./*.test.mjs > "$STAGING/test.log" 2>&1; then
     grep -E '^# (tests|pass|fail|skipped|todo|cancelled)' "$STAGING/test.log" || true
     log "tests PASSED"
     exit 0
@@ -88,18 +126,27 @@ if [ "$ACTION" = test ]; then
   die "tests FAILED (full log: $STAGING/test.log); nothing live was changed"
 fi
 
+[ "$(id -u)" = 0 ] || die "must run as root"
 case "$MARKET" in musu) PORT=8791 ;; vipp) PORT=8792 ;; *) die "--market musu|vipp" ;; esac
 DIR="$KAMI_ROOT/vault-kit-v16-$MARKET"
 UNIT="kami-renter-pod-v16-$MARKET"
 [ -d "$DIR" ] || die "$DIR missing"
 
-env_path() { # KEY default -> absolute path (only this one path-valued key is read from .env)
+env_value() { # KEY -> value as the worker's .env loader reads it (first non-empty line wins,
+  # trimmed, one pair of surrounding quotes stripped). Never printed by callers.
+  [ -r "$DIR/.env" ] || return 0
+  tr -d '\r' < "$DIR/.env" | sed -nE "s/^$1=(.+)\$/\\1/p" | head -1 \
+    | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
+}
+env_path() { # KEY default -> absolute path
   local v=""
-  v=$(grep -E "^$1=" "$DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^ +| +$//g; s/^"(.*)"$/\1/' || true)
+  v=$(env_value "$1")
   [ -n "$v" ] || v="$2"
   case "$v" in /*) ;; *) v="$DIR/$v" ;; esac
   printf '%s' "$v"
 }
+worker_rpc=$(env_value YOMINET_RPC)
+if [ -n "$worker_rpc" ]; then RPC=$worker_rpc; RPC_SRC="worker .env YOMINET_RPC"; fi
 SF=$(env_path WORKER_STATE_FILE "$DIR/renter-pod-worker-state.json")
 HB="$(dirname "$SF")/heartbeat.json"
 STORE=$(env_path RESERVATION_STATE_FILE "$(dirname "$SF")/$(basename "$SF" .json).reservations.json")
@@ -141,6 +188,31 @@ async function rpc(method, params) {
       } catch (e) { open++; console.log(`unknown ${k} ${v.hash} (${String(e.message).slice(0, 80)})`); }
     }
     console.log("PENDING " + open);
+  } else if (op === "prune-resolved") {
+    // Rollback only, with the unit stopped and every entry already resolved: drop the
+    // mined/dropped pendingTxs entries (the pre-hardening worker saves them verbatim,
+    // and gate T1 would count them as in flight forever) and, once none are left,
+    // txNonceHints. An entry that is not provably resolved is kept.
+    const state = readJson(SF);
+    const pend = state.pendingTxs && typeof state.pendingTxs === "object" ? state.pendingTxs : {};
+    let pruned = 0, kept = 0;
+    for (const [k, v] of Object.entries(pend)) {
+      let resolved = false;
+      if (v && v.hash) {
+        try {
+          if (await rpc("eth_getTransactionReceipt", [v.hash])) resolved = true;
+          else if (!(await rpc("eth_getTransactionByHash", [v.hash]))) resolved = true;
+        } catch { resolved = false; }
+      }
+      if (resolved) { delete pend[k]; pruned++; } else kept++;
+    }
+    let hints = 0;
+    if (kept === 0 && state.txNonceHints && typeof state.txNonceHints === "object") {
+      hints = Object.keys(state.txNonceHints).length;
+      delete state.txNonceHints;
+    }
+    if (pruned > 0 || hints > 0) { if ("pendingTxs" in state) state.pendingTxs = pend; writeAtomic(SF, state); }
+    console.log(`PRUNED ${pruned} kept=${kept} txNonceHints=${hints}`);
   } else if (op === "merge") {
     if (!fs.existsSync(STORE)) { console.log("MERGED 0 (no reservation store)"); return; }
     const raw = readJson(STORE);
@@ -164,6 +236,89 @@ async function rpc(method, params) {
 })().catch((e) => { console.error("ERROR " + e.message); process.exit(1); });
 '
 state_op() { OP="$1" SF="$SF" STORE="$STORE" RPC="$RPC" "$NODE_BIN" -e "$STATE_JS"; }
+
+# Launch guards over the market .env, parsed like the worker (renter-pod-worker.mjs
+# loader + renter-pod-config.mjs parseRenterAllowlist). Prints counts and knob
+# numbers only: never an address, token, key or URL.
+GUARD_JS='
+const fs = require("fs");
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const problems = [];
+const env = {};
+if (!fs.existsSync(process.env.ENV_FILE)) problems.push("no .env in the market dir");
+else {
+  const unquote = (v) => {
+    const t = v.trim();
+    return t.length >= 2 && (t[0] === "\"" || t[0] === "\x27") && t[t.length - 1] === t[0] ? t.slice(1, -1).trim() : t;
+  };
+  for (const line of fs.readFileSync(process.env.ENV_FILE, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^([A-Z_]+)=(.+)$/);
+    if (!m || env[m[1]] !== undefined) continue;
+    const v = unquote(m[2]);
+    if (v) env[m[1]] = v;
+  }
+}
+let renters = 0;
+const list = String(env.RENTER_ALLOWLIST ?? "").trim().replace(/^["\x27]|["\x27]$/g, "");
+if (list) {
+  const set = new Set();
+  list.split(",").forEach((entry, i) => {
+    const a = entry.trim();
+    if (!a) return;
+    if (!ADDRESS_RE.test(a)) problems.push(`RENTER_ALLOWLIST entry ${i + 1} is not a 0x+40-hex address (length ${a.length}): the worker refuses to start`);
+    else set.add(a.toLowerCase());
+  });
+  renters = set.size;
+}
+const knobs = { MAX_ACTIVE_LEASES: 1, MAX_ACTIVE_LEASES_PER_RENTER: 1, MAX_LIVE_RESERVATIONS: 1, MAX_RESERVATIONS_PER_RENTER: 1,
+  RESERVATION_TTL_SEC: 1, EXIT_RESERVE_ACTIONS: 1, EXIT_RESUME_HEADROOM_ACTIONS: 0 };
+const shown = [];
+for (const [k, min] of Object.entries(knobs)) {
+  if (env[k] === undefined) continue;
+  const n = Number(env[k]);
+  if (!Number.isSafeInteger(n) || n < min) problems.push(`${k} is not an integer >= ${min}: the worker refuses to start`);
+  else shown.push(`${k}=${n}`);
+}
+console.log("ALLOWLIST " + renters);
+console.log("PER_RENTER " + (env.MAX_ACTIVE_LEASES_PER_RENTER === undefined ? "absent" : "present"));
+console.log("KNOBS " + (shown.join(" ") || "none-set(defaults)"));
+for (const p of problems) console.log("PROBLEM " + p);
+'
+GUARD_PER_RENTER=""
+launch_guards() { # -> 0 ok, 8 refuse (logs why); sets GUARD_PER_RENTER=present|absent
+  local out n p refuse=0 per
+  out=$(ENV_FILE="$DIR/.env" "$NODE_BIN" -e "$GUARD_JS" 2>&1) || { log "launch guards: REFUSE cannot evaluate $DIR/.env"; return 8; }
+  n=$(sed -n 's/^ALLOWLIST //p' <<<"$out"); n=${n:-0}
+  GUARD_PER_RENTER=$(sed -n 's/^PER_RENTER //p' <<<"$out")
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    log "launch guards: REFUSE $p"; refuse=1
+  done < <(sed -n 's/^PROBLEM //p' <<<"$out")
+  if [ "$n" = 0 ]; then
+    if [ "$ALLOW_OPEN_RENTALS" = 1 ]; then
+      log "launch guards: WARNING RENTER_ALLOWLIST is empty or missing and ALLOW_OPEN_RENTALS=true: the keeper will attest quotes for ANY renter (open rentals, not a gated soft launch)"
+    else
+      log "launch guards: REFUSE RENTER_ALLOWLIST is empty or missing in $DIR/.env: the soft launch is allowlisted and fails closed. Append an UNQUOTED line RENTER_ALLOWLIST=0x..,0x.. (the same list as Vercel LEASE_RENTER_ALLOWLIST), or run the deploy with ALLOW_OPEN_RENTALS=true to open rentals on purpose"
+      refuse=1
+    fi
+  fi
+  per="present (kept)"; [ "$GUARD_PER_RENTER" = present ] || per="absent (install appends MAX_ACTIVE_LEASES_PER_RENTER=2)"
+  log "launch guards [$MARKET]: allowlist=$n renter(s) openRentals=$([ "$ALLOW_OPEN_RENTALS" = 1 ] && echo allowed || echo refused) knobs: $(sed -n 's/^KNOBS //p' <<<"$out") perRenterCap=$per"
+  [ "$refuse" = 0 ] || return 8
+}
+append_env_line() { # line: atomic append to the market .env, same mode/owner, value never printed
+  local envf="$DIR/.env" tmp="$DIR/.env.launch-guard-tmp"
+  [ -f "$envf" ] || die "$envf missing"
+  cp -p "$envf" "$tmp"
+  [ -z "$(tail -c1 "$tmp")" ] || printf '\n' >> "$tmp"
+  printf '%s\n' "$1" >> "$tmp"
+  mv -f "$tmp" "$envf"
+}
+
+if [ "$ACTION" = guards ]; then
+  rc=0; launch_guards || rc=$?
+  exit "$rc"
+fi
 
 protected_sums() { # md5 of files that must never change because of a deploy
   ( cd "$DIR" && for f in .env .env.*; do [ -f "$f" ] && md5sum "$f"; done ) 2>/dev/null || true
@@ -268,6 +423,15 @@ rollback_to_backup() {
     log "[LEASE-ALERT] TX_TIMEOUT market=$MARKET unit=$UNIT rollback=blocked reason=pendingTxs-in-flight waitedSec=$PENDING_WAIT_SEC action=current-code-restarted"
     systemctl start "$UNIT"
     return 5
+  else
+    # every entry is mined or dropped and the unit is stopped: prune them, or the old
+    # worker saves them verbatim and every later gate refuses on T1
+    local pr
+    if pr=$(state_op prune-resolved 2>&1); then
+      log "pendingTxs: $pr"
+    else
+      log "pendingTxs prune failed ($pr); continuing (gate T1 resolves hashes over RPC)"
+    fi
   fi
   if ! merge_reservations_back; then
     log "[LEASE-ALERT] STAGE_STUCK market=$MARKET unit=$UNIT rollback=blocked reason=reservation-merge-failed action=current-code-restarted"
@@ -284,6 +448,7 @@ rollback_to_backup() {
 
 if [ "$ACTION" = rollback ]; then
   [ -d "$BACKUP_DIR" ] || die "backup dir $BACKUP_DIR missing"
+  log "pendingTxs RPC: $RPC_SRC"
   # Fail fast (nothing stopped yet) while the patched worker has a tx in flight.
   if [ "$FORCE" != 1 ]; then
     out=$(state_op pending 2>&1) || die "cannot read pendingTxs from the state file: $out"
@@ -304,6 +469,17 @@ fi
 [ "$ACTION" = install ] || die "--action install|rollback|test"
 [ -d "$STAGING/code" ] || die "no staging code at $STAGING/code"
 [ -n "$BACKUP_DIR" ] || die "--backup-dir required"
+
+# Launch guards BEFORE anything is backed up, copied or restarted.
+if ! launch_guards; then
+  log "install refused by the launch guards; nothing was changed"
+  exit 8
+fi
+if [ "$GUARD_PER_RENTER" != present ]; then
+  append_env_line "MAX_ACTIVE_LEASES_PER_RENTER=2"
+  log "appended MAX_ACTIVE_LEASES_PER_RENTER=2 to $DIR/.env (per-renter active-lease cap; mode/owner kept)"
+fi
+log "pendingTxs RPC: $RPC_SRC"
 
 log "backup: code files + state snapshot -> $BACKUP_DIR (mode 700; .env is not copied)"
 mkdir -p "$BACKUP_DIR/state-snapshot"

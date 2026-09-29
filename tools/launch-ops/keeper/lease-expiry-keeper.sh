@@ -18,7 +18,8 @@
 # Safety: flock shared with the gas sponsor (one sender per sponsor nonce; a run
 # that finds the lock taken skips and exits 0), key file must be root-owned mode
 # 600 and is never printed, every tx waits at most TX_WAIT_TIMEOUT_MS. The signer
-# appends the ledger row ("sent") right after broadcasting and BEFORE waiting.
+# signs locally and appends the ledger row ("sent") BEFORE broadcasting
+# (reserve-then-confirm), so a lost RPC reply cannot hide a sent tx.
 # Before sending, --apply resolves unresolved ledger rows and compares the sponsor's
 # pending and latest nonce; while any sponsor tx (keeper or gas sponsor) is still
 # in flight it sends nothing and logs [LEASE-ALERT] TX_TIMEOUT source=expiry-keeper.
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) MODE="dry-run" ;;
     --apply) MODE="apply" ;;
-    -h|--help) sed -n '2,26p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -89,12 +90,19 @@ fmt_ts() { date -u -d "@$1" +%FT%TZ 2>/dev/null || echo "$1"; }
 
 # Signs and sends one legacy (type 0) tx with ethers from the VPS vault-kit.
 # The key is read from SPONSOR_KEY_FILE inside node and never echoed.
+# Reserve-then-confirm (same as lease-gas-sponsor.sh): sign locally, append the
+# "sent" ledger row BEFORE broadcasting (no broadcast when the append fails, exit 4);
+# a lost broadcast reply (exit 5) or receipt timeout (exit 1) leaves the row, so the
+# next run sees the tx in flight instead of sending a duplicate.
 SIGNER_JS='
 const fs = require("fs");
-const { JsonRpcProvider, Wallet } = require("ethers");
+const { FetchRequest, JsonRpcProvider, Wallet, keccak256 } = require("ethers");
+const short = (e) => String((e && (e.shortMessage || e.message)) || e).slice(0, 300);
 (async () => {
   const key = fs.readFileSync(process.env.KEY_FILE, "utf8").trim();
-  const provider = new JsonRpcProvider(process.env.RPC);
+  const request = new FetchRequest(process.env.RPC);
+  request.timeout = Number(process.env.SIGNER_RPC_TIMEOUT_MS || 20000);
+  const provider = new JsonRpcProvider(request, undefined, { batchMaxCount: 1 });
   const wallet = new Wallet(key, provider);
   if (wallet.address.toLowerCase() !== String(process.env.EXPECT_FROM).toLowerCase()) {
     throw new Error("SPONSOR_KEY_FILE does not match SPONSOR_ADDRESS");
@@ -103,26 +111,30 @@ const { JsonRpcProvider, Wallet } = require("ethers");
   if (gasPrice == null) throw new Error("RPC returned no gas price");
   const tx = { to: process.env.TX_TO, data: process.env.TX_DATA || "0x", value: BigInt(process.env.TX_VALUE || "0"), type: 0, gasPrice };
   tx.gasLimit = ((await provider.estimateGas({ ...tx, from: wallet.address })) * 12n) / 10n;
-  const sent = await wallet.sendTransaction(tx);
-  console.log("TXHASH " + sent.hash);
-  // Durable BEFORE waiting: a timeout or a kill still leaves this tx on the ledger,
-  // so the next run sees it in flight instead of sending a duplicate.
+  const populated = await wallet.populateTransaction(tx);
+  const raw = await wallet.signTransaction(populated);
+  const hash = keccak256(raw);
   try {
-    fs.appendFileSync(process.env.LEDGER_FILE, [Math.floor(Date.now() / 1000), process.env.LEDGER_ROW, sent.hash, sent.nonce, "sent"].join("\t") + "\n");
-  } catch (e) { console.error("ledger append failed: " + e.message); }
-  const receipt = await sent.wait(1, Number(process.env.TX_WAIT_TIMEOUT_MS || 120000));
+    fs.appendFileSync(process.env.LEDGER_FILE, [Math.floor(Date.now() / 1000), process.env.LEDGER_ROW, hash, populated.nonce, "sent"].join("\t") + "\n");
+  } catch (e) { console.error("ledger append failed, NOT broadcasting: " + short(e)); process.exit(4); }
+  console.log("TXHASH " + hash);
+  try {
+    await provider.broadcastTransaction(raw);
+  } catch (e) { console.error("broadcast failed or its reply was lost (ledger row kept): " + short(e)); process.exit(5); }
+  const receipt = await provider.waitForTransaction(hash, 1, Number(process.env.TX_WAIT_TIMEOUT_MS || 120000));
+  if (!receipt) throw new Error("no receipt for " + hash);
   console.log("STATUS " + receipt.status + " GASUSED " + receipt.gasUsed);
   if (receipt.status !== 1) process.exit(3);
-})().catch((e) => { console.error("send failed: " + String((e && (e.shortMessage || e.message)) || e).slice(0, 300)); process.exit(1); });
+})().catch((e) => { console.error("send failed: " + short(e)); process.exit(1); });
 '
 send_tx() { # to data value ledger_row -> stdout lines TXHASH/STATUS; non-zero on failure
   KEY_FILE="$SPONSOR_KEY_FILE" EXPECT_FROM="$SPONSOR_ADDRESS" RPC="$RPC" TX_TO="$1" TX_DATA="$2" TX_VALUE="$3" \
-    LEDGER_FILE="$LEDGER" LEDGER_ROW="$4" \
+    LEDGER_FILE="$LEDGER" LEDGER_ROW="$4" SIGNER_RPC_TIMEOUT_MS="${SIGNER_RPC_TIMEOUT_MS:-20000}" \
     TX_WAIT_TIMEOUT_MS="$TX_WAIT_TIMEOUT_MS" NODE_PATH="$ETHERS_NODE_PATH" "$NODE_BIN" -e "$SIGNER_JS"
 }
 
 # Ledger rows (tab separated):
-#   <ts> endLease <market> <token> <hash> <nonce> sent     (written by the signer, before waiting)
+#   <ts> endLease <market> <token> <hash> <nonce> sent     (written by the signer, before broadcasting)
 #   <ts> result   -        -       <hash> -       mined|reverted|dropped
 INFLIGHT=0
 resolve_ledger() { # checks every endLease row without a result row; appends results in --apply
@@ -272,8 +284,10 @@ for c in "${CANDIDATES[@]}"; do
     log "[LEASE-ALERT] TX_TIMEOUT source=expiry-keeper market=$market token=$tok hash=${hash:-none} exit=$rc detail=$(tail -1 <<<"$out" | tr ' ' '_' | cut -c1-160)"
     failed=$((failed + 1))
     sent=$((sent + 1))
-    # broadcast but unconfirmed: stop; the next run resolves it before sending again
-    [ -z "$hash" ] || [ "$rc" = 3 ] || break
+    # Only a mined revert (rc 3: e.g. someone else ended it first) moves on to the next
+    # candidate. Anything else stops the run: a written ledger row may be in flight
+    # (the next run resolves it first), and without a hash the signer itself is failing.
+    [ "$rc" = 3 ] || break
   fi
 done
 log "done: sent=$sent failed=$failed"
