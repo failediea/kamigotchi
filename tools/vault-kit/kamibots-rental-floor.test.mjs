@@ -142,3 +142,74 @@ test("hardening config: floor and safety defaults, overrides and strict parsing"
   assert.throws(() => prefsFloorFromEnv({ PREFS_FLOOR_FARM_INTERVAL_MAX_SEC: "60" }), /between 1200 and 72000/);
   assert.throws(() => hardeningConfigFromEnv({ KAMIBOTS_STOP_MAX_FAILURES: "0" }), /positive integer/);
 });
+
+test("review repro: Harvest & Feed with timer feeding cannot bypass the floor (asserted on the Kamibots body)", async () => {
+  const { startBodyFloorViolations } = await import("./kamibots-rental-config.mjs");
+  const raw = {
+    strategy: "harvestAndFeed",
+    enableFeedInterval: true,
+    feedInterval: 1200 * 60,
+    farmInterval: 1200 * 60,
+    restInterval: 15 * 60,
+    hpThresholdLow: 5,
+  };
+  // Without the floor this is exactly the blind 20h-farm / 15-min-rest / 20h-feed body.
+  const unfloored = buildKamibotsStartBody(pod, 9, normalizeKamibotsPrefs(raw, options));
+  assert.equal(unfloored.config.enableFeedInterval, true);
+  assert.ok(startBodyFloorViolations(unfloored).length >= 3, "the checker catches the unfloored body");
+
+  const { prefs, clamped } = floored(raw);
+  const body = buildKamibotsStartBody(pod, 9, prefs);
+  assert.equal(body.strategyType, "harvestAndFeed");
+  assert.equal(body.config.enableFeedInterval, false, "feeds on HP, not on a 20 h timer");
+  assert.equal("feedInterval" in body.config, false);
+  assert.equal(body.config.feedPercent, 50, "normalize default 50 is above the 45 floor");
+  assert.equal(body.config.farmInterval, 300 * 60);
+  assert.equal(body.config.restInterval, Math.ceil(300 * 60 * 0.51), "rest >= 51% of farm (measured 147/292)");
+  assert.equal(body.config.enableFailsafeRest, true);
+  assert.deepEqual(startBodyFloorViolations(body), []);
+  const fields = clamped.map((row) => row.field);
+  assert.ok(fields.includes("enableFeedInterval") && fields.includes("restInterval") && fields.includes("farmInterval"));
+});
+
+test("fuzz: every floored prefs object produces a Kamibots body inside the floor", async () => {
+  const { startBodyFloorViolations } = await import("./kamibots-rental-config.mjs");
+  let seed = 42;
+  const rand = () => {
+    seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+    return seed / 2 ** 31;
+  };
+  const pick = (values) => values[Math.floor(rand() * values.length)];
+  for (let i = 0; i < 2_000; i++) {
+    const raw = {
+      strategy: pick(["harvestAndRest", "harvestAndFeed", "rest_v3", "bogus", undefined]),
+      risk: pick(["safe", "balanced", "aggressive", "x"]),
+      useHpBasedRest: pick([true, false, 1, 0, undefined]),
+      hpThresholdLow: pick([0, 5, 20, 44, 45, 80, 90, "x"]),
+      hpThresholdHigh: pick([0, 10, 50, 100]),
+      farmInterval: pick([0, 1200, 18_000, 18_001, 72_000, 999_999]),
+      restInterval: pick([0, 900, 5_000, 9_180, 30_000]),
+      enableFeedInterval: pick([true, false, 1, 0, undefined]),
+      feedInterval: pick([1_800, 72_000]),
+      feedPercent: pick([1, 10, 44, 45, 99]),
+      enableFailsafeRest: pick([true, false, undefined]),
+      safetyMargin: pick([0, 2, 5, 10]),
+    };
+    const { prefs } = floored(raw);
+    const body = buildKamibotsStartBody(pod, 1, prefs);
+    assert.deepEqual(startBodyFloorViolations(body), [], JSON.stringify(raw));
+  }
+});
+
+test("floor knobs for Harvest & Feed are env-configurable and change the floor signature", () => {
+  const floor = prefsFloorFromEnv({ PREFS_FLOOR_REST_PCT_OF_FARM: "80", PREFS_FLOOR_FORCE_HP_FEED: "off" });
+  assert.equal(floor.restPctOfFarmMin, 80);
+  assert.equal(floor.forceHpFeed, false);
+  assert.notEqual(leasePrefsFloorSignature(floor), leasePrefsFloorSignature());
+  const { prefs } = floored({ strategy: "harvestAndFeed", enableFeedInterval: true, farmInterval: 6000, restInterval: 900 }, floor);
+  assert.equal(prefs.enableFeedInterval, true, "timer feeding allowed when explicitly switched off");
+  assert.equal(prefs.restInterval, 4800);
+  assert.equal(prefsFloorFromEnv({}).restPctOfFarmMin, 51);
+  assert.equal(prefsFloorFromEnv({}).forceHpFeed, true);
+  assert.throws(() => prefsFloorFromEnv({ PREFS_FLOOR_REST_PCT_OF_FARM: "0" }), /between 1 and 200/);
+});

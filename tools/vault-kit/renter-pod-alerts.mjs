@@ -52,12 +52,25 @@ export function createLeaseAlerter({
   log = (line) => console.error(line),
   now = () => Date.now(),
   minIntervalMs = 300_000,
+  // Buckets are keyed by caller-chosen keys, some of them request-supplied
+  // (RESERVATION_CAP is keyed by renter address). Past this many buckets,
+  // every bucket whose interval has elapsed is dropped: a later alert for it
+  // would have been emitted anyway, so only its suppressed count is lost.
+  maxBuckets = 512,
 } = {}) {
   const lastEmitted = new Map();
   const suppressed = new Map();
-  return function leaseAlert(code, details = {}, { key = "" } = {}) {
+  function evictExpired(at) {
+    for (const [bucket, last] of lastEmitted) {
+      if (at - last < minIntervalMs) continue;
+      lastEmitted.delete(bucket);
+      suppressed.delete(bucket);
+    }
+  }
+  const leaseAlert = function leaseAlert(code, details = {}, { key = "" } = {}) {
     const bucket = `${code}:${key}`;
     const at = now();
+    if (lastEmitted.size >= maxBuckets) evictExpired(at);
     const last = lastEmitted.get(bucket);
     if (last !== undefined && at - last < minIntervalMs) {
       suppressed.set(bucket, (suppressed.get(bucket) ?? 0) + 1);
@@ -69,4 +82,6 @@ export function createLeaseAlerter({
     log(formatLeaseAlert(code, dropped ? { ...details, suppressed: dropped } : details));
     return true;
   };
+  leaseAlert.bucketCount = () => lastEmitted.size;
+  return leaseAlert;
 }

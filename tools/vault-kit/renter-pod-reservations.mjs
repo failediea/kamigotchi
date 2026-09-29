@@ -35,18 +35,88 @@ export function activeJobCount(state) {
   return Object.values(state.jobs ?? {}).filter((job) => !job.returned).length;
 }
 
+/** A Kami listing index as the factory takes it (uint32), or null. */
+export function normalizeTokenIndex(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 && number <= 0xffffffff ? number : null;
+}
+
+/**
+ * An attested reservation can still become a pod until the factory's quote
+ * deadline (block.timestamp > deadline reverts). Legacy entries without a
+ * recorded deadline fall back to the reservation TTL.
+ */
+export function isPendingAttestation(reservation, nowMs, ttlMs) {
+  if (!reservation?.attestedDigest) return false;
+  const deadline = Number(reservation.quoteDeadline);
+  if (deadline > 0) return nowMs <= deadline * 1000;
+  return isLiveReservation(reservation, nowMs, ttlMs);
+}
+
+/**
+ * Concurrency as the chain can actually realise it. Only one lease can exist
+ * per Kami (tokenIndex), so capacity is:
+ *   active: tokens with an unreturned job
+ *   pending: DISTINCT tokens among keeper-attested quotes that can still be
+ *            submitted, excluding tokens already active.
+ * Unattested reservations and repeat quotes for the same listing never count,
+ * so request volume alone cannot exhaust the cap: an attacker is bounded by
+ * the number of real listings they can get quotes for (THR-04 / FE-2).
+ */
+export function leaseCapacity(state, { nowMs, ttlMs }) {
+  const activeTokens = new Set(
+    Object.values(state.jobs ?? {})
+      .filter((job) => !job.returned)
+      .map((job) => Number(job.tokenIndex))
+  );
+  const pendingTokens = new Set();
+  for (const reservation of Object.values(state.reservations ?? {})) {
+    const token = normalizeTokenIndex(reservation?.tokenIndex);
+    if (token === null || activeTokens.has(token)) continue;
+    if (isPendingAttestation(reservation, nowMs, ttlMs)) pendingTokens.add(token);
+  }
+  return { activeTokens, pendingTokens, used: activeTokens.size + pendingTokens.size };
+}
+
+function leaseCapRefusal(capacity, cap) {
+  return {
+    ok: false,
+    status: 429,
+    code: "LEASE_CAP",
+    error: "the market is at its concurrent lease limit; try again later",
+    details: { active: capacity.activeTokens.size, pending: capacity.pendingTokens.size, cap },
+  };
+}
+
+/** True when a lease on `token` would exceed MAX_ACTIVE_LEASES. A token that
+ * is already counted (active or pending) never adds to the total. */
+export function exceedsLeaseCap(capacity, token, cap) {
+  if (token !== null && (capacity.activeTokens.has(token) || capacity.pendingTokens.has(token))) return false;
+  return capacity.used >= cap;
+}
+
 /**
  * Admission control for POST /v1/operator-reservations. Returns
  * { ok: true } or { ok: false, status, code, error }. `code` is the lease alert
  * code to raise (or null for plain client errors).
+ *
+ * The lease cap is enforced authoritatively at attestation (where the quote's
+ * tokenIndex is known). Here it is only an early answer for the UI when the
+ * market is already full of REAL leases/attested quotes; unattested
+ * reservations never count toward it.
  */
-export function admitReservation(state, { renter, nonce, nowMs, policy }) {
+export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, policy }) {
   const normalized = normalizeRenter(renter);
   if (!normalized) {
     return { ok: false, status: 400, code: null, error: "renter address required" };
   }
   if (policy.renterAllowlist && !policy.renterAllowlist.has(normalized)) {
     return { ok: false, status: 403, code: null, error: "renter is not on the soft-launch allowlist" };
+  }
+  const token = normalizeTokenIndex(tokenIndex);
+  if (tokenIndex !== undefined && tokenIndex !== null && token === null) {
+    return { ok: false, status: 400, code: null, error: "invalid tokenIndex" };
   }
   const existing = state.reservations?.[String(nonce ?? "").toLowerCase()];
   if (existing) {
@@ -57,16 +127,31 @@ export function admitReservation(state, { renter, nonce, nowMs, policy }) {
     }
     return { ok: true, existing: true };
   }
+  if (token !== null) {
+    // Early answer only when the listing is named: without it the reserve
+    // cannot tell whether the quote is for an already-counted listing.
+    const capacity = leaseCapacity(state, { nowMs, ttlMs: policy.reservationTtlMs });
+    if (exceedsLeaseCap(capacity, token, policy.maxActiveLeases)) {
+      return leaseCapRefusal(capacity, policy.maxActiveLeases);
+    }
+  }
   const stats = reservationStats(state, { nowMs, ttlMs: policy.reservationTtlMs });
-  const active = activeJobCount(state);
-  if (active + stats.live >= policy.maxActiveLeases) {
-    return {
-      ok: false,
-      status: 429,
-      code: "LEASE_CAP",
-      error: "the market is at its concurrent lease limit; try again later",
-      details: { active, live: stats.live, cap: policy.maxActiveLeases },
-    };
+  if (token !== null && policy.maxReservationsPerListing > 0) {
+    let forListing = 0;
+    for (const reservation of Object.values(state.reservations)) {
+      if (normalizeTokenIndex(reservation.tokenIndex) === token && isLiveReservation(reservation, nowMs, policy.reservationTtlMs)) {
+        forListing++;
+      }
+    }
+    if (forListing >= policy.maxReservationsPerListing) {
+      return {
+        ok: false,
+        status: 429,
+        code: "RESERVATION_CAP",
+        error: "too many checkouts are in progress for this Kami; try again in a few minutes",
+        details: { scope: "listing", tokenIndex: token, live: forListing, cap: policy.maxReservationsPerListing },
+      };
+    }
   }
   if (stats.live >= policy.maxLiveReservations) {
     return {
@@ -87,12 +172,16 @@ export function admitReservation(state, { renter, nonce, nowMs, policy }) {
       details: { scope: "renter", renter: normalized, live: mine, cap: policy.maxReservationsPerRenter },
     };
   }
-  return { ok: true, existing: false, renter: normalized };
+  return { ok: true, existing: false, renter: normalized, tokenIndex: token };
 }
 
-/** Admission control for POST /v1/operator-reservations/attest. */
-export function admitAttestation(reservation, { quoteRenter, policy }) {
-  const renter = normalizeRenter(quoteRenter);
+/**
+ * Admission control for POST /v1/operator-reservations/attest. This is where
+ * the lease cap is authoritative: the quote names its tokenIndex, and the
+ * keeper signature is what lets a pod be created at all.
+ */
+export function admitAttestation(state, reservation, { quote, nowMs, policy }) {
+  const renter = normalizeRenter(quote?.renter);
   if (!renter) return { ok: false, status: 400, code: null, error: "quote renter address required" };
   if (policy.renterAllowlist && !policy.renterAllowlist.has(renter)) {
     return { ok: false, status: 403, code: null, error: "renter is not on the soft-launch allowlist" };
@@ -101,7 +190,17 @@ export function admitAttestation(reservation, { quoteRenter, policy }) {
   if (bound && bound !== renter) {
     return { ok: false, status: 400, code: null, error: "quote renter does not match the reservation" };
   }
-  return { ok: true, renter };
+  const token = normalizeTokenIndex(quote?.tokenIndex);
+  if (token === null) return { ok: false, status: 400, code: null, error: "quote tokenIndex required" };
+  const reservedToken = normalizeTokenIndex(reservation?.tokenIndex);
+  if (reservedToken !== null && reservedToken !== token) {
+    return { ok: false, status: 400, code: null, error: "quote tokenIndex does not match the reservation" };
+  }
+  const capacity = leaseCapacity(state, { nowMs, ttlMs: policy.reservationTtlMs });
+  if (exceedsLeaseCap(capacity, token, policy.maxActiveLeases)) {
+    return leaseCapRefusal(capacity, policy.maxActiveLeases);
+  }
+  return { ok: true, renter, tokenIndex: token };
 }
 
 /**
@@ -196,18 +295,25 @@ export function saveReservationStore(state, file, { write = writeJsonAtomic } = 
   write(file, { version: 1, reservations: state.reservations ?? {} });
 }
 
-const HARDENING_CONTAINERS = ["retiredJobs", "ingestRetry", "pendingTxs"];
+const HARDENING_CONTAINERS = ["retiredJobs", "ingestRetry", "pendingTxs", "txNonceHints"];
 
 /**
- * Serialize job state for disk. Reservations live in their own store, so the
- * state file keeps an always-empty `reservations` map (the key a rolled-back
- * worker expects). The hardening containers are written only when non-empty,
- * so an idle live state file keeps exactly its pre-hardening shape.
+ * Serialize job state for disk. The reservation store is the source of truth
+ * for reservations (a quote request rewrites only that small file), but every
+ * job-state save also MIRRORS the current reservations into the state file's
+ * `reservations` map, exactly where a pre-hardening worker keeps them. Rolling
+ * back to that worker therefore needs no manual merge: its ingest finds the
+ * operator key of any quote that was reserved before the last tick save.
+ * (The mirror can lag the store by one tick; on load the two are merged, and a
+ * mirrored entry the store already dropped is simply pruned again.)
+ *
+ * The hardening containers are written only when non-empty, so an idle live
+ * state file keeps exactly its pre-hardening shape.
  */
 export function stateForDisk(state) {
-  const { reservations: _omit, ...rest } = state;
+  const { reservations = {}, ...rest } = state;
   for (const key of HARDENING_CONTAINERS) {
     if (rest[key] && typeof rest[key] === "object" && !Object.keys(rest[key]).length) delete rest[key];
   }
-  return { ...rest, reservations: {} };
+  return { ...rest, reservations: { ...reservations } };
 }

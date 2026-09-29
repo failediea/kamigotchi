@@ -34,7 +34,37 @@ export const HARDENING_DEFAULTS = Object.freeze({
   PREFS_FLOOR_FARM_INTERVAL_MAX_SEC: LEASE_PREFS_FLOOR.farmIntervalMaxSec,
   PREFS_FLOOR_SAFETY_MARGIN_MIN: LEASE_PREFS_FLOOR.safetyMarginMin,
   PREFS_FLOOR_FEED_PERCENT_MIN: LEASE_PREFS_FLOOR.feedPercentMin,
+  PREFS_FLOOR_REST_PCT_OF_FARM: LEASE_PREFS_FLOOR.restPctOfFarmMin,
+  // Optional per-listing cap on live reservations, applied only when the
+  // quote API sends tokenIndex on reserve. 0 = off: until renter requests are
+  // signed, a per-listing cap is itself a cheap way to lock one listing.
+  MAX_RESERVATIONS_PER_LISTING: 0,
+  // Event ingest reads at most this many blocks per eth_getLogs call and at
+  // most this many calls per tick, so a long outage backlog is caught up in
+  // bounded steps instead of one call that times out forever.
+  LOG_CHUNK_BLOCKS: 5_000,
+  LOG_CHUNKS_PER_TICK: 20,
+  // Returned retired (superseded) jobs are dropped from the state file after
+  // this many days.
+  RETIRED_JOB_RETENTION_DAYS: 30,
 });
+
+/**
+ * How the worker prices (and, for "legacy", sends) its own txs.
+ *   eip1559 (default): txs keep ethers' EIP-1559 fee fields exactly as before;
+ *     gas health and the exit reserve are priced at maxFeePerGas, which is
+ *     what Yominet bills (never below the node gasPrice).
+ *   legacy: txs are sent as type 0 at the node gasPrice, so the cost is exact
+ *     and about half of the eip1559 maxFeePerGas default. Switch only after a
+ *     smoke-loop receipt confirms effectiveGasPrice on the live chain.
+ */
+export const OperatorTxPricing = Object.freeze({ EIP1559: "eip1559", LEGACY: "legacy" });
+
+export function operatorTxPricing(raw) {
+  const value = String(raw ?? "").trim().toLowerCase() || OperatorTxPricing.EIP1559;
+  if (value === OperatorTxPricing.EIP1559 || value === OperatorTxPricing.LEGACY) return value;
+  throw new Error("OPERATOR_TX_PRICING must be eip1559 or legacy");
+}
 
 function boundedInteger(env, name, min, max) {
   const value = positiveIntegerOrZero(env, name);
@@ -75,6 +105,8 @@ export function prefsFloorFromEnv(env = process.env) {
     farmIntervalMaxSec: boundedInteger(env, "PREFS_FLOOR_FARM_INTERVAL_MAX_SEC", 20 * 60, 1200 * 60),
     safetyMarginMin: boundedInteger(env, "PREFS_FLOOR_SAFETY_MARGIN_MIN", 0, 10),
     feedPercentMin: boundedInteger(env, "PREFS_FLOOR_FEED_PERCENT_MIN", 1, 99),
+    restPctOfFarmMin: boundedInteger(env, "PREFS_FLOOR_REST_PCT_OF_FARM", 1, 200),
+    forceHpFeed: parseSwitch(env, "PREFS_FLOOR_FORCE_HP_FEED", true),
   });
 }
 
@@ -124,6 +156,11 @@ export function hardeningConfigFromEnv(env = process.env) {
     kamibotsStopMaxFailures: positiveInteger(env, "KAMIBOTS_STOP_MAX_FAILURES"),
     kamibotsRetryMaxMs: positiveInteger(env, "KAMIBOTS_RETRY_MAX_SEC") * 1000,
     prefsFloor: prefsFloorFromEnv(env),
+    maxReservationsPerListing: positiveIntegerOrZero(env, "MAX_RESERVATIONS_PER_LISTING"),
+    logChunkBlocks: boundedInteger(env, "LOG_CHUNK_BLOCKS", 100, 1_000_000),
+    logChunksPerTick: boundedInteger(env, "LOG_CHUNKS_PER_TICK", 1, 1_000),
+    retiredJobRetentionMs: positiveInteger(env, "RETIRED_JOB_RETENTION_DAYS") * 86_400_000,
+    operatorTxPricing: operatorTxPricing(env.OPERATOR_TX_PRICING),
   };
   // The kamistats quote deadline is 15 minutes. A reservation that expires
   // before its quote can still be submitted would orphan the pod's operator.

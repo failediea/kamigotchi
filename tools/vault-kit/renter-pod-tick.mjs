@@ -60,6 +60,14 @@ export async function runWorkerTick({
   now = () => Date.now(),
   stageStuckAlertMs = 30 * 60_000,
   save = () => {},
+  // Called after ingest, after pruning and after every job. The worker re-arms
+  // its watchdog here, so the watchdog measures time WITHOUT PROGRESS rather
+  // than the length of a whole tick (a slow-but-alive RPC with many jobs made
+  // every tick exceed the limit at the same job, forever).
+  onProgress = () => {},
+  // Rotates the job order each tick, so no job is permanently queued behind
+  // a slow prefix of other jobs.
+  startOffset = 0,
 }) {
   const startedAt = now();
   let ingestOk = true;
@@ -71,22 +79,32 @@ export async function runWorkerTick({
     log(`ingest failed: ${message}`);
     alert(LeaseAlertCode.INGEST_ERROR, { scope: "batch", err: message.slice(0, 200) }, { key: "batch" });
   }
+  onProgress("ingest");
 
   try {
     prune();
   } catch (error) {
     log(`reservation prune failed: ${errorText(error)}`);
   }
+  onProgress("prune");
 
   const common = { txs, alert, log, stageStuckAlertMs };
-  for (const job of Object.values(state.jobs ?? {})) {
-    if (job.returned) continue;
+  for (const job of rotate(Object.values(state.jobs ?? {}).filter((j) => !j.returned), startOffset)) {
     await runJob(job, processJob, { ...common, nowMs: now() });
+    onProgress("job");
   }
-  for (const job of Object.values(state.retiredJobs ?? {})) {
-    if (job.returned) continue;
+  for (const job of rotate(Object.values(state.retiredJobs ?? {}).filter((j) => !j.returned), startOffset)) {
     await runJob(job, processRetiredJob, { ...common, nowMs: now(), label: "retired" });
+    onProgress("retired-job");
   }
   save();
   return { ingestOk, tickMs: now() - startedAt };
+}
+
+/** Round-robin start: element `offset mod n` first, order otherwise kept. */
+export function rotate(items, offset) {
+  const n = items.length;
+  if (n < 2) return items;
+  const start = ((Math.trunc(Number(offset) || 0) % n) + n) % n;
+  return start ? [...items.slice(start), ...items.slice(0, start)] : items;
 }

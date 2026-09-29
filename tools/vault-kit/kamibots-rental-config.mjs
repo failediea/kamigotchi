@@ -110,31 +110,62 @@ export function normalizeKamibotsPrefs(input, options) {
  *   A matching tile is the best case, so a fixed timer above ~300 minutes
  *   harvests past the point where Kamibots itself would stop. With HP-based
  *   rest forced on it only binds Harvest & Feed, which farms on a timer.
+ *
+ * Harvest & Feed is the one strategy Kamibots always runs on TIMERS: its start
+ * body hard-codes useHpBasedRest:false, so the HP-rest floor above never
+ * reaches it. For it the floor instead:
+ * - forceHpFeed: timer feeding (enableFeedInterval) is switched off, so
+ *   Kamibots feeds on HP ("feed below feedPercent% HP", floored at 45). A
+ *   timer feed of once per 20 h was otherwise a renter-controlled kill dial.
+ * - restPctOfFarmMin 51: the rest timer is at least 51% of the farm timer.
+ *   The measured Kamibots cycle rests 147 min per 292 min farmed (50.3%);
+ *   a 300-min farm with the 15-min minimum rest drained HP cycle over cycle.
+ * - failsafe rest stays forced on: if food cannot be used it rests.
+ * startBodyFloorViolations() re-checks the exact body sent to Kamibots.
  */
 export const LEASE_PREFS_FLOOR = Object.freeze({
   hpThresholdLowMin: 45,
   farmIntervalMaxSec: 300 * 60,
   safetyMarginMin: 5,
   feedPercentMin: 45,
+  restPctOfFarmMin: 51,
   forceHpBasedRest: true,
   forceFailsafeRest: true,
+  forceHpFeed: true,
   disallowedRisk: "aggressive",
   replacementRisk: "balanced",
 });
+
+/** Kamibots' own rest timer ceiling (normalizeKamibotsPrefs clamps to it). */
+const REST_INTERVAL_MAX_SEC = 500 * 60;
+
+/** Minimum rest timer for a farm timer under a floor (seconds). */
+export function minRestIntervalSec(farmIntervalSec, floor = LEASE_PREFS_FLOOR) {
+  const pct = Number(floor.restPctOfFarmMin) || 0;
+  return Math.min(REST_INTERVAL_MAX_SEC, Math.ceil((Number(farmIntervalSec) * pct) / 100));
+}
 
 /** Stable identity of a floor. A strategy started under a different floor is
  * restarted without waiting for the restart debounce. */
 export function leasePrefsFloorSignature(floor = LEASE_PREFS_FLOOR) {
   return [
-    "floor1",
+    "floor2",
     floor.hpThresholdLowMin,
     floor.farmIntervalMaxSec,
     floor.safetyMarginMin,
     floor.feedPercentMin,
+    floor.restPctOfFarmMin,
     floor.forceHpBasedRest ? 1 : 0,
     floor.forceFailsafeRest ? 1 : 0,
+    floor.forceHpFeed ? 1 : 0,
     floor.disallowedRisk,
   ].join(":");
+}
+
+/** Whether a prefs object makes Kamibots farm/rest on fixed timers. */
+function runsOnTimers(prefs) {
+  return prefs.strategy === "harvestAndFeed"
+    || (prefs.strategy === "harvestAndRest" && !prefs.useHpBasedRest);
 }
 
 /**
@@ -171,7 +202,56 @@ export function applyLeasePrefsFloor(prefs, floor = LEASE_PREFS_FLOOR) {
   if (Number(next.feedPercent) < floor.feedPercentMin) {
     set("feedPercent", floor.feedPercentMin);
   }
+  if (floor.forceHpFeed && next.strategy === "harvestAndFeed") {
+    set("enableFeedInterval", false);
+  }
+  if (runsOnTimers(next) && floor.restPctOfFarmMin) {
+    const minRest = minRestIntervalSec(next.farmInterval, floor);
+    if (Number(next.restInterval) < minRest) set("restInterval", minRest);
+  }
   return { prefs: next, clamped };
+}
+
+/**
+ * Defense in depth for THR-02: check the EXACT Kamibots start body (what
+ * Kamibots receives) against the floor, independently of how the prefs were
+ * normalized and floored. Returns a list of violations; the worker refuses to
+ * start a strategy whose body has any.
+ */
+export function startBodyFloorViolations(body, floor = LEASE_PREFS_FLOOR) {
+  if (!floor) return [];
+  const config = body?.config ?? {};
+  const violations = [];
+  const need = (ok, what) => {
+    if (!ok) violations.push(what);
+  };
+  if (body?.strategyType === "rest_v3") {
+    const prefs = config.restV3Preferences?.[0] ?? {};
+    need(Number(prefs.safetyMargin) >= floor.safetyMarginMin, `safetyMargin ${prefs.safetyMargin} < ${floor.safetyMarginMin}`);
+    return violations;
+  }
+  const timers = body?.strategyType === "harvestAndFeed" || config.useHpBasedRest !== true;
+  if (body?.strategyType === "harvestAndRest" && floor.forceHpBasedRest) {
+    need(config.useHpBasedRest === true, "harvestAndRest without HP-based rest");
+  }
+  if (config.useHpBasedRest === true) {
+    need(Number(config.hpThresholdLow) >= floor.hpThresholdLowMin, `hpThresholdLow ${config.hpThresholdLow} < ${floor.hpThresholdLowMin}`);
+  }
+  if (timers) {
+    need(Number(config.farmInterval) <= floor.farmIntervalMaxSec, `farmInterval ${config.farmInterval} > ${floor.farmIntervalMaxSec}`);
+    need(
+      Number(config.restInterval) >= minRestIntervalSec(config.farmInterval, floor),
+      `restInterval ${config.restInterval} < ${minRestIntervalSec(config.farmInterval, floor)}`
+    );
+  }
+  if (body?.strategyType === "harvestAndFeed") {
+    if (floor.forceHpFeed) need(config.enableFeedInterval === false, "harvestAndFeed feeds on a timer, not on HP");
+    if (config.enableFeedInterval === false) {
+      need(Number(config.feedPercent) >= floor.feedPercentMin, `feedPercent ${config.feedPercent} < ${floor.feedPercentMin}`);
+    }
+    if (floor.forceFailsafeRest) need(config.enableFailsafeRest === true, "harvestAndFeed without failsafe rest");
+  }
+  return violations;
 }
 
 /**

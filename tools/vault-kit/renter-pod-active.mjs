@@ -1,5 +1,6 @@
 import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
 import { exitReservePlan } from "./renter-pod-safety.mjs";
+import { StopOutcome } from "./renter-pod-strategy.mjs";
 
 export const ActiveAction = Object.freeze({
   END_LEASE: "end-lease",
@@ -85,25 +86,39 @@ export async function advanceActiveLease({
     }
     alert(LeaseAlertCode.ESCROW_LOW, { ...details, reason: "exit-reserve" }, { key: `escrow:${alertKey}` });
 
-    await strategy.stopForOnChain(job, { force: true });
-    try {
-      // Pull whatever escrow is left into the operator: in terminal stages the
-      // deployed v16 factory cannot pull, so gas must be on the EOA by now.
-      await ensureGas({ required: false });
-    } catch (error) {
-      log(`#${job.tokenIndex}: exit-reserve escrow pull failed (${error?.message ?? error}); trying the stop anyway`);
-    }
+    const stop = await strategy.stopForOnChain(job, { force: true });
+    // BYPASSED: Kamibots did not confirm the stop, so the strategy may still be
+    // running with the operator key. Escrow in the factory is out of its
+    // reach; escrow pulled onto the EOA is not. Then pull just in time, one
+    // exit tx at a time, instead of handing it the whole remainder.
+    const strategyMayRun = stop === StopOutcome.BYPASSED;
+    const pull = async (targetActions) => {
+      try {
+        await ensureGas({ required: false, ...(targetActions ? { targetActions } : {}) });
+      } catch (error) {
+        log(`#${job.tokenIndex}: exit-reserve escrow pull failed (${error?.message ?? error}); trying the stop anyway`);
+      }
+    };
+    // Stop confirmed: pull whatever escrow is left into the operator now - in
+    // terminal stages the deployed v16 factory cannot pull, so gas must be on
+    // the EOA before the lease leaves stage 3.
+    if (!strategyMayRun) await pull(null);
     if (expired) {
+      if (strategyMayRun) await pull(1);
       await endLease();
       return ActiveAction.END_LEASE;
     }
     if (listing.ending) {
+      // The ending's next tx (harvest stop or finalizeMarketLease) plus the
+      // KamiSend home after finalize, which stage 5 can no longer pull for.
+      if (strategyMayRun) await pull(2);
       await advanceEnding();
       return ActiveAction.ENDING;
     }
     const kamiState = await readKamiState();
     if (observeKami(kamiState, "exit-reserve")) return ActiveAction.DEAD;
     if (kamiState === "HARVESTING") {
+      if (strategyMayRun) await pull(1);
       await stopHarvest();
       return ActiveAction.EXIT_STOP_HARVEST;
     }

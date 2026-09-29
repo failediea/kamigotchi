@@ -103,6 +103,33 @@ export function exitReservePlan({
 }
 
 /**
+ * Fee per gas the worker's own txs are actually billed at (THR-03 pricing).
+ * Yominet bills an EIP-1559 tx at its maxFeePerGas, not at the base fee
+ * (measured over 1,937 txs; the base fee is a flat 2.5 Mwei), and ethers sets
+ * maxFeePerGas = 2 x baseFee + priority. Pricing gas health and the exit
+ * reserve at gasPrice therefore bought about half the actions it claimed.
+ *   pricing "eip1559": max(maxFeePerGas, gasPrice)  (txs keep ethers defaults)
+ *   pricing "legacy":  gasPrice                      (txs are sent as type 0)
+ */
+export function operatorFeePerGas(feeData, pricing = "eip1559") {
+  const gasPrice = feeData?.gasPrice;
+  if (gasPrice == null) throw new Error("RPC returned no gas price");
+  if (pricing === "legacy") return BigInt(gasPrice);
+  const maxFee = feeData.maxFeePerGas;
+  return maxFee != null && BigInt(maxFee) > BigInt(gasPrice) ? BigInt(maxFee) : BigInt(gasPrice);
+}
+
+/**
+ * Gas units billed for an action measured at `gasUnits`: Yominet refunds only
+ * 90% of UNUSED gas, so a tx pays gasUsed + 10% of (gasLimit - gasUsed). The
+ * extra 10% of gasUnits covers a gas limit up to twice the gas used.
+ */
+export function billedActionGas(gasUnits) {
+  const units = BigInt(gasUnits);
+  return units + units / 10n;
+}
+
+/**
  * THR-03 cadence guard for a prefs change mid-lease. A change that raises the
  * scheduled action rate is refused when the remaining term at the new rate
  * plus the exit reserve is more than balance + escrow can pay. Changes that

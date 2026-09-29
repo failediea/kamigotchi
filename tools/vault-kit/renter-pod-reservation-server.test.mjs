@@ -12,7 +12,7 @@ const DIGEST = `0x${"cd".repeat(32)}`;
 const nonce = (n) => `0x${n.toString(16).padStart(64, "0")}`;
 const renter = (n) => `0x${n.toString(16).padStart(40, "0")}`;
 
-async function harness({ env = {}, healthy = true, jobs = {} } = {}) {
+async function harness({ env = {}, healthy = true, jobs = {}, listingExists } = {}) {
   const state = { jobs, reservations: {} };
   const events = [];
   const alertLines = [];
@@ -29,6 +29,7 @@ async function harness({ env = {}, healthy = true, jobs = {} } = {}) {
     saveReservations: () => events.push(["save", JSON.parse(JSON.stringify(state.reservations))]),
     alert: createLeaseAlerter({ log: (line) => alertLines.push(line), minIntervalMs: 60_000 }),
     log: () => {},
+    ...(listingExists ? { listingExists } : {}),
   });
   const server = createServer(handler);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -130,14 +131,38 @@ test("429 + one rate-limited RESERVATION_CAP alert line at the per-renter cap", 
   }
 });
 
-test("429 LEASE_CAP when active leases plus live reservations reach MAX_ACTIVE_LEASES", async () => {
-  const h = await harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 5: { returned: false } } });
+test("429 LEASE_CAP at attest when active leases plus distinct attested listings reach MAX_ACTIVE_LEASES", async () => {
+  const h = await harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 5: { tokenIndex: 5, returned: false } } });
   try {
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) })).status, 201);
-    const refused = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2) });
+    const deadline = String(Math.floor(Date.now() / 1000) + 900);
+    const quoteFor = async (n, tokenIndex) => {
+      const { body } = await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) });
+      return h.post(ATTEST_PATH, { quote: { nonce: nonce(n), renter: renter(n), operator: body.operator, tokenIndex, deadline } });
+    };
+    // Reserving is never refused for lease capacity by unattested requests.
+    for (let n = 10; n < 20; n++) assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) })).status, 201);
+    assert.equal((await quoteFor(1, 8)).status, 200, "listing #8 takes the second slot");
+    assert.equal((await quoteFor(2, 8)).status, 200, "a second quote for #8 adds nothing");
+    const refused = await quoteFor(3, 9);
     assert.equal(refused.status, 429);
     assert.equal(refused.body.code, "LEASE_CAP");
-    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] LEASE_CAP active=1 live=1 cap=2/);
+    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] LEASE_CAP active=1 pending=1 cap=2/);
+    assert.equal(h.state.reservations[nonce(3)].attestedDigest, undefined, "nothing signed");
+  } finally {
+    await h.close();
+  }
+});
+
+test("attest refuses a tokenIndex that is not a real listing", async () => {
+  const h = await harness({ listingExists: async (tokenIndex) => tokenIndex === 8 });
+  try {
+    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
+    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 99 };
+    const refused = await h.post(ATTEST_PATH, { quote });
+    assert.equal(refused.status, 400);
+    assert.match(refused.body.error, /unknown listing/);
+    assert.equal((await h.post(ATTEST_PATH, { quote: { ...quote, tokenIndex: 8 } })).status, 200);
+    assert.equal(h.state.reservations[nonce(1)].tokenIndex, 8);
   } finally {
     await h.close();
   }
@@ -147,7 +172,7 @@ test("attest: signs the digest, records the quote deadline, and enforces renter 
   const h = await harness();
   try {
     const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, deadline: "1790000900" };
+    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 4, deadline: "1790000900" };
     const signed = await h.post(ATTEST_PATH, { quote });
     assert.equal(signed.status, 200);
     assert.equal(signed.body.keeperSignature, `sig(${DIGEST})`);
@@ -168,7 +193,7 @@ test("attest refuses a renter removed from the allowlist after reserving (403)",
   const h = await harness({ env: { RENTER_ALLOWLIST: renter(1) } });
   try {
     h.state.reservations[nonce(1)] = { operator: renter(77), operatorKey: "0x00", createdAt: Date.now(), renter: renter(2) };
-    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(2), operator: renter(77) } });
+    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(2), operator: renter(77), tokenIndex: 4 } });
     assert.equal(refused.status, 403);
   } finally {
     await h.close();
@@ -184,7 +209,7 @@ test("an unattested reservation past its TTL is never signed", async () => {
       createdAt: Date.now() - 21 * 60_000,
       renter: renter(1),
     };
-    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: renter(77) } });
+    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: renter(77), tokenIndex: 4 } });
     assert.equal(refused.status, 400);
     assert.equal(h.state.reservations[nonce(1)].attestedDigest, undefined);
   } finally {

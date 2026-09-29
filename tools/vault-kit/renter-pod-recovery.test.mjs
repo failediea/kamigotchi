@@ -77,8 +77,10 @@ test("terminal dust return never hard-requires a full action of operator gas", (
 test("uses the keeper after the stage-four operator returns its gas", () => {
   assert.match(
     workerSource,
-    /returnUnusedOperatorGas[\s\S]+factory\.connect\(keeper\)\.finalizePreparingCancellation/
+    /returnUnusedOperatorGas[\s\S]+keeperTx\(job, "finalizePreparingCancellation", 4\)/
   );
+  // keeperTx signs with the durable keeper (and re-reads the request first).
+  assert.match(workerSource, /function keeperTx\(job, method, expectedStage\) \{\s+return sendTx\(job, method, keeper, factory, method/);
 });
 
 test("recovers a finalized lease after local state loss", () => {

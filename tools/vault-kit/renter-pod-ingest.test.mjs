@@ -300,3 +300,30 @@ test("operator keys differ per pod so a retired job never signs for the live one
   assert.equal(new Wallet(liveKey).address, b.operator);
   assert.equal(new Wallet(retiredKey).address, a.operator);
 });
+
+test("keeper preflight: aborts when the request moved to another pod or stage", async () => {
+  const { assertRequestStillOurs, IngestConflictError } = await import("./renter-pod-ingest.mjs");
+  const job = { tokenIndex: 7, pod: "0x00000000000000000000000000000000000000Aa" };
+  assert.doesNotThrow(() => assertRequestStillOurs(job, { pod: "0x00000000000000000000000000000000000000aa", stage: 1n }, 1));
+  assert.throws(
+    () => assertRequestStillOurs(job, { pod: "0x00000000000000000000000000000000000000bb", stage: 1n }, 1, "markLeasePreparing"),
+    (error) => error instanceof IngestConflictError && /markLeasePreparing for Kami #7 aborted: the factory request now belongs to pod/.test(error.message)
+  );
+  assert.throws(() => assertRequestStillOurs(job, { pod: job.pod, stage: 0n }, 2), /stage is 0, expected 2/);
+});
+
+test("returned retired jobs are dropped after the retention window, never while returning", async () => {
+  const { pruneRetiredJobs } = await import("./renter-pod-ingest.mjs");
+  const day = 86_400_000;
+  const state = {
+    retiredJobs: {
+      "1:0xa": { returned: true, returnedAt: 0 },
+      "2:0xb": { returned: true, returnedAt: 20 * day },
+      "3:0xc": { returned: false },
+      "4:0xd": { returned: true },
+    },
+  };
+  assert.equal(pruneRetiredJobs(state, { nowMs: 31 * day, retentionMs: 30 * day }), 1);
+  assert.deepEqual(Object.keys(state.retiredJobs), ["2:0xb", "3:0xc", "4:0xd"]);
+  assert.equal(state.retiredJobs["4:0xd"].returnedAt, 31 * day, "legacy entries start aging now");
+});

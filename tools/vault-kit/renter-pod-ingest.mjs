@@ -240,3 +240,48 @@ export function requestBelongsToOtherPod(job, request) {
   if (stage === 0) return false;
   return lower(request.pod) !== lower(job.pod);
 }
+
+/**
+ * TOCTOU guard for keeper-signed factory calls. The factory keys keeper calls
+ * (markLeasePreparing, routePreparedKami, activateProvisionedLease,
+ * recoverPreparingFromHub, finalize*) by tokenIndex and checks only the stage,
+ * not the pod. processJob reads requests(token) once and then may spend
+ * minutes walking; if the renter cancels and re-rents in that window, the
+ * keeper call would advance the NEWER request, which this job never
+ * provisioned. Re-read the request immediately before signing and abort
+ * unless it is still this job's pod at the expected stage.
+ */
+export function assertRequestStillOurs(job, request, expectedStage, label = "keeper call") {
+  const stage = Number(request?.stage ?? 0);
+  if (lower(request?.pod) !== lower(job.pod)) {
+    throw new IngestConflictError(
+      `${label} for Kami #${job.tokenIndex} aborted: the factory request now belongs to pod ${request?.pod}, not ${job.pod}`
+    );
+  }
+  if (stage !== Number(expectedStage)) {
+    throw new IngestConflictError(
+      `${label} for Kami #${job.tokenIndex} aborted: request stage is ${stage}, expected ${expectedStage}`
+    );
+  }
+}
+
+/**
+ * Drop returned retired jobs older than the retention window, so superseded
+ * pods do not accumulate in (and get rewritten with) the state file forever.
+ * Retired jobs still bringing a Kami home are never dropped. Returns the count.
+ */
+export function pruneRetiredJobs(state, { nowMs, retentionMs }) {
+  let removed = 0;
+  for (const [key, job] of Object.entries(state.retiredJobs ?? {})) {
+    if (!job.returned) continue;
+    if (job.returnedAt == null) {
+      // Stamp jobs returned before this field existed; they age from now.
+      job.returnedAt = nowMs;
+      continue;
+    }
+    if (nowMs - Number(job.returnedAt) < retentionMs) continue;
+    delete state.retiredJobs[key];
+    removed++;
+  }
+  return removed;
+}

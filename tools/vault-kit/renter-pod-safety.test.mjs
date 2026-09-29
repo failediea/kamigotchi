@@ -98,3 +98,25 @@ test("Kamibots backoff doubles from 30s and caps", () => {
   assert.equal(kamibotsBackingOff(record, 31_000), false);
   assert.equal(kamibotsBackingOff(undefined, 0), false);
 });
+
+test("operator gas is priced at what Yominet bills: maxFeePerGas for EIP-1559, gasPrice for legacy", async () => {
+  const { billedActionGas, operatorFeePerGas } = await import("./renter-pod-safety.mjs");
+  const feeData = { gasPrice: 2_500_000n, maxFeePerGas: 5_000_000n };
+  assert.equal(operatorFeePerGas(feeData), 5_000_000n, "2 x base fee, as ethers sends it");
+  assert.equal(operatorFeePerGas(feeData, "legacy"), 2_500_000n);
+  assert.equal(operatorFeePerGas({ gasPrice: 2_500_000n, maxFeePerGas: null }), 2_500_000n, "no 1559 data: legacy tx");
+  assert.equal(operatorFeePerGas({ gasPrice: 3n, maxFeePerGas: 2n }), 3n, "never below the node gas price");
+  assert.throws(() => operatorFeePerGas({ gasPrice: null }), /no gas price/);
+  assert.equal(billedActionGas(1_700_000n), 1_870_000n);
+  // The review's case: 3 reserved actions priced at gasPrice funded ~1.5 real
+  // EIP-1559 actions. Priced at the billed fee they fund 3.
+  const plan = exitReservePlan({
+    balance: 0n,
+    escrow: 0n,
+    gasPrice: operatorFeePerGas(feeData),
+    actionGas: billedActionGas(1_700_000n),
+    exitReserveActions: 3,
+  });
+  const realActionCost = (1_611_833n + (1_870_000n - 1_611_833n) / 10n) * 5_000_000n;
+  assert.ok(plan.reserveWei >= realActionCost * 3n);
+});

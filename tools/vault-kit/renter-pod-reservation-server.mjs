@@ -40,6 +40,14 @@ function writeJson(response, status, body) {
  *   403 renter not allowlisted, 429 reservation or lease cap reached,
  *   503 worker stale or halted (heartbeat/ingest older than the limit).
  *
+ * Request bodies: reserve {market, factory, nonce, renter, tokenIndex?};
+ * attest {market, factory, quote} where quote.tokenIndex is REQUIRED.
+ * LEASE_CAP is decided at attest, counting active leases plus DISTINCT
+ * listings with a keeper-attested quote still inside its deadline, so repeat
+ * or unauthenticated quote requests cannot fill it. tokenIndex on reserve is
+ * optional: when sent, the reserve answers LEASE_CAP early and the optional
+ * per-listing cap (MAX_RESERVATIONS_PER_LISTING) applies.
+ *
  * Reservations are persisted with saveReservations() (small separate file,
  * atomic) BEFORE the operator address is returned, so a crash can never hand
  * out an operator whose key was not written down.
@@ -58,6 +66,8 @@ export function createReservationHandler({
   log = (line) => console.error(line),
   now = () => Date.now(),
   walletFactory,
+  // Worker: market.listings(tokenIndex).owner is non-zero.
+  listingExists = async () => true,
 }) {
   return async function handleReservationRequest(request, response) {
     try {
@@ -83,18 +93,33 @@ export function createReservationHandler({
         return;
       }
 
+      const refuse = (admission) => {
+        if (admission.code) {
+          const scope = admission.details?.scope;
+          alert(
+            LeaseAlertCode[admission.code],
+            { ...(admission.details ?? {}), market: String(market).slice(0, 10) },
+            {
+              key: scope === "renter"
+                ? `renter:${admission.details.renter}`
+                : scope === "listing" ? `listing:${admission.details.tokenIndex}` : admission.code,
+            }
+          );
+        }
+        writeJson(response, admission.status, { error: admission.error, ...(admission.code ? { code: admission.code } : {}) });
+      };
+
       if (request.url === RESERVE_PATH) {
         const nowMs = now();
-        const admission = admitReservation(state, { renter: body.renter, nonce: body.nonce, nowMs, policy });
+        const admission = admitReservation(state, {
+          renter: body.renter,
+          nonce: body.nonce,
+          tokenIndex: body.tokenIndex,
+          nowMs,
+          policy,
+        });
         if (!admission.ok) {
-          if (admission.code) {
-            alert(
-              LeaseAlertCode[admission.code],
-              { ...(admission.details ?? {}), market: String(market).slice(0, 10) },
-              { key: admission.details?.scope === "renter" ? `renter:${admission.details.renter}` : admission.code }
-            );
-          }
-          writeJson(response, admission.status, { error: admission.error, ...(admission.code ? { code: admission.code } : {}) });
+          refuse(admission);
           return;
         }
         const reservation = reserveRandomOperator(state, String(body.nonce), {
@@ -102,7 +127,12 @@ export function createReservationHandler({
           renter: admission.existing ? undefined : admission.renter,
           ...(walletFactory ? { walletFactory } : {}),
         });
-        if (!admission.existing) saveReservations();
+        if (!admission.existing) {
+          if (admission.tokenIndex !== null && admission.tokenIndex !== undefined) {
+            state.reservations[String(body.nonce).toLowerCase()].tokenIndex = admission.tokenIndex;
+          }
+          saveReservations();
+        }
         writeJson(response, 201, { operator: reservation.operator });
         return;
       }
@@ -118,9 +148,15 @@ export function createReservationHandler({
         // cap and may be pruned at any moment; never sign a quote against it.
         throw new Error("operator reservation expired before attestation");
       }
-      const admission = admitAttestation(reservation, { quoteRenter: quote.renter, policy });
+      const admission = admitAttestation(state, reservation, { quote, nowMs: now(), policy });
       if (!admission.ok) {
-        writeJson(response, admission.status, { error: admission.error });
+        refuse(admission);
+        return;
+      }
+      // Pending leases are counted per listing, so the listing must be real:
+      // a made-up tokenIndex must not be able to occupy lease capacity.
+      if (!(await listingExists(admission.tokenIndex))) {
+        writeJson(response, 400, { error: "unknown listing" });
         return;
       }
       const digest = await quoteDigest(quote);
@@ -128,6 +164,7 @@ export function createReservationHandler({
       const deadline = Number(quote.deadline);
       if (Number.isSafeInteger(deadline) && deadline > 0) reservation.quoteDeadline = deadline;
       reservation.renter ??= admission.renter;
+      reservation.tokenIndex = admission.tokenIndex;
       saveReservations();
       writeJson(response, 200, { keeperSignature: signDigest(digest) });
     } catch (error) {

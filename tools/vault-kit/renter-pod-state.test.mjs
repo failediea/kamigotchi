@@ -96,7 +96,9 @@ test("legacy state with embedded reservations migrates them to the store (store 
     const store = JSON.parse(readFileSync(reservationFile, "utf8"));
     assert.equal(store.reservations[nonce].operatorKey, wallet.privateKey);
     const stateOnDisk = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert.deepEqual(stateOnDisk.reservations, {}, "keys no longer rewritten with job state");
+    // Mirrored so a rollback to the pre-hardening worker needs no manual
+    // merge; the reservation store stays the source of truth.
+    assert.deepEqual(stateOnDisk.reservations, store.reservations, "mirrored for rollback");
     assert.deepEqual(stateOnDisk.jobs, legacy.jobs);
 
     // Restart after migration keeps the reservation.

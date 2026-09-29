@@ -114,3 +114,43 @@ test("a DEAD Kami in an active lease is alerted, its strategy stopped, and nothi
   assert.match(h.lines[0], /^\[LEASE-ALERT\] DEAD_KAMI token=5846 market=0xmarket stage=3 action=active/);
   assert.ok(h.job.dead);
 });
+
+test("stop only BYPASSED (Kamibots may still run): no bulk pull, one action just in time per exit tx", async () => {
+  const pulls = [];
+  const setup = (opts) => {
+    const h = harness(opts);
+    h.args.strategy.stopForOnChain = async () => "bypassed";
+    h.args.ensureGas = async (options) => {
+      pulls.push(options);
+      h.calls.push(`ensureGas:${options.required}:${options.targetActions ?? "all"}`);
+    };
+    return h;
+  };
+  const harvesting = setup({ balance: ACTION * 2n, escrow: ACTION * 1n });
+  assert.equal(await advanceActiveLease(harvesting.args), ActiveAction.EXIT_STOP_HARVEST);
+  assert.deepEqual(harvesting.calls, ["readState", "ensureGas:false:1", "stopHarvest"]);
+
+  const expired = setup({ balance: ACTION * 2n, escrow: ACTION * 1n, listing: { leaseEnd: NOW - 1 } });
+  assert.equal(await advanceActiveLease(expired.args), ActiveAction.END_LEASE);
+  assert.deepEqual(expired.calls, ["ensureGas:false:1", "endLease"]);
+
+  const ending = setup({ balance: ACTION * 2n, escrow: ACTION * 1n, listing: { ending: true } });
+  assert.equal(await advanceActiveLease(ending.args), ActiveAction.ENDING);
+  assert.deepEqual(ending.calls, ["ensureGas:false:2", "advanceEnding"], "finalize + the KamiSend home");
+
+  const resting = setup({ balance: ACTION * 2n, escrow: ACTION * 1n, kamiState: "RESTING" });
+  assert.equal(await advanceActiveLease(resting.args), ActiveAction.EXIT_HOLD);
+  assert.deepEqual(resting.calls, ["readState"], "nothing to send: nothing pulled onto the shared EOA");
+  assert.ok(pulls.every((options) => options.required === false && options.targetActions));
+});
+
+test("stop confirmed: the remaining escrow is pulled in full, as before", async () => {
+  for (const outcome of ["stopped", "none"]) {
+    const h = harness({ balance: ACTION * 2n, escrow: ACTION * 1n });
+    h.args.strategy.stopForOnChain = async () => outcome;
+    const seen = [];
+    h.args.ensureGas = async (options) => seen.push(options);
+    await advanceActiveLease(h.args);
+    assert.deepEqual(seen, [{ required: false }], outcome);
+  }
+});

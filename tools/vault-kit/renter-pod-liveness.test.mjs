@@ -84,6 +84,62 @@ test("tick watchdog fires once when a tick overruns, never for a finished tick",
   assert.deepEqual(stalls, [{ elapsedMs: 600_001, limitMs: 600_000 }]);
 });
 
+test("watchdog measures time without progress: a long tick that keeps finishing jobs is never killed", () => {
+  let clock = 0;
+  const stalls = [];
+  const watchdog = createTickWatchdog({ limitMs: 600_000, now: () => clock, onStall: (info) => stalls.push(info) });
+  watchdog.begin();
+  // 20 slow jobs at 500 s each: a 10,000 s tick, but progress every 500 s.
+  for (let i = 0; i < 20; i++) {
+    clock += 500_000;
+    assert.equal(watchdog.check(), false);
+    watchdog.progress();
+  }
+  assert.equal(stalls.length, 0);
+  // One job that truly hangs past the limit still trips it.
+  clock += 600_001;
+  assert.equal(watchdog.check(), true);
+  watchdog.progress();
+  assert.equal(watchdog.check(), false, "fires once; progress after firing does not re-arm");
+});
+
+test("durable atomic write fsyncs the temp file before the rename, then the directory", () => {
+  const calls = [];
+  const fakeFs = {
+    openSync: (path, flags) => {
+      calls.push(["open", path, flags]);
+      return path.endsWith(".tmp") ? 11 : 12;
+    },
+    writeFileSync: (target) => calls.push(["write", target]),
+    fsyncSync: (fd) => calls.push(["fsync", fd]),
+    closeSync: (fd) => calls.push(["close", fd]),
+    chmodSync: (path) => calls.push(["chmod", path]),
+    renameSync: (from, to) => calls.push(["rename", from, to]),
+  };
+  writeJsonAtomic("/d/state.json", { a: 1 }, { fs: fakeFs });
+  assert.deepEqual(calls.map((c) => c[0]), ["open", "write", "fsync", "close", "chmod", "rename", "open", "fsync", "close"]);
+  assert.deepEqual(calls[2], ["fsync", 11], "file data synced before rename");
+  assert.deepEqual(calls[6], ["open", "/d", "r"], "then the directory entry");
+
+  const quick = [];
+  writeJsonAtomic("/d/heartbeat.json", {}, { durable: false, fs: { ...fakeFs, writeFileSync: (t) => quick.push(t), fsyncSync: () => assert.fail("no fsync") } });
+  assert.deepEqual(quick, ["/d/heartbeat.json.tmp"]);
+});
+
+test("durable atomic write works on a real directory", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-live-"));
+  try {
+    const file = join(dir, "state.json");
+    writeJsonAtomic(file, { v: 1 });
+    writeJsonAtomic(file, { v: 2 });
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { v: 2 });
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(dir), ["state.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("fetchWithTimeout aborts a hung request", async () => {
   const hung = (_url, init) =>
     new Promise((_resolve, reject) => {

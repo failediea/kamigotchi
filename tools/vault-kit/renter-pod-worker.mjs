@@ -24,10 +24,13 @@
  *   ALERT_MIN_INTERVAL_SEC, STAGE_STUCK_ALERT_SEC,
  *   RESERVATION_STATE_FILE (default <state>.reservations.json next to the
  *   state file), WORKER_HALT_FILE (default HALT next to the state file; while
- *   it exists the reservation server answers 503).
+ *   it exists the reservation server answers 503), MAX_RESERVATIONS_PER_LISTING,
+ *   LOG_CHUNK_BLOCKS, LOG_CHUNKS_PER_TICK, OPERATOR_TX_PRICING (eip1559|legacy),
+ *   RETIRED_JOB_RETENTION_DAYS.
  * Lease safety (THR-02/03/10; defaults in renter-pod-config.mjs):
  *   PREFS_FLOOR, PREFS_FLOOR_HP_LOW_MIN, PREFS_FLOOR_FARM_INTERVAL_MAX_SEC,
  *   PREFS_FLOOR_SAFETY_MARGIN_MIN, PREFS_FLOOR_FEED_PERCENT_MIN,
+ *   PREFS_FLOOR_REST_PCT_OF_FARM, PREFS_FLOOR_FORCE_HP_FEED,
  *   EXIT_RESERVE_ACTIONS, EXIT_RESUME_HEADROOM_ACTIONS, PREFS_CADENCE_GUARD,
  *   STRATEGY_RESTART_MIN_INTERVAL_SEC, KAMIBOTS_STOP_MAX_FAILURES,
  *   KAMIBOTS_RETRY_MAX_SEC.
@@ -42,15 +45,18 @@ import {
   FetchRequest,
   JsonRpcProvider,
   Wallet,
+  ZeroAddress,
   id as keccakId,
   solidityPackedKeccak256,
 } from "ethers";
 import { LeaseAlertCode, createLeaseAlerter } from "./renter-pod-alerts.mjs";
-import { hardeningConfigFromEnv } from "./renter-pod-config.mjs";
+import { OperatorTxPricing, hardeningConfigFromEnv } from "./renter-pod-config.mjs";
 import {
   RetiredJobAction,
+  assertRequestStillOurs,
   ingestRenterPodRecords,
   protectedReservationNonces,
+  pruneRetiredJobs,
   renterPodEventRecord,
   requestBelongsToOtherPod,
   retiredJobAction,
@@ -76,9 +82,10 @@ import { createTxTracker } from "./renter-pod-tx.mjs";
 import {
   buildKamibotsStartBody,
   normalizeKamibotsPrefs,
+  startBodyFloorViolations,
 } from "./kamibots-rental-config.mjs";
 import { advanceActiveLease } from "./renter-pod-active.mjs";
-import { observeKamiState } from "./renter-pod-safety.mjs";
+import { billedActionGas, observeKamiState, operatorFeePerGas } from "./renter-pod-safety.mjs";
 import { createStrategyController } from "./renter-pod-strategy.mjs";
 import {
   assertCanonicalCheckpoint,
@@ -220,11 +227,47 @@ const txs = createTxTracker({
   state,
   provider,
   timeoutMs: HARDENING.txWaitTimeoutMs,
+  // OPERATOR_TX_PRICING=legacy: every worker tx is type 0 at the node gas
+  // price. Default eip1559 leaves ethers' fee fields exactly as before.
+  feeOverrides: async () => {
+    if (HARDENING.operatorTxPricing !== OperatorTxPricing.LEGACY) return {};
+    const { gasPrice } = await provider.getFeeData();
+    if (gasPrice == null) throw new Error("RPC returned no gas price");
+    return { type: 0, gasPrice };
+  },
   alert: leaseAlert,
   persist: save,
 });
-/** Send one job-scoped tx with a bounded wait (see renter-pod-tx.mjs). */
-const sendTx = (job, label, sendFn) => txs.send(txKeyForJob(job), label, sendFn);
+
+/**
+ * Send one job-scoped contract call with a bounded wait (renter-pod-tx.mjs):
+ * signed locally and recorded before broadcast, so a broadcast timeout or a
+ * restart can never produce an unrecorded duplicate.
+ */
+function sendTx(job, label, signer, contract, method, args = [], { overrides, preflight } = {}) {
+  return txs.send(txKeyForJob(job), label, {
+    signer,
+    request: () => contract.getFunction(method).populateTransaction(...args, ...(overrides ? [overrides] : [])),
+    preflight,
+  });
+}
+
+/**
+ * Keeper-signed, tokenIndex-keyed factory call. The request is re-read right
+ * before signing: if the token's request now belongs to another pod (renter
+ * cancelled and re-rented during a long walk) or moved stage, nothing is sent.
+ */
+function keeperTx(job, method, expectedStage) {
+  return sendTx(job, method, keeper, factory, method, [job.tokenIndex], {
+    preflight: async () => assertRequestStillOurs(job, await factory.requests(job.tokenIndex), expectedStage, method),
+  });
+}
+
+/** Fee per gas the worker's txs are billed at (OPERATOR_TX_PRICING). */
+function feePerGas(feeData) {
+  return operatorFeePerGas(feeData, HARDENING.operatorTxPricing);
+}
+const OPERATOR_ACTION_BILLED_GAS = billedActionGas(OPERATOR_ACTION_GAS_FLOOR);
 
 let lastIngestOkAt = null;
 let lastHeartbeat = null;
@@ -266,6 +309,7 @@ function startReservationServer() {
       signDigest: (digest) => keeper.signingKey.sign(digest).serialized,
       saveReservations,
       alert: leaseAlert,
+      listingExists: async (tokenIndex) => (await market.listings(tokenIndex)).owner !== ZeroAddress,
     })
   );
   server.requestTimeout = 5_000;
@@ -388,7 +432,7 @@ async function walk(job, operator, accID) {
     : job.tile.path.slice(Math.max(0, job.tile.path.indexOf(current) + 1));
   for (const room of route) {
     if (current === Number(job.tile.room)) break;
-    await sendTx(job, `move:${room}`, () => moveSystem.connect(operator).executeTyped(Number(room)));
+    await sendTx(job, `move:${room}`, operator, moveSystem, "executeTyped", [Number(room)]);
     current = Number(await roomComponent.get(accID));
     if (current !== Number(room)) throw new Error(`walk expected room ${room}, got ${current}`);
   }
@@ -404,11 +448,16 @@ async function applyIngest(records) {
   });
 }
 
-/** Delete claimed reservations only after the jobs holding their keys are durable. */
-function releaseClaimedReservations(claimedNonces) {
-  if (!claimedNonces.length) return;
+/**
+ * Persist ingest results. Claimed reservations leave the in-memory map BEFORE
+ * the job-state save (the state file mirrors reservations for rollback), and
+ * the reservation store is written only AFTER it, so on disk every operator
+ * key is always in the saved job, the store, or both - never in neither.
+ */
+function persistIngest(claimedNonces) {
   for (const nonce of claimedNonces) delete state.reservations[nonce];
-  saveReservations();
+  save();
+  if (claimedNonces.length) saveReservations();
 }
 
 async function ingestEvents() {
@@ -428,42 +477,57 @@ async function ingestEvents() {
     // No new confirmed range: still retry parked events.
     if (Object.keys(state.ingestRetry).length) {
       const { claimedNonces } = await applyIngest([]);
-      save();
-      releaseClaimedReservations(claimedNonces);
+      persistIngest(claimedNonces);
     }
     lastIngestOkAt = Date.now();
     return;
   }
-  const confirmedBlockBefore = await provider.getBlock(confirmedTip);
-  if (!confirmedBlockBefore) throw new Error(`confirmed block ${confirmedTip} is unavailable`);
-  const nextCursor = checkpointForBlock(confirmedBlockBefore);
-  const events = await factory.queryFilter(
-    factory.filters.RenterPodCreated(),
-    state.lastBlock,
-    confirmedTip
-  );
-  // If the query raced a reorg, discard all in-memory results before claiming
-  // a reservation or changing any durable job state.
-  const confirmedBlockAfter = await provider.getBlock(confirmedTip);
-  assertCanonicalCheckpoint(nextCursor, confirmedBlockAfter);
-  const records = events.map(renterPodEventRecord);
 
-  // Per-event isolation (THR-01): an event that cannot be applied is parked in
-  // state.ingestRetry with an INGEST_ERROR alert; it never blocks the cursor
-  // or any other token. The parked record is saved together with the cursor.
-  const { claimedNonces } = await applyIngest(records);
-  state.lastBlock = confirmedTip + 1;
-  state.eventCursor = nextCursor;
-  // Block time of the ingested tip: the reservation pruner uses it to prove a
-  // signed quote's deadline has passed on-chain before dropping its key.
-  const tipTime = Number(confirmedBlockBefore.timestamp);
-  if (Number.isFinite(tipTime) && tipTime > 0) state.ingestedThroughSec = tipTime;
-  save();
-  releaseClaimedReservations(claimedNonces);
+  // A long outage leaves a backlog of ~43k blocks per day. Read it in bounded
+  // chunks (LOG_CHUNK_BLOCKS per eth_getLogs, LOG_CHUNKS_PER_TICK per tick),
+  // committing the cursor after each chunk, so one oversized call that times
+  // out can never hold ingest back forever.
+  for (let chunk = 0; chunk < HARDENING.logChunksPerTick && state.lastBlock <= confirmedTip; chunk++) {
+    const toBlock = Math.min(confirmedTip, state.lastBlock + HARDENING.logChunkBlocks - 1);
+    const chunkBlockBefore = await provider.getBlock(toBlock);
+    if (!chunkBlockBefore) throw new Error(`confirmed block ${toBlock} is unavailable`);
+    const nextCursor = checkpointForBlock(chunkBlockBefore);
+    const events = await factory.queryFilter(
+      factory.filters.RenterPodCreated(),
+      state.lastBlock,
+      toBlock
+    );
+    // If the query raced a reorg, discard all in-memory results before claiming
+    // a reservation or changing any durable job state.
+    const chunkBlockAfter = await provider.getBlock(toBlock);
+    assertCanonicalCheckpoint(nextCursor, chunkBlockAfter);
+    const records = events.map(renterPodEventRecord);
+
+    // Per-event isolation (THR-01): an event that cannot be applied is parked in
+    // state.ingestRetry with an INGEST_ERROR alert; it never blocks the cursor
+    // or any other token. The parked record is saved together with the cursor.
+    const { claimedNonces } = await applyIngest(records);
+    state.lastBlock = toBlock + 1;
+    state.eventCursor = nextCursor;
+    // Block time of the ingested chunk end: the reservation pruner uses it to
+    // prove a signed quote's deadline has passed on-chain before dropping its key.
+    const chunkTime = Number(chunkBlockBefore.timestamp);
+    if (Number.isFinite(chunkTime) && chunkTime > 0) state.ingestedThroughSec = chunkTime;
+    persistIngest(claimedNonces);
+    // A committed chunk is progress: a long catch-up never trips the watchdog.
+    watchdog.progress();
+  }
+  if (state.lastBlock <= confirmedTip) {
+    // Still catching up: new quotes stay refused (ingest-stale -> 503) until
+    // ingest has reached the confirmed tip, because a pod created now would
+    // not be adopted until then.
+    console.error(`ingest catching up: at block ${state.lastBlock}, confirmed tip ${confirmedTip}`);
+    return;
+  }
   lastIngestOkAt = Date.now();
 }
 
-async function ensureOperatorGas(job, request, operator, { allowPull = true, required = true } = {}) {
+async function ensureOperatorGas(job, request, operator, { allowPull = true, required = true, targetActions = null } = {}) {
   const tokenIndex = job.tokenIndex;
   const [balance, feeData] = await Promise.all([
     provider.getBalance(operator.address),
@@ -476,9 +540,15 @@ async function ensureOperatorGas(job, request, operator, { allowPull = true, req
   // 439-minute cycle (~6.6 tx/day). The old fixed 1e12-wei reserve bought a
   // quarter of one action at 2.5 Mwei. Price the one-day reserve dynamically
   // so an RPC gas-price change cannot turn a previously safe constant into
-  // another underfunded valve.
-  const minimumActionWei = feeData.gasPrice * OPERATOR_ACTION_GAS_FLOOR;
-  const reserve = feeData.gasPrice * OPERATOR_RESERVE_GAS_UNITS;
+  // another underfunded valve. Priced at the fee the tx is actually billed at
+  // (maxFeePerGas for EIP-1559 on Yominet, plus the unused-gas charge).
+  const fee = feePerGas(feeData);
+  const minimumActionWei = fee * OPERATOR_ACTION_BILLED_GAS;
+  // targetActions (exit reserve with an unconfirmed Kamibots stop): top up
+  // only to that many actions, just in time, instead of the full reserve.
+  const reserve = targetActions
+    ? minimumActionWei * BigInt(targetActions)
+    : fee * OPERATOR_RESERVE_GAS_UNITS;
   const health = operatorGasHealth(
     balance,
     allowPull ? request.gasBudget : 0n,
@@ -502,7 +572,7 @@ async function ensureOperatorGas(job, request, operator, { allowPull = true, req
   }
   if (health.topUpAmount === 0n) return;
 
-  await sendTx(job, "pullGas", () => factory.connect(operator).pullGas(tokenIndex, health.topUpAmount));
+  await sendTx(job, "pullGas", operator, factory, "pullGas", [tokenIndex, health.topUpAmount]);
   const fundedBalance = await provider.getBalance(operator.address);
   if (fundedBalance < minimumActionWei) {
     throw new Error(
@@ -530,14 +600,14 @@ async function returnUnusedOperatorGas(job, operator) {
   // A legacy-priced transaction makes its maximum cost exact on Yominet. The
   // value can therefore return the rest of the ephemeral EOA's balance before
   // its key is erased; the factory includes it in the renter's final refund.
-  await sendTx(job, "returnGas", () =>
-    connected.returnGas(tokenIndex, {
+  await sendTx(job, "returnGas", operator, factory, "returnGas", [tokenIndex], {
+    overrides: {
       value: amount,
       gasLimit,
       gasPrice,
       type: 0,
-    })
-  );
+    },
+  });
 }
 
 /** Raw Kamibots DELETE; 404 counts as stopped. Callers go through `strategy`. */
@@ -564,14 +634,22 @@ function normalizeJobPrefs(job, rawPrefs) {
 }
 
 async function startStrategyRemote(job, prefs) {
+  if (!job.creds) throw new Error(`Kamibots credentials missing for Kami #${job.tokenIndex}`);
+  const body = buildKamibotsStartBody(
+    { node: job.node, creds: job.creds },
+    job.tokenIndex,
+    prefs
+  );
+  // THR-02 defense in depth: whatever the prefs path did, the body Kamibots
+  // actually receives must be inside the safety floor.
+  const violations = startBodyFloorViolations(body, HARDENING.prefsFloor);
+  if (violations.length) {
+    throw new Error(`refusing to start a Kamibots strategy outside the lease safety floor for Kami #${job.tokenIndex}: ${violations.join("; ")}`);
+  }
   await kb("/api/strategies/start", {
     method: "POST",
     apiKey: job.creds.apiKey,
-    body: buildKamibotsStartBody(
-      { node: job.node, creds: job.creds },
-      job.tokenIndex,
-      prefs
-    ),
+    body,
   });
 }
 
@@ -617,7 +695,9 @@ async function readOperatorGas(job, request, operator) {
   if (feeData.gasPrice == null) {
     throw new Error(`operator gas health failed for Kami #${job.tokenIndex}: RPC returned no gas price`);
   }
-  return { balance, escrow: BigInt(request.gasBudget), gasPrice: feeData.gasPrice };
+  // "gasPrice" here is the fee per gas the exit txs are billed at (see
+  // operatorFeePerGas), not the node gas price.
+  return { balance, escrow: BigInt(request.gasBudget), gasPrice: feePerGas(feeData) };
 }
 
 async function processJob(job) {
@@ -646,16 +726,23 @@ async function processJob(job) {
       save();
     }
     await walk(job, operator, podAccID);
-    await sendTx(job, "markLeasePreparing", () => factory.connect(keeper).markLeasePreparing(job.tokenIndex));
+    await keeperTx(job, "markLeasePreparing", 1);
     return;
   }
 
   if (stage === 2) {
     if (actualAccID === marketAccID) {
-      await sendTx(job, "routePreparedKami", () => factory.connect(keeper).routePreparedKami(job.tokenIndex));
+      await keeperTx(job, "routePreparedKami", 2);
       return;
     }
     if (actualAccID !== podAccID) return;
+    // A request adopted mid-flight (e.g. marked PREPARING by a keeper call
+    // this job never made) has no Kamibots registration yet: register now
+    // instead of failing on null creds every tick.
+    if (!job.creds) {
+      job.creds = await registerKamibots(operator);
+      save();
+    }
     if (await kamiIsDead(job, listing.kamiID, stage, "preparing")) {
       await strategy.stopForOnChain(job, { force: true });
       return;
@@ -665,9 +752,7 @@ async function processJob(job) {
       reconcileStrategy: () => strategy.reconcile(job),
       readKamiState: () => kamiStateComponent.get(listing.kamiID),
       activateLease: async () => {
-        await sendTx(job, "activateProvisionedLease", () =>
-          factory.connect(keeper).activateProvisionedLease(job.tokenIndex)
-        );
+        await keeperTx(job, "activateProvisionedLease", 2);
       },
     });
     return;
@@ -679,9 +764,8 @@ async function processJob(job) {
         ["string", "uint256"],
         ["harvest", listing.kamiID]
       );
-      const connectedStop = harvestStopSystem.connect(operator);
-      await connectedStop.executeTyped.staticCall(harvestID);
-      await sendTx(job, "stopHarvest", () => connectedStop.executeTyped(harvestID));
+      await harvestStopSystem.connect(operator).executeTyped.staticCall(harvestID);
+      await sendTx(job, "stopHarvest", operator, harvestStopSystem, "executeTyped", [harvestID]);
     };
     // THR-03: the exit reserve is checked before the fail-closed gas check.
     await advanceActiveLease({
@@ -690,14 +774,14 @@ async function processJob(job) {
       listing,
       market: MARKET,
       readGas: () => readOperatorGas(job, request, operator),
-      actionGas: OPERATOR_ACTION_GAS_FLOOR,
+      actionGas: OPERATOR_ACTION_BILLED_GAS,
       exitReserveActions: HARDENING.exitReserveActions,
       resumeHeadroomActions: HARDENING.exitResumeHeadroomActions,
-      ensureGas: ({ required }) => ensureOperatorGas(job, request, operator, { required }),
+      ensureGas: ({ required, targetActions }) => ensureOperatorGas(job, request, operator, { required, targetActions }),
       strategy,
       readKamiState: () => kamiStateComponent.get(listing.kamiID),
       stopHarvest,
-      endLease: () => sendTx(job, "endLease", () => market.connect(operator).endLease(job.tokenIndex)),
+      endLease: () => sendTx(job, "endLease", operator, market, "endLease", [job.tokenIndex]),
       advanceEnding: () =>
         advanceEndingLease({
           tokenIndex: job.tokenIndex,
@@ -711,7 +795,7 @@ async function processJob(job) {
           onDead: async () => {},
           stopHarvest,
           finalizeLease: async () => {
-            await sendTx(job, "finalizeMarketLease", () => factory.connect(operator).finalizeMarketLease(job.tokenIndex));
+            await sendTx(job, "finalizeMarketLease", operator, factory, "finalizeMarketLease", [job.tokenIndex]);
           },
           markFinalized: async () => {
             job.finalized = true;
@@ -734,11 +818,11 @@ async function processJob(job) {
       await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
-      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
+      await sendTx(job, "kamiSend", operator, sendSystem, "executeTyped", [job.tokenIndex, listing.owner]);
       return;
     }
     if (actualAccID === marketAccID) {
-      await sendTx(job, "recoverPreparingFromHub", () => factory.connect(keeper).recoverPreparingFromHub(job.tokenIndex));
+      await keeperTx(job, "recoverPreparingFromHub", 4);
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
@@ -755,9 +839,7 @@ async function processJob(job) {
       await returnUnusedOperatorGas(job, operator);
       // This factory entrypoint is permissionless. Use the durable keeper after
       // the ephemeral operator has returned its remaining balance.
-      await sendTx(job, "finalizePreparingCancellation", () =>
-        factory.connect(keeper).finalizePreparingCancellation(job.tokenIndex)
-      );
+      await keeperTx(job, "finalizePreparingCancellation", 4);
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -772,7 +854,7 @@ async function processJob(job) {
       await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
-      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
+      await sendTx(job, "kamiSend", operator, sendSystem, "executeTyped", [job.tokenIndex, listing.owner]);
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
@@ -787,7 +869,7 @@ async function processJob(job) {
         });
       }
       await returnUnusedOperatorGas(job, operator);
-      await sendTx(job, "finalizeGasRefund", () => factory.connect(keeper).finalizeGasRefund(job.tokenIndex));
+      await keeperTx(job, "finalizeGasRefund", 5);
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -814,14 +896,14 @@ async function processJob(job) {
         return;
       }
       await ensureOperatorGas(job, request, operator, { allowPull: false });
-      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
+      await sendTx(job, "kamiSend", operator, sendSystem, "executeTyped", [job.tokenIndex, listing.owner]);
       save();
       return;
     }
     if (action === StageZeroAction.CLEAR_OWNER_RETURN) {
-      await sendTx(job, "clearReturned", () => market.connect(operator).clearReturned(job.tokenIndex));
+      await sendTx(job, "clearReturned", operator, market, "clearReturned", [job.tokenIndex]);
     } else if (action === StageZeroAction.CONFIRM_POOL_RETURN) {
-      await sendTx(job, "confirmReturnedToPool", () => market.connect(operator).confirmReturnedToPool(job.tokenIndex));
+      await sendTx(job, "confirmReturnedToPool", operator, market, "confirmReturnedToPool", [job.tokenIndex]);
     } else if (action === StageZeroAction.WAIT) {
       save();
       return;
@@ -843,14 +925,13 @@ async function finishRetiredJob(job, { listing, podAccID, actualAccID, operator 
   if (action === RetiredJobAction.RETURN_FROM_POD) {
     if (await kamiIsDead(job, listing.kamiID, "retired", "kamiSend(retired)")) return;
     await ensureOperatorGas(job, { gasBudget: 0n }, operator, { allowPull: false });
-    await sendTx(job, "kamiSend(retired)", () =>
-      sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)
-    );
+    await sendTx(job, "kamiSend(retired)", operator, sendSystem, "executeTyped", [job.tokenIndex, listing.owner]);
     save();
     return;
   }
   job.finalized = true;
   job.returned = true;
+  if (job.retired) job.returnedAt = Date.now();
   purgeReturnedJobSecrets(job);
   save();
   console.log(`#${job.tokenIndex}: retired superseded pod ${job.pod}`);
@@ -873,6 +954,9 @@ function pruneExpiredReservations() {
     protectedNonces: protectedReservationNonces(state),
   });
   if (removed) saveReservations();
+  // Superseded pods that finished returning are kept for the retention window
+  // only (dropped from the next state save).
+  pruneRetiredJobs(state, { nowMs: Date.now(), retentionMs: HARDENING.retiredJobRetentionMs });
   return removed;
 }
 
@@ -888,9 +972,13 @@ function writeHeartbeat({ tickMs, lastTickOk }) {
     }).live,
     tickMs,
   });
-  writeJsonAtomic(HEARTBEAT_FILE, heartbeat, { mode: 0o644, pretty: false });
+  writeJsonAtomic(HEARTBEAT_FILE, heartbeat, { mode: 0o644, pretty: false, durable: false });
   lastHeartbeat = heartbeat;
 }
+
+// Rotates which job goes first each tick (random start so a restart loop can
+// never pin the same job behind a slow prefix).
+let tickSequence = Math.floor(Math.random() * 1_000_000);
 
 async function tick() {
   const result = await runWorkerTick({
@@ -904,6 +992,8 @@ async function tick() {
     log: (line) => console.error(line),
     stageStuckAlertMs: HARDENING.stageStuckAlertMs,
     save,
+    onProgress: () => watchdog.progress(),
+    startOffset: tickSequence++,
   });
   // Only a tick that ran to completion refreshes the heartbeat.
   writeHeartbeat({ tickMs: result.tickMs, lastTickOk: result.ingestOk });
@@ -912,7 +1002,8 @@ async function tick() {
 // A hung await (dropped tx, stalled RPC/Kamibots socket) keeps systemd's unit
 // "active" while nothing advances. Exit so Restart=always brings up a fresh
 // process; pending txs are persisted in the state file, so the restart never
-// double-sends them.
+// double-sends them. The limit applies to time WITHOUT PROGRESS: it is re-armed
+// after ingest and after every job, so many slow-but-finishing jobs never trip it.
 const watchdog = createTickWatchdog({
   limitMs: HARDENING.tickWatchdogMs,
   onStall: ({ elapsedMs, limitMs }) => {
@@ -944,12 +1035,23 @@ console.log(
     + `reservationTtlSec=${HARDENING.reservationTtlMs / 1000}, txWaitTimeoutMs=${HARDENING.txWaitTimeoutMs}, `
     + `fetchTimeoutMs=${HARDENING.fetchTimeoutMs}, tickWatchdogSec=${HARDENING.tickWatchdogMs / 1000}, `
     + `heartbeatStaleSec=${HARDENING.heartbeatStaleMs / 1000}, heartbeat=${HEARTBEAT_FILE}, `
-    + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}`
+    + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}, `
+    + `maxReservationsPerListing=${HARDENING.maxReservationsPerListing || "off"}, `
+    + `logChunkBlocks=${HARDENING.logChunkBlocks}x${HARDENING.logChunksPerTick}, `
+    + `operatorTxPricing=${HARDENING.operatorTxPricing}`
 );
+if (!HARDENING.renterAllowlist) {
+  console.warn(
+    "WARNING: RENTER_ALLOWLIST is off. Renter addresses on quote requests are not authenticated yet, "
+      + "so reservation caps can be filled by anyone who can reach the quote API. Keep an allowlist "
+      + "until the quote API verifies a renter signature."
+  );
+}
 const FLOOR = HARDENING.prefsFloor;
 console.log(
   `lease safety: prefsFloor=${FLOOR ? `hpLow>=${FLOOR.hpThresholdLowMin},farm<=${FLOOR.farmIntervalMaxSec}s,`
-    + `safetyMargin>=${FLOOR.safetyMarginMin},feed>=${FLOOR.feedPercentMin}%,no-${FLOOR.disallowedRisk}` : "off"}, `
+    + `safetyMargin>=${FLOOR.safetyMarginMin},feed>=${FLOOR.feedPercentMin}%,rest>=${FLOOR.restPctOfFarmMin}%farm,`
+    + `hpFeed=${FLOOR.forceHpFeed ? "on" : "off"},no-${FLOOR.disallowedRisk}` : "off"}, `
     + `exitReserveActions=${HARDENING.exitReserveActions}, exitResumeHeadroomActions=${HARDENING.exitResumeHeadroomActions}, `
     + `cadenceGuard=${HARDENING.cadenceGuard ? "on" : "off"}, `
     + `strategyRestartMinIntervalSec=${HARDENING.strategyRestartMinIntervalMs / 1000}, `

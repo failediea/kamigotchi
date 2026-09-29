@@ -132,6 +132,44 @@ test("retired jobs are driven by the retired handler until returned", async () =
   assert.deepEqual(seen, [7]);
 });
 
+test("progress is reported after ingest, prune and every job; job order rotates with startOffset", async () => {
+  const state = { jobs: { 1: job(1), 2: job(2), 3: job(3), 4: job(4, { returned: true }) }, retiredJobs: { "9:0x": job(9, { retired: true }) } };
+  const progress = [];
+  const order = [];
+  const deps = {
+    state,
+    ingest: async () => {},
+    processJob: async (j) => order.push(j.tokenIndex),
+    processRetiredJob: async (j) => order.push(`r${j.tokenIndex}`),
+    log: () => {},
+    onProgress: (step) => progress.push(step),
+  };
+  await runWorkerTick({ ...deps, startOffset: 1 });
+  assert.deepEqual(order, [2, 3, 1, "r9"]);
+  assert.deepEqual(progress, ["ingest", "prune", "job", "job", "job", "retired-job"]);
+  order.length = 0;
+  await runWorkerTick({ ...deps, startOffset: 5 });
+  assert.deepEqual(order, [3, 1, 2, "r9"], "offset wraps modulo the active job count");
+});
+
+test("a job stuck behind a slow prefix is reached within n ticks", async () => {
+  const state = { jobs: Object.fromEntries([1, 2, 3, 4, 5].map((n) => [n, job(n)])) };
+  const firsts = new Set();
+  for (let tick = 0; tick < 5; tick++) {
+    const seen = [];
+    await runWorkerTick({
+      state,
+      ingest: async () => {},
+      processJob: async (j) => seen.push(j.tokenIndex),
+      processRetiredJob: async () => {},
+      log: () => {},
+      startOffset: tick,
+    });
+    firsts.add(seen[0]);
+  }
+  assert.equal(firsts.size, 5, "every job gets to go first once per n ticks");
+});
+
 test("pending-tx keys are per job so a retired and a live job never collide", () => {
   const a = job(7, { nonce: `0x${"a".repeat(64)}` });
   const b = job(7, { nonce: `0x${"b".repeat(64)}` });

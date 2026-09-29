@@ -68,3 +68,19 @@ test("config parsing is strict", () => {
   assert.throws(() => hardeningConfigFromEnv({ RESERVATION_TTL_SEC: "600" }), /quote deadline/);
   assert.throws(() => hardeningConfigFromEnv({ TICK_WATCHDOG_SEC: "60", TX_WAIT_TIMEOUT_MS: "120000" }), /must exceed/);
 });
+
+test("alerter buckets keyed by request-supplied renters stay bounded", () => {
+  let clock = 0;
+  const lines = [];
+  const alert = createLeaseAlerter({ log: (line) => lines.push(line), now: () => clock, minIntervalMs: 60_000, maxBuckets: 10 });
+  for (let i = 0; i < 1_000; i++) {
+    clock += 1_000;
+    alert("RESERVATION_CAP", { scope: "renter" }, { key: `renter:0x${i}` });
+  }
+  assert.ok(alert.bucketCount() <= 70, `buckets bounded (got ${alert.bucketCount()})`);
+  assert.equal(lines.length, 1_000, "distinct keys are still each reported");
+  // A live bucket inside its interval is never evicted: its repeat stays suppressed.
+  alert("TX_TIMEOUT", { job: "a" }, { key: "a" });
+  for (let i = 0; i < 20; i++) alert("RESERVATION_CAP", {}, { key: `renter:x${i}` });
+  assert.equal(alert("TX_TIMEOUT", { job: "a" }, { key: "a" }), false);
+});

@@ -1,15 +1,45 @@
-import { chmodSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+
+const NODE_FS = { writeFileSync, chmodSync, renameSync, openSync, fsyncSync, closeSync };
 
 /**
  * Crash-safe JSON write: a reader (or a restart after a crash) sees either the
  * previous complete file or the new complete file, never a torn one.
+ *
+ * durable (default): the temp file is fsynced before the rename and the
+ * directory after it, so a power loss or kernel panic cannot leave a
+ * zero-length or missing state / reservation file (those hold operator keys).
+ * The heartbeat passes durable:false - it is rewritten every tick anyway.
  */
-export function writeJsonAtomic(path, value, { mode = 0o600, pretty = true, fs = { writeFileSync, chmodSync, renameSync } } = {}) {
+export function writeJsonAtomic(path, value, { mode = 0o600, pretty = true, durable = true, fs = NODE_FS } = {}) {
   const temp = `${path}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(value, null, pretty ? 2 : 0), { mode });
+  const body = JSON.stringify(value, null, pretty ? 2 : 0);
+  if (!durable) {
+    fs.writeFileSync(temp, body, { mode });
+    fs.chmodSync(temp, mode);
+    fs.renameSync(temp, path);
+    return;
+  }
+  const fd = fs.openSync(temp, "w", mode);
+  try {
+    fs.writeFileSync(fd, body);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.chmodSync(temp, mode);
   fs.renameSync(temp, path);
+  let dirFd = null;
+  try {
+    dirFd = fs.openSync(dirname(path), "r");
+    fs.fsyncSync(dirFd);
+  } catch {
+    // Directory fsync is best effort (not supported on every filesystem);
+    // the rename itself is already atomic.
+  } finally {
+    if (dirFd !== null) fs.closeSync(dirFd);
+  }
 }
 
 /** heartbeat.json lives next to the worker state file (one dir per market). */
@@ -58,8 +88,11 @@ export function reservationServiceHealth({
 /**
  * Tick watchdog. A hung await (RPC, tx wait, Kamibots) keeps the process
  * "active" in systemd while nothing advances. check() is driven by a timer;
- * when a tick has run longer than limitMs it reports the stall once and calls
- * onStall (which in the worker logs WORKER_STALL and exits for a restart).
+ * when the running tick has made NO PROGRESS for longer than limitMs it
+ * reports the stall once and calls onStall (which in the worker logs
+ * WORKER_STALL and exits for a restart). progress() re-arms the timer; the
+ * worker calls it after ingest and after every job, so a long tick that keeps
+ * finishing jobs (slow RPC, many leases) is never killed half-way through.
  */
 export function createTickWatchdog({ limitMs, now = () => Date.now(), onStall }) {
   let startedAt = null;
@@ -68,6 +101,9 @@ export function createTickWatchdog({ limitMs, now = () => Date.now(), onStall })
     begin() {
       startedAt = now();
       fired = false;
+    },
+    progress() {
+      if (startedAt !== null && !fired) startedAt = now();
     },
     end() {
       startedAt = null;
