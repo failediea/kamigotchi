@@ -10,6 +10,8 @@ OnFailure=kami-lease-ops-onfailure@%n.service
 [Service]
 Type=oneshot
 Environment=LAUNCH_OPS_ENV=/etc/kami-lease-ops/launch-ops.env
-ExecStart=/root/kamigotchi/tools/launch-ops/keeper/lease-expiry-keeper.sh --apply
+# /bin/bash: the unit runs even if the script lost its exec bit (git archive of a
+# 100644 commit); install-launch-ops.sh still enforces the mode.
+ExecStart=/bin/bash /root/kamigotchi/tools/launch-ops/keeper/lease-expiry-keeper.sh --apply
 TimeoutStartSec=900
 SyslogIdentifier=kami-lease-expiry-keeper

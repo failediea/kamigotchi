@@ -15,10 +15,17 @@
 #   --no-enable          install keeper/sponsor units but do not enable their timers
 #
 #   (default) --dry-run  print every file it would write; change nothing
-#   --apply              back up, write, daemon-reload, enable, run one read-only check
+#   --apply              back up, write, daemon-reload, enable, then check:
+#                          every installed script is executable;
+#                          each installed script's --dry-run exits 0;
+#                          alerts: one real run of kami-worker-alerts.service must end
+#                          with Result=success (an exec failure fails the install)
 #   --rollback DIR       restore from the backup dir printed by --apply
 #
-# Idempotent: identical files are skipped. Backups: /root/launch-ops-backups/ops-<UTC ts>/.
+# Idempotent: a file is skipped only when its content AND its mode already match.
+# A file whose content matches but whose mode differs (e.g. a script shipped by
+# `git archive` of a commit that lost the exec bit) is chmod-ed and recorded.
+# Backups: /root/launch-ops-backups/ops-<UTC ts>/.
 { # one block: safe to pipe into `bash -s`
 set -euo pipefail
 
@@ -42,16 +49,16 @@ done
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${LAUNCH_OPS_DEST:-/root/kamigotchi/tools/launch-ops}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
-ENV_DIR="/etc/kami-lease-ops"
+ENV_DIR="${LAUNCH_OPS_ENV_DIR:-/etc/kami-lease-ops}"
 ENV_FILE="$ENV_DIR/launch-ops.env"
-LIVE_ALERTS="/root/kamigotchi/tools/alerts/worker-alerts.sh"
+LIVE_ALERTS="${LIVE_ALERTS:-/root/kamigotchi/tools/alerts/worker-alerts.sh}"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/launch-ops-backups}"
 ONFAIL_TARGETS="caddy.service kami-renter-pod-v16-musu.service kami-renter-pod-v16-vipp.service"
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root on the VPS"
-command -v jq >/dev/null || die "jq is required"
+command -v jq >/dev/null || log "WARN: jq is missing: alerts v2 runs degraded (it pushes ALERTS_DEGRADED) and the gate cannot decide"
 
 if [ "$MODE" = rollback ]; then
   [ -f "$ROLLBACK_DIR/manifest.tsv" ] || die "no manifest.tsv in $ROLLBACK_DIR"
@@ -59,6 +66,7 @@ if [ "$MODE" = rollback ]; then
     case "$action" in
       created) log "rollback: removing $path"; rm -f "$path" ;;
       replaced) log "rollback: restoring $path"; cp -a "$ROLLBACK_DIR/files/$saved" "$path" ;;
+      mode) log "rollback: mode of $path back to $saved"; chmod "$saved" "$path" ;;
       enabled) log "rollback: disabling $path"; systemctl disable --now "$path" || true ;;
     esac
   done < <(tac "$ROLLBACK_DIR/manifest.tsv")
@@ -105,6 +113,13 @@ gen_content() { # src -> content
   fi
 }
 
+file_status() { # src dest mode -> create | replace | mode | same
+  if [ ! -f "$2" ]; then echo create
+  elif [ "$(gen_content "$1")" != "$(cat "$2")" ]; then echo replace
+  elif [ "$(stat -c %a "$2")" != "$3" ]; then echo mode
+  else echo same; fi
+}
+
 needs_sponsor=0
 case " $COMPONENTS " in *" keeper "*|*" sponsor "*) needs_sponsor=1 ;; esac
 if [ "$needs_sponsor" = 1 ]; then
@@ -122,13 +137,12 @@ log "install-launch-ops mode=$MODE components=[$COMPONENTS] src=$SRC dest=$DEST"
 CHANGES=0
 for p in "${PLAN[@]}"; do
   IFS=$'\t' read -r s d m <<<"$p"
-  if [ -f "$d" ] && [ "$(gen_content "$s")" = "$(cat "$d")" ]; then
-    log "  unchanged $d"
-  elif [ -f "$d" ]; then
-    log "  REPLACE   $d (mode $m)"; CHANGES=$((CHANGES + 1))
-  else
-    log "  CREATE    $d (mode $m)"; CHANGES=$((CHANGES + 1))
-  fi
+  case "$(file_status "$s" "$d" "$m")" in
+    same) log "  unchanged $d" ;;
+    mode) log "  CHMOD     $d ($(stat -c %a "$d") -> $m; content unchanged)"; CHANGES=$((CHANGES + 1)) ;;
+    replace) log "  REPLACE   $d (mode $m)"; CHANGES=$((CHANGES + 1)) ;;
+    create) log "  CREATE    $d (mode $m)"; CHANGES=$((CHANGES + 1)) ;;
+  esac
 done
 case " $COMPONENTS " in *" alerts "*)
   if [ -f "$ENV_FILE" ]; then
@@ -150,8 +164,15 @@ mkdir -p "$BK/files"; chmod 700 "$BACKUP_ROOT" "$BK"
 n=0
 for p in "${PLAN[@]}"; do
   IFS=$'\t' read -r s d m <<<"$p"
+  st=$(file_status "$s" "$d" "$m")
+  [ "$st" != same ] || continue
+  if [ "$st" = mode ]; then
+    printf 'mode\t%s\t%s\n' "$d" "$(stat -c %a "$d")" >> "$BK/manifest.tsv"
+    chmod "$m" "$d"
+    log "chmod $m $d"
+    continue
+  fi
   want=$(gen_content "$s")
-  if [ -f "$d" ] && [ "$want" = "$(cat "$d")" ]; then continue; fi
   if [ -f "$d" ]; then
     n=$((n + 1)); cp -a "$d" "$BK/files/$n"
     printf 'replaced\t%s\t%s\n' "$d" "$n" >> "$BK/manifest.tsv"
@@ -194,14 +215,38 @@ for c in $COMPONENTS; do
   fi
 done
 
-# one read-only pass of each installed script (never --apply here)
+# Post-install checks. Any failure exits non-zero with the rollback command: an
+# install that leaves a unit unable to run must never look successful.
+fail_check() { log "backup + manifest: $BK"; die "$* -- roll back with: $0 --rollback $BK"; }
+for p in "${PLAN[@]}"; do
+  IFS=$'\t' read -r _ d m <<<"$p"
+  case "$d" in *.sh) [ -x "$d" ] || fail_check "$d is not executable after install (mode $(stat -c %a "$d"))" ;; esac
+done
 for c in $COMPONENTS; do
   case "$c" in
-    alerts) LAUNCH_OPS_ENV="$ENV_FILE" "$DEST/alerts/worker-alerts-v2.sh" --dry-run | tail -25 || true ;;
-    keeper) LAUNCH_OPS_ENV="$ENV_FILE" "$DEST/keeper/lease-expiry-keeper.sh" --dry-run | tail -15 || true ;;
-    sponsor) LAUNCH_OPS_ENV="$ENV_FILE" "$DEST/keeper/lease-gas-sponsor.sh" --dry-run | tail -15 || true ;;
+    alerts) script="$DEST/alerts/worker-alerts-v2.sh" ;;
+    keeper) script="$DEST/keeper/lease-expiry-keeper.sh" ;;
+    sponsor) script="$DEST/keeper/lease-gas-sponsor.sh" ;;
   esac
+  # read-only pass (never --apply here); its exit status counts
+  rc=0; out=$(LAUNCH_OPS_ENV="$ENV_FILE" "$script" --dry-run 2>&1) || rc=$?
+  tail -15 <<<"$out"
+  [ "$rc" = 0 ] || fail_check "$script --dry-run exited $rc"
 done
+case " $COMPONENTS " in *" alerts "*)
+  # One real run through systemd, exactly what the timer does every 10 min (it may
+  # push conditions that are firing right now). Catches 203/EXEC, a bad ExecStart,
+  # a missing env file. The keeper/sponsor services are NOT started here: their
+  # --apply sends transactions; their timers run them.
+  log "starting kami-worker-alerts.service once to prove the unit runs"
+  systemctl start kami-worker-alerts.service || true
+  res=$(systemctl show kami-worker-alerts.service -p Result --value 2>/dev/null || echo unknown)
+  st=$(systemctl show kami-worker-alerts.service -p ExecMainStatus --value 2>/dev/null || echo "?")
+  if [ "$res" != success ]; then
+    fail_check "kami-worker-alerts.service Result=$res ExecMainStatus=$st (journalctl -u kami-worker-alerts.service -n 30)"
+  fi
+  log "kami-worker-alerts.service ran: Result=$res ExecMainStatus=$st"
+;; esac
 log "backup + manifest: $BK   (rollback: $0 --rollback $BK)"
 exit 0
 }
