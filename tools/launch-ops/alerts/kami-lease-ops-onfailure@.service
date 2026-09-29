@@ -1,0 +1,11 @@
+# OnFailure= hook: one ntfy push when a watched unit enters the failed state.
+# %i is the failed unit's name. Used by the alerts, expiry-keeper and
+# gas-sponsor services and by the v16 worker / caddy drop-ins.
+[Unit]
+Description=Kami lease ops failure notification for %i
+
+[Service]
+Type=oneshot
+Environment=LAUNCH_OPS_ENV=/etc/kami-lease-ops/launch-ops.env
+ExecStart=/root/kamigotchi/tools/launch-ops/alerts/worker-alerts-v2.sh --apply --notify-failure %i
+TimeoutStartSec=60

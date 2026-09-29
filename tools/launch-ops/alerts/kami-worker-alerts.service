@@ -1,0 +1,12 @@
+# worker-alerts v2. Replaces /etc/systemd/system/kami-worker-alerts.service
+# (baseline in ./baseline/). Installed by ../install-launch-ops.sh --component alerts.
+[Unit]
+Description=Kami lease worker health alert check (v2)
+OnFailure=kami-lease-ops-onfailure@%n.service
+
+[Service]
+Type=oneshot
+Environment=LAUNCH_OPS_ENV=/etc/kami-lease-ops/launch-ops.env
+ExecStart=/root/kamigotchi/tools/launch-ops/alerts/worker-alerts-v2.sh --apply
+TimeoutStartSec=300
+Nice=5

@@ -1,0 +1,7 @@
+# BASELINE (read-only copy, 2026-09-29) of the live
+# /etc/systemd/system/kami-worker-alerts.service. Reference only.
+[Unit]
+Description=Kami worker health alert check
+[Service]
+Type=oneshot
+ExecStart=/root/kamigotchi/tools/alerts/worker-alerts.sh

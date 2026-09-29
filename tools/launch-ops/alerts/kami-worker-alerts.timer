@@ -1,0 +1,8 @@
+# Unchanged from the live timer (baseline/kami-worker-alerts.timer).
+[Unit]
+Description=Kami worker health alerts every 10 minutes
+[Timer]
+OnCalendar=*:00/10
+Persistent=true
+[Install]
+WantedBy=timers.target

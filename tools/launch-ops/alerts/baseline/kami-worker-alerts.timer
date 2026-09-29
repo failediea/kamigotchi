@@ -1,0 +1,10 @@
+# BASELINE (read-only copy, 2026-09-29) of the live
+# /etc/systemd/system/kami-worker-alerts.timer. Reference only; v2 keeps
+# this timer unchanged.
+[Unit]
+Description=Kami worker health alerts every 10 minutes
+[Timer]
+OnCalendar=*:00/10
+Persistent=true
+[Install]
+WantedBy=timers.target
