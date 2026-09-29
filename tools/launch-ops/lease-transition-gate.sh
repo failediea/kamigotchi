@@ -9,12 +9,12 @@
 #   A market is safe to restart only when every lease it knows about is either
 #   fully returned or in steady ACTIVE farming far from expiry. Concretely, REFUSE if
 #   J1  a non-returned worker job has factory stage 1 REQUESTED, 2 PREPARING,
-#       4 CANCEL_REQUESTED, 5 FINALIZED, 6/7 RECOVERY_*, or stage 0 (custody return
-#       still pending in the worker);
+#       4 CANCEL_REQUESTED, 5 FINALIZED, 6/7/8 RECOVERY_* (8 = RECOVERY_RETURN), or
+#       stage 0 (custody return still pending in the worker);
 #   J2  a non-returned job is ACTIVE (3) but the listing is ending, or leaseEnd is
 #       less than GATE_EXPIRY_MARGIN_SEC away (or already past);
 #   J3  a non-returned job's chain pod differs from the job's pod;
-#   C1  any listing on the market has factory stage in {1,2,4,5,6,7}, or is leased
+#   C1  any listing on the market has factory stage in {1,2,4,5,6,7,8}, or is leased
 #       and ending, even if the worker has not ingested it yet;
 #   C2  any leased listing (renter != 0) has no non-returned job in the worker state;
 #   R1  a reservation bound to a signed quote (attestedDigest set) is younger than
@@ -24,6 +24,8 @@
 #   Steady ACTIVE leases (stage 3, not ending, > margin to expiry) are allowed:
 #   a restart only pauses reconciliation for ~30 s while Kamibots keeps farming.
 #   Set GATE_ALLOW_ACTIVE=0 to refuse those too.
+#   A read that fails (chain, state, an unparsable reservations file or tx tracker)
+#   is UNDECIDED, never "0 found".
 #
 # Usage: lease-transition-gate.sh [--market musu|vipp]... (default both)
 { # one block: safe to pipe into `bash -s`
@@ -114,7 +116,7 @@ for m in $MARKETS; do
     lease_end=$(hex2dec "$(word "$l" 12)")
     case "$stage" in
       0) refuse "[$m] J1 #$tok request cleared on chain but the worker has not finished the custody return" ;;
-      1|2|4|5|6|7) refuse "[$m] J1 #$tok factory stage $stage is a transition stage" ;;
+      1|2|4|5|6|7|8) refuse "[$m] J1 #$tok factory stage $stage is a transition stage" ;;
       3)
         if [ "$(lc "$chain_pod")" != "$(lc "$pod")" ]; then
           refuse "[$m] J3 #$tok chain pod $chain_pod != worker job pod $pod"
@@ -143,7 +145,7 @@ for m in $MARKETS; do
     renter=$(addr_word "$l" 8)
     ending=$(hex2dec "$(word "$l" 7)")
     stage=$(hex2dec "$(word "$r" 5)")
-    case "$stage" in 1|2|4|5|6|7) refuse "[$m] C1 listing #$tok factory stage $stage (in transition on chain)" ;; esac
+    case "$stage" in 1|2|4|5|6|7|8) refuse "[$m] C1 listing #$tok factory stage $stage (in transition on chain)" ;; esac
     if [ "$renter" != "$ZERO_ADDR" ]; then
       [ "$ending" = 1 ] && refuse "[$m] C1 listing #$tok leased and ending"
       case "$known_tokens" in *" $tok "*) ;; *) refuse "[$m] C2 listing #$tok is leased on chain but has no live worker job" ;; esac
@@ -154,14 +156,18 @@ for m in $MARKETS; do
   # --- R1: bound reservations (legacy: inside the state file; patched worker: *reservations*.json) ---
   inflight=0
   for rf in STATE "$(dirname "$sf")"/*reservations*.json; do
-    if [ "$rf" = STATE ]; then rjson=$STATE_JSON; else [ -r "$rf" ] || continue; rjson=$(cat "$rf"); fi
-    c=$(jq --argjson now "$NOW" --argjson win "$GATE_INFLIGHT_SEC" '
+    if [ "$rf" = STATE ]; then rjson=$STATE_JSON; else [ -e "$rf" ] || continue; rjson=$(cat "$rf" 2>/dev/null) || { undecided "[$m] cannot read $rf"; continue; }; fi
+    c=$(jq -e --argjson now "$NOW" --argjson win "$GATE_INFLIGHT_SEC" '
       (if has("reservations") then .reservations else . end) as $r
       | if ($r|type) == "object" then
           [ $r | to_entries[] | .value | select(type == "object")
             | select((.attestedDigest // "") != "")
             | select((($now * 1000) - ((.createdAt // 0) | tonumber)) < ($win * 1000)) ] | length
-        else 0 end' <<<"$rjson" 2>/dev/null || echo 0)
+        else 0 end' <<<"$rjson" 2>/dev/null) || c=""
+    if ! [[ "$c" =~ ^[0-9]+$ ]]; then
+      undecided "[$m] R1 cannot parse reservations in $( [ "$rf" = STATE ] && echo "the state file" || basename "$rf")"
+      continue
+    fi
     inflight=$((inflight + c))
   done
   if [ "$inflight" -gt 0 ]; then
@@ -172,8 +178,12 @@ for m in $MARKETS; do
   pending=$(jq '[ to_entries[] | select(.key | test("^(txs|pendingTxs|inflightTxs)$")) | .value
                   | (if type == "object" then [.[]] elif type == "array" then . else [] end)[]
                   | select(type == "object")
-                  | select(((.status // "pending") | tostring | test("pending|sent|inflight|submitted"; "i"))) ] | length' <<<"$STATE_JSON" 2>/dev/null || echo 0)
-  if [ "$pending" -gt 0 ]; then refuse "[$m] T1 $pending transaction(s) still in flight in the worker state"; fi
+                  | select(((.status // "pending") | tostring | test("pending|sent|inflight|submitted"; "i"))) ] | length' <<<"$STATE_JSON" 2>/dev/null) || pending=""
+  if ! [[ "$pending" =~ ^[0-9]+$ ]]; then
+    undecided "[$m] T1 cannot parse the tx tracker in the state file"
+  elif [ "$pending" -gt 0 ]; then
+    refuse "[$m] T1 $pending transaction(s) still in flight in the worker state"
+  fi
 
   # informational: ingest lag
   lb=$(jq -r '.lastBlock // 0' <<<"$STATE_JSON")

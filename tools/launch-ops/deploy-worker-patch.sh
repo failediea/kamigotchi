@@ -6,7 +6,11 @@
 #
 #   deploy-worker-patch.sh --ref <sha|branch>                 dry-run (read-only)
 #   deploy-worker-patch.sh --ref <sha|branch> --apply         install
-#   deploy-worker-patch.sh --rollback <TS> [--markets "vipp"] restore code from a backup
+#   deploy-worker-patch.sh --rollback <TS> [--markets "vipp"] [--force]
+#                                                             restore code from a backup
+#   deploy-worker-patch.sh --ref <sha|branch> --local-stage DIR
+#                             build the staging tree (code/ + full/) locally and stop
+#                             (no ssh; used by tests/run-tests.sh)
 #
 # What --apply does, in order (stops at the first failure):
 #   1. git archive <ref>:tools/vault-kit locally; keep only code files
@@ -14,21 +18,31 @@
 #   2. refuse if tools/vault-kit/package.json dependencies differ from the VPS copy
 #      (no npm install on the box) unless --allow-dep-change
 #   3. mid-transition gate (lease-transition-gate.sh, read-only) for all markets
-#   4. upload to /root/launch-ops-staging/worker-<TS>/ and run the vault-kit tests
-#      there (node --test *.test.mjs); nothing live changes if they fail
-#   5. per market, ONE AT A TIME (default order: musu, the market with 0 jobs, then vipp):
-#      re-run the gate for that market; back up the whole dir to
-#      /root/launch-ops-backups/worker-<TS>/vault-kit-v16-<m>/; copy code files only
-#      (.env*, state, reservations, heartbeat, keys, node_modules untouched); restart
-#      the unit; verify for VERIFY_SEC (120): unit active, port 8791/8792 bound,
-#      heartbeat.json fresh (ts >= restart and <= 120 s old), no [LEASE-ALERT] line,
-#      no auto-restart; on failure restore that market's code, restart, exit non-zero
+#   4. upload to /root/launch-ops-staging/worker-<TS>/: code/ (what gets installed)
+#      and full/ (the whole tools/vault-kit tree of the ref, so tests that read
+#      test-fixtures/ work) and run the vault-kit tests in full/ (node --test
+#      *.test.mjs); nothing live changes if they fail
+#   5. per market, ONE AT A TIME (default order: musu, the market with 0 jobs, then vipp),
+#      skipping a market whose file plan has no NEW/CHANGED runtime file (*.test.mjs and
+#      *.env.example alone do not count; idempotent re-run):
+#      re-run the gate for that market; back up the code files + a state snapshot to
+#      /root/launch-ops-backups/worker-<TS>/vault-kit-v16-<m>/ (.env is not copied);
+#      copy code files only (.env*, state, reservations, heartbeat, keys, node_modules
+#      untouched); create HALT for the verify window (VERIFY_HALT=1, only if absent; the
+#      patched worker answers 503 to new quotes, so nothing is signed while the install
+#      can still roll back); restart the unit; verify for VERIFY_SEC (120): unit active,
+#      port 8791/8792 bound, heartbeat.json fresh (ts >= restart and <= 120 s old), no
+#      [LEASE-ALERT] line, no auto-restart; then remove HALT. On failure: auto-rollback
+#      (waits for pendingTxs, merges the reservation store back into the state file,
+#      restores the code; see deploy/remote-install-worker-code.sh), exit non-zero
 #      (the next market is not touched)
 #
 # Dry-run does steps 1-3 plus a per-file diff against the live copies. It writes
 # nothing locally except a temp dir, and nothing on the VPS.
-# Rollback: --rollback <TS> restores code files from the backup of that run
-# (heartbeat not required, since older code does not write one).
+# Rollback: --rollback <TS> first runs the transition gate per market (refuses unless
+# --force), then restores code files from the backup of that run (heartbeat not
+# required, since older code does not write one), with the same pendingTxs wait and
+# reservation merge as the auto-rollback.
 {
 set -euo pipefail
 
@@ -40,6 +54,10 @@ MARKETS="${DEPLOY_MARKETS:-musu vipp}"
 ALLOW_DEP_CHANGE=0
 REQUIRE_HEARTBEAT="${REQUIRE_HEARTBEAT:-1}"
 VERIFY_SEC="${VERIFY_SEC:-120}"
+VERIFY_HALT="${VERIFY_HALT:-1}"
+ROLLBACK_PENDING_WAIT_SEC="${ROLLBACK_PENDING_WAIT_SEC:-300}"
+FORCE=0
+LOCAL_STAGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?}"; shift ;;
@@ -50,7 +68,9 @@ while [ $# -gt 0 ]; do
     --markets) MARKETS="${2:?}"; shift ;;
     --allow-dep-change) ALLOW_DEP_CHANGE=1 ;;
     --no-require-heartbeat) REQUIRE_HEARTBEAT=0 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    --force) FORCE=1 ;;
+    --local-stage) LOCAL_STAGE="${2:?}"; shift ;;
+    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -74,8 +94,16 @@ gate() { # markets...
 
 if [ "$MODE" = rollback ]; then
   log "ROLLBACK code from backup worker-$ROLLBACK_TS for [$MARKETS] on $HOST"
+  force_arg=""; [ "$FORCE" = 1 ] && force_arg="--force"
   for m in $MARKETS; do
-    remote "--action rollback --market $m --backup-dir /root/launch-ops-backups/worker-$ROLLBACK_TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC" \
+    # The pre-hardening worker has no tx tracker and re-derives every action; the
+    # gate (J1-J3, C1-C2, R1, T1) refuses while a lease is mid-transition.
+    rc=0; gate "$m" || rc=$?
+    if [ "$rc" != 0 ]; then
+      [ "$FORCE" = 1 ] || die "gate refused rollback of $m (exit $rc). Wait until it prints SAFE, or pass --force."
+      log "WARN: gate refused (exit $rc) but --force given; rolling back $m anyway"
+    fi
+    remote "--action rollback --market $m --backup-dir /root/launch-ops-backups/worker-$ROLLBACK_TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --pending-wait $ROLLBACK_PENDING_WAIT_SEC $force_arg" \
       < "$HERE/deploy/remote-install-worker-code.sh" || die "rollback of $m failed; see output above"
   done
   log "rollback complete"
@@ -89,13 +117,24 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 log "deploy-worker-patch mode=$MODE ref=$REF sha=$SHA host=$HOST markets=[$MARKETS]"
 
-# 1. code files from the ref
+# 1. code files from the ref (code/ is installed; full/ is the tested tree)
 git -C "$REPO" archive "$SHA" tools/vault-kit | tar -x -C "$WORK"
-mkdir -p "$WORK/code"
+mkdir -p "$WORK/stage/code"
 for f in "$WORK"/tools/vault-kit/*; do
   b=$(basename "$f")
-  case "$b" in renter-pod-*.mjs|kamibots-rental-config*.mjs|*.env.example) cp "$f" "$WORK/code/$b" ;; esac
+  [ -f "$f" ] || continue
+  case "$b" in renter-pod-*.mjs|kamibots-rental-config*.mjs|*.env.example) cp "$f" "$WORK/stage/code/$b" ;; esac
 done
+cp -a "$WORK/tools/vault-kit" "$WORK/stage/full"
+rm -rf "$WORK/stage/full/node_modules"
+ln -s stage/code "$WORK/code"
+if [ -n "$LOCAL_STAGE" ]; then
+  mkdir -p "$LOCAL_STAGE"
+  cp -a "$WORK/stage/." "$LOCAL_STAGE/"
+  printf '%s\n' "$SHA" > "$LOCAL_STAGE/SHA"
+  log "local staging tree for $SHA written to $LOCAL_STAGE (code/ + full/); nothing else done"
+  exit 0
+fi
 FILES=$(cd "$WORK/code" && ls -1)
 [ -n "$FILES" ] || die "no code files found in $SHA:tools/vault-kit"
 grep -q '^renter-pod-worker.mjs$' <<<"$FILES" || die "renter-pod-worker.mjs missing from $SHA"
@@ -116,51 +155,67 @@ if [ "$local_deps" != "$remote_deps" ]; then
 fi
 
 # diff against live copies (read-only)
+declare -A NEED=()
 for m in $MARKETS; do
+  NEED[$m]=0
   "${SSH[@]}" "cd $REMOTE_ROOT/vault-kit-v16-$m && for f in renter-pod-*.mjs kamibots-rental-config*.mjs *.env.example; do [ -f \"\$f\" ] && printf '%s %s %s\n' \"\$(md5sum < \"\$f\" | cut -c1-32)\" \"\$(tr -d '\\r' < \"\$f\" | md5sum | cut -c1-32)\" \"\$f\"; done" > "$WORK/remote-$m.md5" || true
   log "== $m: file plan"
   while read -r sum norm name; do
     r=$(awk -v n="$name" '$3==n{print $1}' "$WORK/remote-$m.md5")
     rn=$(awk -v n="$name" '$3==n{print $2}' "$WORK/remote-$m.md5")
-    if [ -z "$r" ]; then echo "    NEW      $name"
+    # *.test.mjs and *.env.example never change what the running worker does, so on
+    # their own they do not justify a restart (they are still copied when the market
+    # is deployed for another reason)
+    runtime=1; case "$name" in *.test.mjs|*.env.example) runtime=0 ;; esac
+    if [ -z "$r" ]; then echo "    NEW      $name"; [ "$runtime" = 0 ] || NEED[$m]=$(( NEED[$m] + 1 ))
     elif [ "$r" = "$sum" ]; then echo "    same     $name"
-    elif [ "$rn" = "$norm" ]; then echo "    eol-only $name (identical except CRLF/LF; will be rewritten as LF)"
-    else echo "    CHANGED  $name"; fi
+    elif [ "$rn" = "$norm" ]; then echo "    eol-only $name (identical except CRLF/LF; rewritten as LF only if the market is deployed)"
+    else echo "    CHANGED  $name"; [ "$runtime" = 0 ] || NEED[$m]=$(( NEED[$m] + 1 )); fi
   done < "$WORK/local.md5"
   while read -r _ _ name; do
     grep -q " $name\$" "$WORK/local.md5" || echo "    extra    $name (on VPS only; left in place)"
   done < "$WORK/remote-$m.md5"
+  if [ ! -s "$WORK/remote-$m.md5" ]; then NEED[$m]=1; log "    (could not list the live files of $m; it will be deployed)"; fi
+  if [ "${NEED[$m]}" = 0 ]; then log "== $m already runs the code of $SHA (no NEW/CHANGED runtime file): skipped, no restart"; fi
 done
+TODO=""
+for m in $MARKETS; do [ "${NEED[$m]}" = 0 ] || TODO="$TODO $m"; done
+TODO="${TODO# }"
+if [ -z "$TODO" ]; then
+  log "nothing to deploy: every market in [$MARKETS] already has the code files of $SHA"
+  exit 0
+fi
 
 # 3. gate
 log "mid-transition gate (read-only):"
-rc=0; gate $MARKETS || rc=$?
+rc=0; gate $TODO || rc=$?
 [ "$rc" = 0 ] || die "gate refused (exit $rc): a v16 lease is mid-transition or state is unreadable. Nothing was changed."
 
 if [ "$MODE" != apply ]; then
-  log "[dry-run] would stage to /root/launch-ops-staging/worker-$TS, run tests, then install [$MARKETS] one at a time"
+  log "[dry-run] would stage to /root/launch-ops-staging/worker-$TS, run tests, then install [$TODO] one at a time"
   exit 0
 fi
 
 # 4. stage + test on the box
 STAGE="/root/launch-ops-staging/worker-$TS"
-tar -C "$WORK/code" -czf "$WORK/code.tgz" .
-"${SSH[@]}" "mkdir -p $STAGE/code && chmod 700 /root/launch-ops-staging $STAGE && tar -xzf - -C $STAGE/code" < "$WORK/code.tgz"
+tar -C "$WORK/stage" -czf "$WORK/stage.tgz" code full
+"${SSH[@]}" "mkdir -p $STAGE && chmod 700 /root/launch-ops-staging $STAGE && tar -xzf - -C $STAGE" < "$WORK/stage.tgz"
 printf '%s\n' "$SHA" | "${SSH[@]}" "cat > $STAGE/SHA"
 remote "--action test --staging $STAGE" < "$HERE/deploy/remote-install-worker-code.sh" || die "tests failed on the VPS; nothing live changed (staging kept at $STAGE)"
 
-# 5. one market at a time
-for m in $MARKETS; do
+# 5. one market at a time (markets with nothing NEW/CHANGED were dropped above)
+for m in $TODO; do
   log "== $m: re-checking gate"
   rc=0; gate "$m" || rc=$?
   [ "$rc" = 0 ] || die "gate refused for $m (exit $rc); stopping. Markets already done stay on $SHA."
   rc=0
-  remote "--action install --market $m --staging $STAGE --backup-dir /root/launch-ops-backups/worker-$TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --require-heartbeat $REQUIRE_HEARTBEAT" \
+  remote "--action install --market $m --staging $STAGE --backup-dir /root/launch-ops-backups/worker-$TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --require-heartbeat $REQUIRE_HEARTBEAT --verify-halt $VERIFY_HALT --pending-wait $ROLLBACK_PENDING_WAIT_SEC" \
     < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
-  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back). Not continuing."
+  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back, 5/6 = auto-rollback blocked: the patched code runs again with HALT kept). Not continuing."
   log "== $m now runs $SHA"
 done
-log "deployed $SHA to [$MARKETS]. Rollback: $0 --rollback $TS --markets \"$MARKETS\""
-log "backups under /root/launch-ops-backups/worker-$TS contain .env and state copies (secrets): prune once stable."
+log "deployed $SHA to [$TODO]. Rollback: $0 --rollback $TS --markets \"$TODO\""
+log "backups under /root/launch-ops-backups/worker-$TS hold code files + state snapshots (operator keys, mode 600). Once stable, prune:"
+log "  ssh $HOST 'bash -s -- --prune-days 14 --apply' < $HERE/cleanup-secret-backups.sh"
 exit 0
 }
