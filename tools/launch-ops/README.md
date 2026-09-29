@@ -49,11 +49,38 @@ The scripts install from that directory. Nothing else is touched until you run o
 
 Step numbers follow `LAUNCH-GO-NO-GO.md` section 4.
 
-### 1. OWNER: decide the policy
-Set the renter allowlist, the lease caps and the other policy values in the worker `.env` knobs
-(`RENTER_ALLOWLIST`, `MAX_ACTIVE_LEASES=20`, `MAX_RESERVATIONS_PER_RENTER=2`, and so on). They
-are delivered with the worker patch. Also decide who pays for revives, and whether to accept
-`TERMINAL_GAS_RETURN_MODE=skip`. Nothing in this directory changes these settings.
+### 1. OWNER: decide the policy, then write it into both worker `.env` files
+The soft launch is **allowlisted and fails closed** at every layer:
+- **Worker:** the keeper attests quotes only for `RENTER_ALLOWLIST`. `deploy-worker-patch.sh`
+  **refuses** (dry run and `--apply`, exit 8 on the box) to deploy into a v16 `.env` without a
+  non-empty, valid `RENTER_ALLOWLIST`, unless you run it with `ALLOW_OPEN_RENTALS=true` on purpose.
+  The worker itself logs a loud startup warning when it runs without an allowlist.
+- **Web:** in production the quote route answers 403 (private beta) when `LEASE_RENTER_ALLOWLIST`
+  is unset, unless `LEASE_OPEN_PUBLIC=true`.
+- **Per-renter cap:** the worker refuses (429, scope `renter`) a renter with
+  `MAX_ACTIVE_LEASES_PER_RENTER` (default 2) active leases + live reservations. The deploy
+  appends `MAX_ACTIVE_LEASES_PER_RENTER=2` to `.env` when it is absent (the only `.env` write a
+  deploy ever makes: atomic, mode and owner kept); an explicit value is kept.
+
+The worker patch does **not** carry these values; they live in `.env`. On the VPS, for `m` in `musu vipp`:
+```bash
+cd /root/kamigotchi/tools/vault-kit-v16-$m && cp -p .env .env.bak-$(date -u +%Y%m%dT%H%M%SZ)
+cat >> .env <<'EOF'
+RENTER_ALLOWLIST=0xTester1,0xTester2
+MAX_ACTIVE_LEASES=20
+MAX_ACTIVE_LEASES_PER_RENTER=2
+MAX_RESERVATIONS_PER_RENTER=2
+MAX_LIVE_RESERVATIONS=200
+RESERVATION_TTL_SEC=1200
+EOF
+```
+- Write the lines **unquoted**. The list is comma separated; entries are trimmed and lowercased,
+  and any entry that is not `0x` + 40 hex is a hard error in the worker, the web and the deploy
+  guard alike. Use the **identical** list for Vercel `LEASE_RENTER_ALLOWLIST`.
+- Keep `TERMINAL_GAS_RETURN_MODE=skip`. Leave `OPERATOR_TX_PRICING` unset (eip1559): the ops
+  sponsor and alerts price gas the same way (see "Gas pricing" below).
+- The running pre-hardening worker ignores these keys; they take effect at the deploy restart.
+- Also decide who pays for revives.
 
 ### 2. OWNER: harden SSH, then do a controlled reboot  [H6, VPS-5, VPS-7]
 Do this while no v16 lease is active. First check with `lease-transition-gate.sh`, which must print `GATE: SAFE`.
@@ -83,19 +110,34 @@ Controlled reboot (VPS-7): run `reboot`. Afterwards, run `./alerts/worker-alerts
 `0 condition(s) firing`, both lease hosts `http=404`, and no unit DOWN.
 
 ### 3/5. Worker patch deploy  [B2, H1-H5; the OWNER approves the deploy]
+**Before it:** step 1 (`.env` allowlist + knobs) and `./install-dropins.sh --apply` from step 6
+(OOMScoreAdjust=-500 for both workers and caddy), so an OOM during the deploy window kills
+something other than a worker.
+
 Run this from WSL. It reads the git repo, and the VPS side is piped over ssh.
 
 ```bash
 cd /home/matrix/wt-launch-ops/tools/launch-ops
-./deploy-worker-patch.sh --ref <worker sha>             # dry run: file plan per market, dependency drift, gate
-./deploy-worker-patch.sh --ref <worker sha> --apply     # stage -> tests on the box -> musu -> vipp
+./deploy-worker-patch.sh --ref <worker sha>             # dry run: file plan, dependency drift, launch guards, gate, test location
+./deploy-worker-patch.sh --ref <worker sha> --apply     # guards -> gate -> tests -> stage -> musu -> vipp
 ```
 
 With `--apply`, the script:
-- **Stages and tests.** It uploads `code/` (the files that get installed) and `full/` (the whole
-  `tools/vault-kit` tree of the ref, so tests that read `test-fixtures/` work) to
-  `/root/launch-ops-staging/worker-<ts>`, checks the two agree byte for byte, and runs
-  `node --test *.test.mjs` in `full/`. If the tests fail, nothing live changes.
+- **Checks the launch guards** in each market `.env` (read-only, counts only, never values): a
+  non-empty valid `RENTER_ALLOWLIST` (else refuse, unless `ALLOW_OPEN_RENTALS=true`), and every
+  numeric worker knob present parses (quotes are stripped like the worker loader). It logs
+  `launch guards [m]: allowlist=N renter(s) ... perRenterCap=...`. The install re-checks them
+  before touching anything (exit 8).
+- **Tests the staged tree, never unguarded next to the live workers** (`--tests auto|box|local`,
+  default `auto`). `code/` (the files that get installed) and `full/` (the whole `tools/vault-kit`
+  tree of the ref, so tests that read `test-fixtures/` work) must agree byte for byte.
+  - `box`: runs on the VPS as `nice -n 19 ionice -c 3 node --test --test-concurrency=1`, and
+    refuses (exit 9) while `MemAvailable` < `TEST_MIN_MEM_MB` (300). The suite peaks at ~135 MB RSS.
+  - `local`: runs off-box in WSL with the local vault-kit `node_modules`; the local `ethers`
+    version must equal the VPS one (`--allow-dep-change` overrides).
+  - `auto`: `box` when the VPS has 300 MB available, else `local` (the box had 153-197 MB on
+    2026-09-29, so today this means `local`).
+  If the tests fail, nothing live changes. Then `code/` + `full/` go to `/root/launch-ops-staging/worker-<ts>`.
 - **Skips markets that already run the ref.** A market whose file plan has no NEW/CHANGED runtime
   file (test files and `*.env.example` alone do not count) is not restarted, so a re-run is a no-op.
 - **Deploys one market at a time.** The order is **musu first** (0 jobs), then vipp. For each market it:
@@ -110,17 +152,30 @@ With `--apply`, the script:
   `ts >= restart` and be at most 120 s old. There must be no `[LEASE-ALERT]` line and no automatic restart.
 - **Auto-rollback** (exit 4). On a verify failure: stop the unit; wait up to
   `ROLLBACK_PENDING_WAIT_SEC` (300) until every `state.pendingTxs` entry is mined or dropped
-  (the old worker has no tx tracker and would re-send it); merge the reservation store back into
+  (the old worker has no tx tracker and would re-send it), then prune those resolved entries and
+  `txNonceHints` from the state file (the old worker saves them verbatim, and gate T1 would
+  otherwise refuse every later deploy); merge the reservation store back into
   the state file's `reservations` (the old worker reads only that) and rename the store to
   `*.reservations.json.rolled-back-<ts>`; restore the code; start. If a tx is still in flight
   (exit 5) or the merge conflicts (exit 6), the **patched** code is started again with `HALT`
   kept and a human decides. The next market is never touched.
-- **Files it never touches:** `.env*`, `heartbeat.json`, `node_modules`. The state file is only
-  rewritten by a rollback's reservation merge (atomic, same mode), and `HALT` only when the deploy created it.
+- **Files it never touches:** `.env.*` backups, `heartbeat.json`, `node_modules`. `.env` only gets
+  the `MAX_ACTIVE_LEASES_PER_RENTER=2` line when absent. The state file is only rewritten by a
+  rollback (pendingTxs prune + reservation merge; atomic, same mode), and `HALT` only when the deploy created it.
+- **RPC.** The pendingTxs checks (mined / dropped) go through the market `.env` `YOMINET_RPC`,
+  the node the worker itself sends through (the URL is never printed), else the public RPC. A tx
+  that only a private node has seen is therefore not mistaken for dropped.
 - **Dependencies.** It refuses if `tools/vault-kit/package.json` dependencies differ from the VPS
   copy, because there is no `npm install` on the box.
 - `TERMINAL_GAS_RETURN_MODE` / `TERMINAL_GAS_PULL_MODE` live in `.env`, so they are unchanged
   (currently return=skip, pull unset = check-only).
+- **Deploy the web right after the workers.** The patched worker rejects the current production
+  web's reserve call (it sends no `renter`), so between the worker deploy and the Vercel deploy
+  every quote returns 503. That fails closed; keep the window short, or `touch <market dir>/HALT`
+  until the web is live.
+- **A pre-existing `[LEASE-ALERT]`** (for example a transient `INGEST_ERROR`) inside the 120 s
+  verify makes it roll back (exit 4). That is fail-safe; if the tail shows only a transient
+  INGEST_ERROR, re-run `--apply`.
 
 Rollback: `./deploy-worker-patch.sh --rollback <ts> [--markets "vipp"] [--force]`
 - **It runs the transition gate first** for each market and refuses unless it prints SAFE.
@@ -144,16 +199,22 @@ ACTIVE farming far from expiry. The gate **refuses** (exit 3) if any of these ho
 | J1 | A non-returned worker job has factory stage 1 REQUESTED, 2 PREPARING, 4 CANCEL_REQUESTED, 5 FINALIZED or 6/7 RECOVERY_*. Stage 0 also counts: the request is cleared, but the worker has not finished the custody return. |
 | J2 | A non-returned job is ACTIVE, but its listing is `ending`, or `leaseEnd` is less than `GATE_EXPIRY_MARGIN_SEC` (1800 s) away or already past. |
 | J3 | A job's on-chain pod differs from the worker's pod. |
+| J4 | `state.retiredJobs` holds a superseded pod whose kami is not returned yet. The pre-hardening worker never reads `retiredJobs`, so a rollback would orphan that kami. |
+| J5 | `state.ingestRetry` holds a parked `RenterPodCreated` event. The cursor is already past it and the pre-hardening worker never replays it. |
 | C1 | Any listing on the market is in a transition stage on chain, or is leased and ending, even if the worker has not ingested it yet. |
 | C2 | A leased listing has no live worker job. |
-| R1 | A reservation bound to a signed quote (`attestedDigest`) is younger than `GATE_INFLIGHT_SEC` (1800 s): a renter may be submitting the create tx. The gate checks the state file and `*reservations*.json`. |
-| T1 | The worker's `pendingTxs` holds a transaction still in flight. |
+| R1 | A reservation bound to a signed quote (`attestedDigest`) can still become a create tx: its `quoteDeadline` is in the future, or it is younger than `GATE_INFLIGHT_SEC` (default `RESERVATION_TTL_SEC` + 900 = 2100 s, the attest window plus the quote lifetime). The gate checks the state file and `*reservations*.json`. |
+| T1 | The worker's `pendingTxs` holds a transaction still in flight. Each hash is resolved over the worker's RPC first: mined or unknown to the node (dropped) does not count; unreadable does. |
 
 Steady ACTIVE leases are allowed: a restart pauses reconciliation for about 30 s while Kamibots keeps farming.
 `GATE_ALLOW_ACTIVE=0` makes the gate refuse those too. If a chain or state read fails, the result
-is **UNDECIDED** (exit 1), and the deploy treats that as a refusal.
+is **UNDECIDED** (exit 1), and the deploy treats that as a refusal. The gate reads the chain
+through the market `.env` `YOMINET_RPC` when present (never printed), else the public RPC.
 
 ### 6. Ops hardening: drop-ins, alerts v2, H7 timers  [the OWNER approves each VPS change]
+
+Run `install-dropins.sh` **before** the worker deploy (3/5): it gives the workers OOM protection
+for the deploy window. The rest of this step comes after the deploy.
 
 ```bash
 cd /root/kamigotchi/tools/launch-ops
@@ -230,16 +291,38 @@ worker rewrites every tick.
   - stages 3-5: the on-chain request pod matches the job. Stage 0 (request cleared): the token is
     listed on this market and the listing is not re-leased (`renter == 0`); otherwise the job is stale;
   - the operator is a plain EOA;
-  - the operator's balance is below `EXIT_RESERVE_ACTIONS × OPERATOR_ACTION_GAS_FLOOR × gasPrice` (3 × 1.7M × 2.5 Mwei = 1.275e13 wei).
-- **Top-up amount:** up to `SPONSOR_TARGET_GAS_UNITS × gasPrice` (3e13 wei).
+  - the operator's balance (plus escrow at stage 3, the only stage where the worker can pull it)
+    is below the worker's exit-reserve **stop trigger** (see "Gas pricing": 3.74e13 wei today).
+- **Top-up amount:** up to `max(SPONSOR_TARGET_GAS_UNITS × feePerGas, resume level)` (6e13 wei
+  today), so a sponsor-funded lease clears the worker's resume level (5.61e13) and farms again.
 - **Caps:**
   - `SPONSOR_MAX_PER_LEASE_WEI` 1e14, cumulative per market, token and pod;
   - `SPONSOR_MAX_PER_DAY_WEI` 3e14, over a rolling 24 h;
   - `SPONSOR_WALLET_FLOOR_WEI` 2e14, a hard floor;
   - `SPONSOR_MAX_TX_PER_RUN` 3.
-- **Ledger:** `/var/lib/kami-lease-ops/sponsor-ledger.tsv`. The signer appends the row right after
-  broadcasting and **before** waiting, so a transfer that times out, or a run killed by systemd,
-  still counts toward both caps. Dropped transfers stay counted (conservative).
+- **Ledger, reserve-then-confirm:** `/var/lib/kami-lease-ops/sponsor-ledger.tsv`. The signer signs
+  the tx locally, appends the `sent` row (hash of the signed tx, nonce) and only **then**
+  broadcasts; if the append fails it does not broadcast at all. A broadcast whose RPC reply is lost
+  (the signer's RPC calls time out after 20 s), a receipt timeout, or a run killed by systemd
+  therefore still counts toward both caps; a row whose tx never reached the node resolves as
+  `dropped` and stays counted (conservative). Any failed send stops the run.
+
+**Gas pricing (sponsor, alerts; same as the worker).** Yominet bills an EIP-1559 tx at its
+`maxFeePerGas`, not at the gas price, and the worker default is `OPERATOR_TX_PRICING=eip1559`.
+Everything that budgets operator gas therefore prices exactly like the worker's
+`renter-pod-safety.mjs` (the test suite checks the numbers against the worker's own `exitReservePlan`):
+
+| Quantity | Formula | Live (gasPrice 2.5 Mwei, baseFee 2.5 Mwei, priority 0) |
+|---|---|---|
+| feePerGas | `max(2 × baseFee + eth_maxPriorityFeePerGas, gasPrice)` (`legacy`: gasPrice) | 5 Mwei |
+| action | feePerGas × (`OPERATOR_ACTION_GAS_FLOOR` 1.7M + 10 % unused-gas charge) | 9.35e12 wei |
+| reserve | `EXIT_RESERVE_ACTIONS` (3) × action (alerts ESCROW_LOW threshold) | 2.805e13 wei |
+| trigger | reserve + 1 action (worker stops the strategy below it; sponsor tops up below it) | 3.74e13 wei |
+| resume | trigger + `EXIT_RESUME_HEADROOM_ACTIONS` (2) × action | 5.61e13 wei |
+
+If the worker `.env` ever sets `OPERATOR_TX_PRICING=legacy`, set the same value in
+`/etc/kami-lease-ops/launch-ops.env`. The earlier stopgap (`OPERATOR_ACTION_GAS_FLOOR=3740000`,
+`SPONSOR_TARGET_GAS_UNITS=24000000`) is **not** needed and must not be set: it would now double-count.
 
 **Both timers:**
 - They share one `flock`, so they never race on the sponsor nonce. A run that finds the lock
@@ -255,13 +338,21 @@ or run `./install-launch-ops.sh --rollback <dir>`.
 
 **OWNER: clean up secret copies (VPS-12).** Read the dry run first; a shred cannot be undone.
 ```bash
-./cleanup-secret-backups.sh                       # dry run: names, modes and sizes only
-./cleanup-secret-backups.sh --apply               # shred unreferenced .env.*bak* files, drop group/world write, *.bak* -> 600
+./cleanup-secret-backups.sh                       # dry run: names, modes, sizes and derived ADDRESSES only
+./cleanup-secret-backups.sh --apply               # shred PROVEN-redundant .env.*bak* files, drop group/world write, *.bak* -> 600
 ./cleanup-secret-backups.sh --prune-days 14 --apply   # also delete worker deploy backups/staging older than 14 days
 ```
-The live `.env` is never touched, and a `.env` backup that a unit file references is kept.
-Today (read-only dry run) it would shred `.env.bak-stackA` in both v16 dirs and fix the mode of the
-777 `renter-pod-worker.mjs*` files.
+- **Nothing unproven is shredded.** A `.env` backup is shredded only when no unit file references
+  it **and** every `*PRIVATE_KEY*` in it (compared by derived address, node + ethers) and every
+  `*SEED*` / `*MNEMONIC*` value is also in a live `.env` on the box (`tools/*/.env`). Otherwise it is
+  **report-only**: kept, with its derived addresses printed. Copy it off-box, then re-run with
+  `--confirm-offbox-copy`. The same rule protects `.env` copies inside old deploy backups on
+  `--prune-days`. Without node/ethers nothing can be proven, so nothing is shredded.
+- The live `.env` is never touched. Only addresses are ever printed, never keys or file contents.
+- Today (read-only dry run, 2026-09-29): vipp's `.env.bak-stackA` holds one key, address
+  `0x5f6F…dFc1`, which is the `OPERATOR_PRIVATE_KEY` of the live `tools/vault-kit/.env`. It is
+  therefore proven redundant and would be shredded; it is **not** the v16 keeper `0x0d02…bcDc`.
+  The dry run also fixes the mode of the 777 `renter-pod-worker.mjs*` files.
 
 ### 7. OWNER: fund and set up
 - **Keeper** `0x0d0294C57B01ED7189b8A9ba354cf77b935abcDc`: top up to about 0.002 ETH. The alert fires below `KEEPER_MIN_WEI` (4e14).
@@ -286,8 +377,12 @@ The go/no-go re-check requires all of these:
 
 ## What alerts v2 checks
 
-Each condition gets one ntfy push per `COOLDOWN_SECS` (3600, same as the baseline). The state dir
-is the same as before (`/run/kami-worker-alerts`); run counters and the last-run stamp are in `/var/lib/kami-lease-ops`.
+Each condition gets one ntfy push per `COOLDOWN_SECS` (3600, same as the baseline). For the
+per-lease codes (DEAD_KAMI, ESCROW_LOW, EXIT_RESERVE_STOP, STAGE_STUCK, TX_TIMEOUT) the condition
+is keyed per (unit, code, `token=`), so a second lease's DEAD_KAMI inside the first one's cooldown
+is pushed too. The state dir is the same as before (`/run/kami-worker-alerts`); run counters and
+the last-run stamp are in `/var/lib/kami-lease-ops`. A malformed numeric knob in the env file
+(for example a quoted number) stops the run with a message naming the knob.
 
 | Check | Fires when | Code in the push |
 |---|---|---|
@@ -301,7 +396,7 @@ is the same as before (`/run/kami-worker-alerts`); run counters and the last-run
 | Tick failures | `lastTickOk=false` on `TICK_FAIL_RUNS` (2) consecutive checks | WORKER_STALL |
 | Job error | a non-returned job keeps `error` set on `JOB_ERROR_RUNS` (2) consecutive checks | STAGE_STUCK |
 | Stage age | PREPARING for more than 6 h; ACTIVE more than 1 h past `leaseEnd` and not ending; ending past the 2-day grace (`recoveryReady`) | STAGE_STUCK |
-| Operator gas | a job's operator balance plus pullable escrow is below the exit reserve (stages 3-5, and stage 0 while the token is listed and not re-leased; only stage 3 counts escrow as pullable) | ESCROW_LOW |
+| Operator gas | a job's operator balance plus pullable escrow is below the worker's exit reserve, priced at the billed fee (see "Gas pricing"; 2.805e13 wei today) (stages 3-5, and stage 0 while the token is listed and not re-leased; only stage 3 counts escrow as pullable) | ESCROW_LOW |
 | Keeper | balance below `KEEPER_MIN_WEI` | KEEPER_LOW |
 | VIPP float | `feeFloatClaimsLeft()` below `FEE_FLOAT_MIN_CLAIMS` | FEE_FLOAT_LOW |
 | Backing | `backingShortfall()` above 0 on either v16 market | BACKING_SHORTFALL |
@@ -332,9 +427,18 @@ LAUNCH_OPS_TEST_REMOTE=root@68.183.190.126 bash tools/launch-ops/tests/run-tests
 - **What is shimmed:** `systemctl`, `journalctl`, `ss`, `id` (root only for the installer, the
   deploy VPS half and the cleanup) and ntfy.
 - **What is real:** chain reads use the public RPC (read-only calls) or `tests/fake-rpc.mjs` on
-  127.0.0.1 (a fake chain for stage-0, cap, in-flight and rollback cases). The keeper/sponsor
-  `--apply` tests use a placeholder key file and a fake `ethers` dir, and assert that
-  `eth_sendRawTransaction` / `eth_chainId` were never called: nothing is ever signed.
+  127.0.0.1 (a fake chain for stage-0, cap, pricing, in-flight and rollback cases). The in-flight
+  keeper/sponsor `--apply` tests use a placeholder key file and a fake `ethers` dir, and assert
+  that `eth_sendRawTransaction` / `eth_chainId` were never called.
+- **Reserve-then-confirm tests** run the real signer (ethers) with the well-known test key 1
+  against the fake chain (chain id 31337, never a real network). The fake answers every
+  broadcast with an error, like a lost reply; the tests assert the ledger row exists, carries the
+  hash of exactly the raw tx that was broadcast, counts toward the caps and blocks the next run,
+  and that an unwritable ledger means no broadcast at all.
+- **Pricing parity:** the sponsor's printed action/reserve/trigger/resume are compared with the
+  worker ref's own `exitReservePlan` (from the staged tree).
+- **Gate tests** (remote mode) cover J4/J5, the R1 quote lifetime and T1 hash resolution with a
+  real mined Yominet tx hash read from the public RPC.
 - **The deploy staging test** builds the staging tree of `launch/worker-hardening` with
   `deploy-worker-patch.sh --local-stage` and runs its vault-kit suite through the VPS half
   (`--action test`), plus a control run on the old code-only layout, which must fail.
