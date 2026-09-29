@@ -17,19 +17,56 @@
  *   OPERATOR_RESERVATION_HOST, OPERATOR_RESERVATION_PORT,
  *   KAMIBOTS_API, KAMISTATS_URL, POLL_MS, START_BLOCK, WORKER_STATE_FILE,
  *   EVENT_CONFIRMATIONS (default 12; confirmed blocks only)
+ * Launch hardening (see renter-pod-config.mjs for defaults):
+ *   RENTER_ALLOWLIST, MAX_ACTIVE_LEASES, MAX_LIVE_RESERVATIONS,
+ *   MAX_RESERVATIONS_PER_RENTER, RESERVATION_TTL_SEC, TX_WAIT_TIMEOUT_MS,
+ *   FETCH_TIMEOUT_MS, TICK_WATCHDOG_SEC, HEARTBEAT_STALE_SEC,
+ *   ALERT_MIN_INTERVAL_SEC, STAGE_STUCK_ALERT_SEC,
+ *   RESERVATION_STATE_FILE (default <state>.reservations.json next to the
+ *   state file), WORKER_HALT_FILE (default HALT next to the state file; while
+ *   it exists the reservation server answers 503).
+ * Alerts needing a human are single lines starting with "[LEASE-ALERT] ".
  */
-import { timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   Contract,
+  FetchRequest,
   JsonRpcProvider,
   Wallet,
   id as keccakId,
   solidityPackedKeccak256,
 } from "ethers";
+import { LeaseAlertCode, createLeaseAlerter } from "./renter-pod-alerts.mjs";
+import { hardeningConfigFromEnv } from "./renter-pod-config.mjs";
+import {
+  RetiredJobAction,
+  ingestRenterPodRecords,
+  protectedReservationNonces,
+  renterPodEventRecord,
+  requestBelongsToOtherPod,
+  retiredJobAction,
+} from "./renter-pod-ingest.mjs";
+import {
+  buildHeartbeat,
+  createTickWatchdog,
+  fetchWithTimeout,
+  heartbeatPathFor,
+  reservationServiceHealth,
+  writeJsonAtomic,
+} from "./renter-pod-liveness.mjs";
+import { createReservationHandler } from "./renter-pod-reservation-server.mjs";
+import {
+  activeJobCount,
+  pruneReservations,
+  reservationFileFor,
+  reservationStats,
+} from "./renter-pod-reservations.mjs";
+import { loadWorkerState } from "./renter-pod-state.mjs";
+import { runWorkerTick, txKeyForJob } from "./renter-pod-tick.mjs";
+import { createTxTracker } from "./renter-pod-tx.mjs";
 import {
   buildKamibotsStartBody,
   kamibotsStrategySignature,
@@ -39,7 +76,6 @@ import {
   assertCanonicalCheckpoint,
   assertCursorSequence,
   checkpointForBlock,
-  eventIdentity,
 } from "./renter-pod-events.mjs";
 import {
   StageZeroAction,
@@ -53,16 +89,7 @@ import {
 } from "./renter-pod-recovery.mjs";
 import { advanceEndingLease } from "./renter-pod-ending.mjs";
 import { advancePreparingLease } from "./renter-pod-activation.mjs";
-import {
-  bindOperatorReservationQuote,
-  claimOperatorReservation,
-  initializeOperatorKeyState,
-  migrateLegacyJobKeys,
-  operatorWalletForJob,
-  purgeReturnedJobSecrets,
-  removeExpiredUnclaimedReservations,
-  reserveRandomOperator,
-} from "./renter-pod-keys.mjs";
+import { operatorWalletForJob, purgeReturnedJobSecrets } from "./renter-pod-keys.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const envPath = join(here, ".env");
@@ -116,9 +143,17 @@ const TERMINAL_GAS_PULL_MODE = terminalGasPullMode(
 );
 const RESERVATION_HOST = process.env.OPERATOR_RESERVATION_HOST || "127.0.0.1";
 const RESERVATION_PORT = Number(process.env.OPERATOR_RESERVATION_PORT || 8789);
-const ZERO = "0x0000000000000000000000000000000000000000";
+const HARDENING = hardeningConfigFromEnv(process.env);
+const RESERVATION_FILE = process.env.RESERVATION_STATE_FILE || reservationFileFor(STATE_FILE);
+const HEARTBEAT_FILE = heartbeatPathFor(STATE_FILE);
+const HALT_FILE = process.env.WORKER_HALT_FILE || join(dirname(STATE_FILE), "HALT");
 
-const provider = new JsonRpcProvider(RPC);
+const leaseAlert = createLeaseAlerter({ minIntervalMs: HARDENING.alertMinIntervalMs });
+
+// Every JSON-RPC call gets a hard deadline (ethers' default is 5 minutes).
+const rpcRequest = new FetchRequest(RPC);
+rpcRequest.timeout = HARDENING.fetchTimeoutMs;
+const provider = new JsonRpcProvider(rpcRequest);
 const keeper = new Wallet(KEEPER_KEY, provider);
 const world = new Contract(
   WORLD,
@@ -162,18 +197,29 @@ const POD_ABI = [
   "function sweepMusu() returns (uint256)",
   "function musuBalance() view returns (uint256)",
 ];
-const state = existsSync(STATE_FILE)
-  ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
-  : { lastBlock: Number(process.env.START_BLOCK || 0), jobs: {} };
-initializeOperatorKeyState(state);
-const save = () => {
-  const temp = `${STATE_FILE}.tmp`;
-  writeFileSync(temp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  chmodSync(temp, 0o600);
-  renameSync(temp, STATE_FILE);
-};
-const migratedLegacyJobs = migrateLegacyJobKeys(state, LEGACY_OPERATOR_SEED);
-if (migratedLegacyJobs) save();
+// Job state (custody, cursor) and reservations (operator keys for quotes in
+// flight) are separate atomic files: a quote request rewrites only the small
+// reservation file. Legacy state files that embed reservations are migrated:
+// the store is written first, then the state file without them.
+const { state, save, saveReservations } = loadWorkerState({
+  stateFile: STATE_FILE,
+  reservationFile: RESERVATION_FILE,
+  startBlock: process.env.START_BLOCK,
+  legacySeed: LEGACY_OPERATOR_SEED,
+});
+
+const txs = createTxTracker({
+  state,
+  provider,
+  timeoutMs: HARDENING.txWaitTimeoutMs,
+  alert: leaseAlert,
+  persist: save,
+});
+/** Send one job-scoped tx with a bounded wait (see renter-pod-tx.mjs). */
+const sendTx = (job, label, sendFn) => txs.send(txKeyForJob(job), label, sendFn);
+
+let lastIngestOkAt = null;
+let lastHeartbeat = null;
 
 let idOwnsKami;
 let kamiStateComponent;
@@ -183,75 +229,37 @@ let moveSystem;
 let sendSystem;
 let marketAccID;
 
-function authorizedReservationRequest(header) {
-  const prefix = "Bearer ";
-  if (!header?.startsWith(prefix)) return false;
-  const supplied = Buffer.from(header.slice(prefix.length));
-  const expected = Buffer.from(RESERVATION_TOKEN);
-  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
-}
-
-async function readReservationBody(request) {
-  let body = "";
-  for await (const chunk of request) {
-    body += chunk;
-    if (Buffer.byteLength(body) > 16_384) throw new Error("reservation body too large");
+function reservationHealth() {
+  let halted = false;
+  try {
+    halted = existsSync(HALT_FILE);
+  } catch {
+    halted = true;
   }
-  return JSON.parse(body || "{}");
-}
-
-function writeJson(response, status, body) {
-  response.writeHead(status, {
-    "Content-Type": "application/json",
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
+  return reservationServiceHealth({
+    nowMs: Date.now(),
+    heartbeat: lastHeartbeat,
+    lastIngestOkAtMs: lastIngestOkAt,
+    staleMs: HARDENING.heartbeatStaleMs,
+    halted,
   });
-  response.end(JSON.stringify(body));
 }
 
 function startReservationServer() {
-  const server = createServer(async (request, response) => {
-    try {
-      if (
-        request.method !== "POST"
-          || (request.url !== "/v1/operator-reservations"
-            && request.url !== "/v1/operator-reservations/attest")
-      ) {
-        writeJson(response, 404, { error: "not found" });
-        return;
-      }
-      if (!authorizedReservationRequest(request.headers.authorization)) {
-        writeJson(response, 401, { error: "unauthorized" });
-        return;
-      }
-      const body = await readReservationBody(request);
-      if (String(body.market).toLowerCase() !== MARKET.toLowerCase() || String(body.factory).toLowerCase() !== FACTORY.toLowerCase()) {
-        writeJson(response, 400, { error: "wrong market or factory" });
-        return;
-      }
-      if (request.url === "/v1/operator-reservations") {
-        const reservation = reserveRandomOperator(state, String(body.nonce));
-        save();
-        writeJson(response, 201, { operator: reservation.operator });
-        return;
-      }
-
-      const quote = body.quote;
-      const nonce = String(quote?.nonce ?? "").toLowerCase();
-      const reservation = state.reservations?.[nonce];
-      if (!quote || !reservation) {
-        throw new Error("operator attestation does not match a live reservation");
-      }
-      const digest = await factory.quoteDigest(quote);
-      bindOperatorReservationQuote(state, nonce, quote.operator, digest);
-      save();
-      const signature = keeper.signingKey.sign(digest).serialized;
-      writeJson(response, 200, { keeperSignature: signature });
-    } catch (error) {
-      console.error("operator reservation failed:", error instanceof Error ? error.message : error);
-      writeJson(response, 400, { error: "operator reservation failed" });
-    }
-  });
+  const server = createServer(
+    createReservationHandler({
+      state,
+      token: RESERVATION_TOKEN,
+      market: MARKET,
+      factory: FACTORY,
+      policy: HARDENING,
+      health: reservationHealth,
+      quoteDigest: (quote) => factory.quoteDigest(quote),
+      signDigest: (digest) => keeper.signingKey.sign(digest).serialized,
+      saveReservations,
+      alert: leaseAlert,
+    })
+  );
   server.requestTimeout = 5_000;
   server.headersTimeout = 6_000;
   return new Promise((resolve, reject) => {
@@ -312,14 +320,14 @@ async function wire() {
 }
 
 async function kb(path, { method = "GET", body, apiKey } = {}) {
-  const response = await fetch(`${KAMIBOTS}${path}`, {
+  const response = await fetchWithTimeout(`${KAMIBOTS}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
       ...(apiKey ? { "X-Agent-Key": apiKey } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
-  });
+  }, { timeoutMs: HARDENING.fetchTimeoutMs });
   const text = await response.text();
   if (!response.ok) throw new Error(`${method} ${path} -> ${response.status}: ${text.slice(0, 180)}`);
   try { return JSON.parse(text); } catch { return { raw: text }; }
@@ -352,7 +360,11 @@ async function registerKamibots(operator) {
 }
 
 async function tileFor(job) {
-  const response = await fetch(`${KAMISTATS}/api/vault/lease-tiles?market=${MARKET}`);
+  const response = await fetchWithTimeout(
+    `${KAMISTATS}/api/vault/lease-tiles?market=${MARKET}`,
+    {},
+    { timeoutMs: HARDENING.fetchTimeoutMs }
+  );
   if (!response.ok) throw new Error(`tile catalog -> ${response.status}`);
   const data = await response.json();
   const tile = data.tiles?.find((row) => Number(row.node) === Number(job.node));
@@ -368,11 +380,27 @@ async function walk(job, operator, accID) {
     : job.tile.path.slice(Math.max(0, job.tile.path.indexOf(current) + 1));
   for (const room of route) {
     if (current === Number(job.tile.room)) break;
-    await (await moveSystem.connect(operator).executeTyped(Number(room))).wait();
+    await sendTx(job, `move:${room}`, () => moveSystem.connect(operator).executeTyped(Number(room)));
     current = Number(await roomComponent.get(accID));
     if (current !== Number(room)) throw new Error(`walk expected room ${room}, got ${current}`);
   }
   if (current !== Number(job.tile.room)) throw new Error(`pod stopped in room ${current}`);
+}
+
+async function applyIngest(records) {
+  return ingestRenterPodRecords(state, records, {
+    readRequestPod: async (tokenIndex) => (await factory.requests(tokenIndex)).pod,
+    nowMs: Date.now(),
+    alert: leaseAlert,
+    log: (line) => console.error(line),
+  });
+}
+
+/** Delete claimed reservations only after the jobs holding their keys are durable. */
+function releaseClaimedReservations(claimedNonces) {
+  if (!claimedNonces.length) return;
+  for (const nonce of claimedNonces) delete state.reservations[nonce];
+  saveReservations();
 }
 
 async function ingestEvents() {
@@ -388,7 +416,16 @@ async function ingestEvents() {
   const confirmedTip = latest - EVENT_CONFIRMATIONS;
   if (confirmedTip < 0) return;
   if (!state.lastBlock) state.lastBlock = Math.max(0, confirmedTip - 2_000);
-  if (state.lastBlock > confirmedTip) return;
+  if (state.lastBlock > confirmedTip) {
+    // No new confirmed range: still retry parked events.
+    if (Object.keys(state.ingestRetry).length) {
+      const { claimedNonces } = await applyIngest([]);
+      save();
+      releaseClaimedReservations(claimedNonces);
+    }
+    lastIngestOkAt = Date.now();
+    return;
+  }
   const confirmedBlockBefore = await provider.getBlock(confirmedTip);
   if (!confirmedBlockBefore) throw new Error(`confirmed block ${confirmedTip} is unavailable`);
   const nextCursor = checkpointForBlock(confirmedBlockBefore);
@@ -401,46 +438,25 @@ async function ingestEvents() {
   // a reservation or changing any durable job state.
   const confirmedBlockAfter = await provider.getBlock(confirmedTip);
   assertCanonicalCheckpoint(nextCursor, confirmedBlockAfter);
+  const records = events.map(renterPodEventRecord);
 
-  for (const event of events) {
-    const args = event.args;
-    const identity = eventIdentity(event);
-    const tokenIndex = Number(args.tokenIndex);
-    const eventNonce = String(args.nonce);
-    const existing = state.jobs[tokenIndex];
-    if (!existing || String(existing.nonce).toLowerCase() !== eventNonce.toLowerCase()) {
-      if (existing && !existing.returned) {
-        throw new Error(`received a second active RoomPod event for Kami #${tokenIndex}`);
-      }
-      state.jobs[tokenIndex] = {
-        tokenIndex,
-        renter: String(args.renter),
-        node: Number(args.nodeIndex),
-        pod: String(args.pod),
-        operator: String(args.operator),
-        operatorKey: claimOperatorReservation(state, eventNonce, String(args.operator)),
-        nonce: eventNonce,
-        creds: null,
-        strategyStarted: false,
-        finalized: false,
-        returned: false,
-        eventBlock: event.blockNumber,
-        eventBlockHash: identity.blockHash,
-        eventTransactionHash: identity.transactionHash,
-        eventIndex: identity.index,
-        eventId: identity.id,
-      };
-    }
-  }
+  // Per-event isolation (THR-01): an event that cannot be applied is parked in
+  // state.ingestRetry with an INGEST_ERROR alert; it never blocks the cursor
+  // or any other token. The parked record is saved together with the cursor.
+  const { claimedNonces } = await applyIngest(records);
   state.lastBlock = confirmedTip + 1;
   state.eventCursor = nextCursor;
-  // Events are ingested before cleanup, so a valid on-chain request always
-  // claims its key even if the worker was offline past the quote deadline.
-  removeExpiredUnclaimedReservations(state);
+  // Block time of the ingested tip: the reservation pruner uses it to prove a
+  // signed quote's deadline has passed on-chain before dropping its key.
+  const tipTime = Number(confirmedBlockBefore.timestamp);
+  if (Number.isFinite(tipTime) && tipTime > 0) state.ingestedThroughSec = tipTime;
   save();
+  releaseClaimedReservations(claimedNonces);
+  lastIngestOkAt = Date.now();
 }
 
-async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = true, required = true } = {}) {
+async function ensureOperatorGas(job, request, operator, { allowPull = true, required = true } = {}) {
+  const tokenIndex = job.tokenIndex;
   const [balance, feeData] = await Promise.all([
     provider.getBalance(operator.address),
     provider.getFeeData(),
@@ -478,7 +494,7 @@ async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = tr
   }
   if (health.topUpAmount === 0n) return;
 
-  await (await factory.connect(operator).pullGas(tokenIndex, health.topUpAmount)).wait();
+  await sendTx(job, "pullGas", () => factory.connect(operator).pullGas(tokenIndex, health.topUpAmount));
   const fundedBalance = await provider.getBalance(operator.address);
   if (fundedBalance < minimumActionWei) {
     throw new Error(
@@ -488,7 +504,8 @@ async function ensureOperatorGas(tokenIndex, request, operator, { allowPull = tr
   }
 }
 
-async function returnUnusedOperatorGas(tokenIndex, operator) {
+async function returnUnusedOperatorGas(job, operator) {
+  const tokenIndex = job.tokenIndex;
   if (TERMINAL_GAS_RETURN_MODE === TerminalGasReturnMode.SKIP) return;
   const balance = await provider.getBalance(operator.address);
   if (balance === 0n) return;
@@ -505,14 +522,14 @@ async function returnUnusedOperatorGas(tokenIndex, operator) {
   // A legacy-priced transaction makes its maximum cost exact on Yominet. The
   // value can therefore return the rest of the ephemeral EOA's balance before
   // its key is erased; the factory includes it in the renter's final refund.
-  await (
-    await connected.returnGas(tokenIndex, {
+  await sendTx(job, "returnGas", () =>
+    connected.returnGas(tokenIndex, {
       value: amount,
       gasLimit,
       gasPrice,
       type: 0,
     })
-  ).wait();
+  );
 }
 
 async function stopStrategy(job) {
@@ -572,38 +589,49 @@ async function processJob(job) {
   const stage = Number(request.stage);
   const actualAccID = await idOwnsKami.safeGet(listing.kamiID);
 
+  // THR-01: the factory's live request for this Kami belongs to a newer pod,
+  // so this job's request was deleted (cancel/refund). Never drive the newer
+  // request's stage machine with this job's pod and operator: only bring the
+  // Kami home from THIS pod if it is somehow there, then retire.
+  if (requestBelongsToOtherPod(job, request)) {
+    await finishRetiredJob(job, { listing, podAccID, actualAccID, operator });
+    return;
+  }
+
   if (stage === 1) {
     if (!job.creds) {
       job.creds = await registerKamibots(operator);
       save();
     }
     await walk(job, operator, podAccID);
-    await (await factory.connect(keeper).markLeasePreparing(job.tokenIndex)).wait();
+    await sendTx(job, "markLeasePreparing", () => factory.connect(keeper).markLeasePreparing(job.tokenIndex));
     return;
   }
 
   if (stage === 2) {
     if (actualAccID === marketAccID) {
-      await (await factory.connect(keeper).routePreparedKami(job.tokenIndex)).wait();
+      await sendTx(job, "routePreparedKami", () => factory.connect(keeper).routePreparedKami(job.tokenIndex));
       return;
     }
     if (actualAccID !== podAccID) return;
-    await ensureOperatorGas(job.tokenIndex, request, operator);
+    await ensureOperatorGas(job, request, operator);
     await advancePreparingLease({
       reconcileStrategy: () => reconcileStrategy(job),
       readKamiState: () => kamiStateComponent.get(listing.kamiID),
       activateLease: async () => {
-        await (await factory.connect(keeper).activateProvisionedLease(job.tokenIndex)).wait();
+        await sendTx(job, "activateProvisionedLease", () =>
+          factory.connect(keeper).activateProvisionedLease(job.tokenIndex)
+        );
       },
     });
     return;
   }
 
   if (stage === 3) {
-    await ensureOperatorGas(job.tokenIndex, request, operator);
+    await ensureOperatorGas(job, request, operator);
     const now = Math.floor(Date.now() / 1000);
     if (!listing.ending && Number(listing.leaseEnd) > 0 && now > Number(listing.leaseEnd)) {
-      await (await market.connect(operator).endLease(job.tokenIndex)).wait();
+      await sendTx(job, "endLease", () => market.connect(operator).endLease(job.tokenIndex));
       return;
     }
     if (listing.ending) {
@@ -618,10 +646,10 @@ async function processJob(job) {
           );
           const connectedStop = harvestStopSystem.connect(operator);
           await connectedStop.executeTyped.staticCall(harvestID);
-          await (await connectedStop.executeTyped(harvestID)).wait();
+          await sendTx(job, "stopHarvest", () => connectedStop.executeTyped(harvestID));
         },
         finalizeLease: async () => {
-          await (await factory.connect(operator).finalizeMarketLease(job.tokenIndex)).wait();
+          await sendTx(job, "finalizeMarketLease", () => factory.connect(operator).finalizeMarketLease(job.tokenIndex));
         },
         markFinalized: async () => {
           job.finalized = true;
@@ -637,14 +665,14 @@ async function processJob(job) {
   if (stage === 4) {
     await stopStrategy(job);
     if (actualAccID === podAccID) {
-      await ensureOperatorGas(job.tokenIndex, request, operator, {
+      await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
-      await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
+      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
       return;
     }
     if (actualAccID === marketAccID) {
-      await (await factory.connect(keeper).recoverPreparingFromHub(job.tokenIndex)).wait();
+      await sendTx(job, "recoverPreparingFromHub", () => factory.connect(keeper).recoverPreparingFromHub(job.tokenIndex));
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
@@ -653,15 +681,17 @@ async function processJob(job) {
         // against the real balance and skips when unaffordable, and the call
         // after it is keeper-signed. Requiring a full action here wedged
         // terminal cleanup on dust (see ensureOperatorGas).
-        await ensureOperatorGas(job.tokenIndex, request, operator, {
+        await ensureOperatorGas(job, request, operator, {
           allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
           required: false,
         });
       }
-      await returnUnusedOperatorGas(job.tokenIndex, operator);
+      await returnUnusedOperatorGas(job, operator);
       // This factory entrypoint is permissionless. Use the durable keeper after
       // the ephemeral operator has returned its remaining balance.
-      await (await factory.connect(keeper).finalizePreparingCancellation(job.tokenIndex)).wait();
+      await sendTx(job, "finalizePreparingCancellation", () =>
+        factory.connect(keeper).finalizePreparingCancellation(job.tokenIndex)
+      );
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -672,10 +702,10 @@ async function processJob(job) {
   if (stage === 5) {
     await stopStrategy(job);
     if (actualAccID === podAccID) {
-      await ensureOperatorGas(job.tokenIndex, request, operator, {
+      await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
-      await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
+      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
       return;
     }
     if (actualAccID === BigInt(listing.owner)) {
@@ -684,13 +714,13 @@ async function processJob(job) {
         // against the real balance and skips when unaffordable, and the call
         // after it is keeper-signed. Requiring a full action here wedged
         // terminal cleanup on dust (see ensureOperatorGas).
-        await ensureOperatorGas(job.tokenIndex, request, operator, {
+        await ensureOperatorGas(job, request, operator, {
           allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
           required: false,
         });
       }
-      await returnUnusedOperatorGas(job.tokenIndex, operator);
-      await (await factory.connect(keeper).finalizeGasRefund(job.tokenIndex)).wait();
+      await returnUnusedOperatorGas(job, operator);
+      await sendTx(job, "finalizeGasRefund", () => factory.connect(keeper).finalizeGasRefund(job.tokenIndex));
       job.returned = true;
       purgeReturnedJobSecrets(job);
       save();
@@ -712,15 +742,15 @@ async function processJob(job) {
     });
     if (action === StageZeroAction.RETURN_FROM_POD) {
       await stopStrategy(job);
-      await ensureOperatorGas(job.tokenIndex, request, operator, { allowPull: false });
-      await (await sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)).wait();
+      await ensureOperatorGas(job, request, operator, { allowPull: false });
+      await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
       save();
       return;
     }
     if (action === StageZeroAction.CLEAR_OWNER_RETURN) {
-      await (await market.connect(operator).clearReturned(job.tokenIndex)).wait();
+      await sendTx(job, "clearReturned", () => market.connect(operator).clearReturned(job.tokenIndex));
     } else if (action === StageZeroAction.CONFIRM_POOL_RETURN) {
-      await (await market.connect(operator).confirmReturnedToPool(job.tokenIndex)).wait();
+      await sendTx(job, "confirmReturnedToPool", () => market.connect(operator).confirmReturnedToPool(job.tokenIndex));
     } else if (action === StageZeroAction.WAIT) {
       save();
       return;
@@ -731,30 +761,123 @@ async function processJob(job) {
   }
 }
 
-async function tick() {
-  await ingestEvents();
-  for (const job of Object.values(state.jobs)) {
-    if (job.returned) continue;
-    try {
-      await processJob(job);
-      job.error = null;
-    } catch (error) {
-      job.error = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
-      console.error(`#${job.tokenIndex}: ${job.error}`);
-    }
+/**
+ * Retired job (superseded pod for a Kami that has a newer request): stop its
+ * Kamibots strategy, return the Kami if it is still in this job's pod, then
+ * mark it returned. Market flags belong to the live job and are not touched.
+ */
+async function finishRetiredJob(job, { listing, podAccID, actualAccID, operator }) {
+  await stopStrategy(job);
+  const action = retiredJobAction({ actualAccID, podAccID });
+  if (action === RetiredJobAction.RETURN_FROM_POD) {
+    await ensureOperatorGas(job, { gasBudget: 0n }, operator, { allowPull: false });
+    await sendTx(job, "kamiSend(retired)", () =>
+      sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)
+    );
+    save();
+    return;
   }
+  job.finalized = true;
+  job.returned = true;
+  purgeReturnedJobSecrets(job);
   save();
+  console.log(`#${job.tokenIndex}: retired superseded pod ${job.pod}`);
 }
 
+async function processRetiredJob(job) {
+  const pod = new Contract(job.pod, POD_ABI, provider);
+  const [listing, podAccID] = await Promise.all([market.listings(job.tokenIndex), pod.accID()]);
+  const actualAccID = await idOwnsKami.safeGet(listing.kamiID);
+  const needsOperator = retiredJobAction({ actualAccID, podAccID }) === RetiredJobAction.RETURN_FROM_POD;
+  const operator = needsOperator ? operatorWalletForJob(job, provider) : null;
+  await finishRetiredJob(job, { listing, podAccID, actualAccID, operator });
+}
+
+function pruneExpiredReservations() {
+  const removed = pruneReservations(state, {
+    nowMs: Date.now(),
+    ttlMs: HARDENING.reservationTtlMs,
+    ingestedThroughSec: state.ingestedThroughSec,
+    protectedNonces: protectedReservationNonces(state),
+  });
+  if (removed) saveReservations();
+  return removed;
+}
+
+function writeHeartbeat({ tickMs, lastTickOk }) {
+  const heartbeat = buildHeartbeat({
+    nowMs: Date.now(),
+    lastBlock: state.lastBlock,
+    lastTickOk,
+    activeJobs: activeJobCount(state),
+    liveReservations: reservationStats(state, {
+      nowMs: Date.now(),
+      ttlMs: HARDENING.reservationTtlMs,
+    }).live,
+    tickMs,
+  });
+  writeJsonAtomic(HEARTBEAT_FILE, heartbeat, { mode: 0o644, pretty: false });
+  lastHeartbeat = heartbeat;
+}
+
+async function tick() {
+  const result = await runWorkerTick({
+    state,
+    ingest: ingestEvents,
+    prune: pruneExpiredReservations,
+    processJob,
+    processRetiredJob,
+    txs,
+    alert: leaseAlert,
+    log: (line) => console.error(line),
+    stageStuckAlertMs: HARDENING.stageStuckAlertMs,
+    save,
+  });
+  // Only a tick that ran to completion refreshes the heartbeat.
+  writeHeartbeat({ tickMs: result.tickMs, lastTickOk: result.ingestOk });
+}
+
+// A hung await (dropped tx, stalled RPC/Kamibots socket) keeps systemd's unit
+// "active" while nothing advances. Exit so Restart=always brings up a fresh
+// process; pending txs are persisted in the state file, so the restart never
+// double-sends them.
+const watchdog = createTickWatchdog({
+  limitMs: HARDENING.tickWatchdogMs,
+  onStall: ({ elapsedMs, limitMs }) => {
+    leaseAlert(LeaseAlertCode.WORKER_STALL, {
+      market: MARKET,
+      tickSec: Math.floor(elapsedMs / 1000),
+      limitSec: Math.floor(limitMs / 1000),
+      lastBlock: state.lastBlock,
+      action: "exit-for-restart",
+    });
+    process.exit(1);
+  },
+});
+setInterval(() => watchdog.check(), Math.min(10_000, Math.max(1_000, Math.floor(HARDENING.tickWatchdogMs / 4)))).unref();
+
+watchdog.begin();
 await wire();
+watchdog.end();
 await startReservationServer();
 console.log(`operator reservations listening on http://${RESERVATION_HOST}:${RESERVATION_PORT}`);
 console.log(
   `renter-funded worker ready: market ${MARKET}, factory ${FACTORY}, keeper ${keeper.address}, `
     + `terminalGasReturn=${TERMINAL_GAS_RETURN_MODE}, terminalGasPull=${TERMINAL_GAS_PULL_MODE}`
 );
+console.log(
+  `launch guards: allowlist=${HARDENING.renterAllowlist ? `${HARDENING.renterAllowlist.size} renters` : "off"}, `
+    + `maxActiveLeases=${HARDENING.maxActiveLeases}, maxLiveReservations=${HARDENING.maxLiveReservations}, `
+    + `maxReservationsPerRenter=${HARDENING.maxReservationsPerRenter}, `
+    + `reservationTtlSec=${HARDENING.reservationTtlMs / 1000}, txWaitTimeoutMs=${HARDENING.txWaitTimeoutMs}, `
+    + `fetchTimeoutMs=${HARDENING.fetchTimeoutMs}, tickWatchdogSec=${HARDENING.tickWatchdogMs / 1000}, `
+    + `heartbeatStaleSec=${HARDENING.heartbeatStaleMs / 1000}, heartbeat=${HEARTBEAT_FILE}, `
+    + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}`
+);
 for (;;) {
   const started = Date.now();
+  watchdog.begin();
   await tick().catch((error) => console.error("tick failed:", error.message || error));
+  watchdog.end();
   await new Promise((resolve) => setTimeout(resolve, Math.max(1_000, POLL_MS - (Date.now() - started))));
 }
