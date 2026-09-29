@@ -27,13 +27,52 @@ test("ingest failure is alerted but every known job is still processed", async (
     alert: (code, details) => alerts.push({ code, details }),
     log: (line) => logs.push(line),
     save: () => saved++,
+    ingestAlertAfter: 1,
   });
   assert.equal(result.ingestOk, false);
   assert.deepEqual(processed, [1, 2], "returned jobs are skipped, others processed");
   assert.equal(alerts[0].code, "INGEST_ERROR");
   assert.equal(alerts[0].details.scope, "batch");
-  assert.match(logs[0], /^ingest failed: event cursor reorg/);
+  assert.match(logs[0], /^ingest failed \(1 in a row\): event cursor reorg/);
   assert.equal(saved, 1);
+});
+
+test("final-verify: one transient ingest failure is logged, not alerted; a persisting one is (default 2 ticks)", async () => {
+  let clock = 0;
+  const alerts = [];
+  const logs = [];
+  const ingestHealth = { failures: 0, since: null };
+  let fail = true;
+  const tick = () =>
+    runWorkerTick({
+      state: { jobs: {} },
+      ingest: async () => {
+        if (fail) throw new Error("confirmed block 123 is unavailable");
+      },
+      processJob: async () => {},
+      processRetiredJob: async () => {},
+      alert: (code, details) => alerts.push({ code, details }),
+      log: (line) => logs.push(line),
+      now: () => clock,
+      ingestHealth,
+    });
+  await tick();
+  assert.deepEqual(alerts, [], "a single RPC blip does not alert (nor fail a deploy verify)");
+  assert.match(logs[0], /ingest failed \(1 in a row\)/);
+  fail = false;
+  clock += 30_000;
+  await tick();
+  assert.equal(ingestHealth.failures, 0, "a good tick resets the streak");
+  fail = true;
+  clock += 30_000;
+  await tick();
+  assert.deepEqual(alerts, []);
+  clock += 30_000;
+  await tick();
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].code, "INGEST_ERROR");
+  assert.equal(alerts[0].details.failures, 2);
+  assert.equal(alerts[0].details.sinceSec, 30);
 });
 
 test("reservation pruning runs even when ingest is failing", async () => {

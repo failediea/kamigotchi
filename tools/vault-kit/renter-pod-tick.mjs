@@ -44,9 +44,14 @@ async function runJob(job, handler, { txs, alert, log, nowMs, stageStuckAlertMs,
 }
 
 /**
- * One worker tick. Ingest failure is contained: it is alerted, the durable
- * cursor stays where it was, and every already-known job still gets its
- * endings, gas and returns processed (THR-01 froze all of them).
+ * One worker tick. Ingest failure is contained: the durable cursor stays where
+ * it was, and every already-known job still gets its endings, gas and returns
+ * processed (THR-01 froze all of them). A batch ingest failure is alerted
+ * (INGEST_ERROR scope=batch) only once it has failed `ingestAlertAfter` ticks
+ * in a row: the live RPC drops 1-4 isolated reads a day ("confirmed block N
+ * is unavailable"), and one such blip must not page anyone or fail a deploy
+ * verify window. `ingestHealth` is the caller's object that carries the
+ * consecutive-failure count across ticks.
  */
 export async function runWorkerTick({
   state,
@@ -68,16 +73,33 @@ export async function runWorkerTick({
   // Rotates the job order each tick, so no job is permanently queued behind
   // a slow prefix of other jobs.
   startOffset = 0,
+  ingestHealth = { failures: 0, since: null },
+  ingestAlertAfter = 2,
 }) {
   const startedAt = now();
   let ingestOk = true;
   try {
     await ingest();
+    ingestHealth.failures = 0;
+    ingestHealth.since = null;
   } catch (error) {
     ingestOk = false;
     const message = errorText(error);
-    log(`ingest failed: ${message}`);
-    alert(LeaseAlertCode.INGEST_ERROR, { scope: "batch", err: message.slice(0, 200) }, { key: "batch" });
+    ingestHealth.failures = (Number(ingestHealth.failures) || 0) + 1;
+    ingestHealth.since ??= startedAt;
+    log(`ingest failed (${ingestHealth.failures} in a row): ${message}`);
+    if (ingestHealth.failures >= ingestAlertAfter) {
+      alert(
+        LeaseAlertCode.INGEST_ERROR,
+        {
+          scope: "batch",
+          failures: ingestHealth.failures,
+          sinceSec: Math.floor((now() - Number(ingestHealth.since)) / 1000),
+          err: message.slice(0, 200),
+        },
+        { key: "batch" }
+      );
+    }
   }
   onProgress("ingest");
 
