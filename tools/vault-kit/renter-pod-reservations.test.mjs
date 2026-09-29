@@ -6,8 +6,13 @@ import test from "node:test";
 import { hardeningConfigFromEnv } from "./renter-pod-config.mjs";
 import { reserveRandomOperator } from "./renter-pod-keys.mjs";
 import {
+  ATTEST_PROVISIONAL_MS,
+  RefusalScope,
   admitAttestation,
   admitReservation,
+  holdAttestationSlot,
+  leaseCapacity,
+  renterLeaseLoad,
   loadReservationStore,
   pruneReservations,
   reservationFileFor,
@@ -41,7 +46,7 @@ test("per-renter cap (default 2) is 429 RESERVATION_CAP", () => {
   const result = admitReservation(state, { renter: renter(1), nonce: nonce(99), nowMs: 0, policy: policy() });
   assert.equal(result.status, 429);
   assert.equal(result.code, "RESERVATION_CAP");
-  assert.equal(result.details.scope, "renter");
+  assert.equal(result.details.scope, "reservation");
   assert.equal(admitReservation(state, { renter: renter(2), nonce: nonce(99), nowMs: 0, policy: policy() }).ok, true);
 });
 
@@ -51,7 +56,7 @@ test("global live-reservation cap is 429 RESERVATION_CAP", () => {
   const result = admitReservation(state, { renter: renter(1), nonce: nonce(99), nowMs: 0, policy: tight });
   assert.equal(result.status, 429);
   assert.equal(result.code, "RESERVATION_CAP");
-  assert.equal(result.details.scope, "global");
+  assert.equal(result.details.scope, "market");
 });
 
 const attest = (state, n, { tokenIndex, deadlineSec = 15 * 60 } = {}) => {
@@ -87,7 +92,7 @@ test("lease cap counts active leases plus DISTINCT attested listings: 429 LEASE_
   const refused = admitAttestation(state, state.reservations[nonce(4)], { quote: quote(11), nowMs: 0, policy: cap3 });
   assert.equal(refused.status, 429);
   assert.equal(refused.code, "LEASE_CAP");
-  assert.deepEqual(refused.details, { active: 2, pending: 1, cap: 3 });
+  assert.deepEqual(refused.details, { scope: "market", active: 2, pending: 1, cap: 3 });
   // A quote for a listing that is already counted adds nothing, so it passes.
   assert.equal(admitAttestation(state, state.reservations[nonce(4)], { quote: quote(10), nowMs: 0, policy: cap3 }).ok, true);
   // Once the attested quotes' deadline has passed, they stop counting.
@@ -118,7 +123,7 @@ test("optional per-listing reservation cap (off by default) applies when tokenIn
   assert.equal(admitReservation(state, args({})).ok, true, "off by default");
   const refused = admitReservation(state, args({ MAX_RESERVATIONS_PER_LISTING: "2" }));
   assert.equal(refused.code, "RESERVATION_CAP");
-  assert.equal(refused.details.scope, "listing");
+  assert.equal(refused.details.scope, "lease");
   assert.equal(admitReservation(state, { ...args({}), tokenIndex: "x" }).status, 400);
 });
 
@@ -252,4 +257,90 @@ test("rollback: a pre-hardening worker reading the mirrored state file finds in-
   const rolledBack = JSON.parse(JSON.stringify(stateForDisk(live)));
   const key = claimOperatorReservation(rolledBack, nonce(1), operator);
   assert.equal(key, live.reservations[nonce(1)].operatorKey);
+});
+
+test("per-renter ACTIVE-lease cap (MAX_ACTIVE_LEASES_PER_RENTER, default 2): jobs + open/attested reservations", () => {
+  const me = renter(1);
+  const state = { jobs: {}, reservations: {} };
+  state.jobs = {
+    3: { tokenIndex: 3, renter: "0x0000000000000000000000000000000000000001".toUpperCase().replace("0X", "0x"), returned: false },
+    4: { tokenIndex: 4, renter: me, returned: true },
+    5: { tokenIndex: 5, renter: renter(2), returned: false },
+  };
+  const args = (n, extra = {}) => ({ renter: me, nonce: nonce(n), nowMs: 0, policy: policy(), ...extra });
+  // One unreturned job (returned and other renters' jobs do not count): a checkout is fine.
+  assert.equal(renterLeaseLoad(state, me, { nowMs: 0, ttlMs: 20 * MIN }), 1);
+  assert.equal(admitReservation(state, args(10)).ok, true);
+  reserveRandomOperator(state, nonce(10), { now: 0, renter: me });
+  // Job + open checkout = 2 leases held or pending: a third is refused with scope "renter".
+  const refused = admitReservation(state, args(11));
+  assert.equal(refused.status, 429);
+  assert.equal(refused.code, "RESERVATION_CAP");
+  assert.equal(refused.details.scope, RefusalScope.RENTER);
+  assert.equal(refused.details.cap, 2);
+  // Other renters are unaffected; a retry of the same nonce is idempotent.
+  assert.equal(admitReservation(state, { ...args(12), renter: renter(2) }).ok, true);
+  assert.deepEqual(admitReservation(state, args(10)), { ok: true, existing: true });
+  // Configurable.
+  assert.equal(admitReservation(state, args(11, { policy: policy({ MAX_ACTIVE_LEASES_PER_RENTER: "3" }) })).ok, true);
+  // The open checkout expires: capacity comes back.
+  assert.equal(admitReservation(state, args(11, { nowMs: 21 * MIN })).ok, true);
+});
+
+test("per-renter lease cap at attest: an attested quote counts until its deadline; the same listing counts once", () => {
+  const me = renter(1);
+  const state = { jobs: { 3: { tokenIndex: 3, renter: me, returned: false } }, reservations: {} };
+  reserveRandomOperator(state, nonce(1), { now: 0, renter: me });
+  reserveRandomOperator(state, nonce(2), { now: 0, renter: me });
+  state.reservations[nonce(1)].attestedDigest = `0x${"01".repeat(32)}`;
+  state.reservations[nonce(1)].quoteDeadline = 15 * 60;
+  state.reservations[nonce(1)].tokenIndex = 8;
+  const attest2 = (tokenIndex, nowMs = 0, p = policy()) =>
+    admitAttestation(state, state.reservations[nonce(2)], { quote: { renter: me, tokenIndex, nonce: nonce(2) }, nowMs, policy: p });
+  const refused = attest2(9);
+  assert.equal(refused.status, 429);
+  assert.equal(refused.details.scope, RefusalScope.RENTER, "job #3 + attested #8 + this #9 = 3 > 2");
+  assert.equal(attest2(8).ok, true, "a second quote for the already-counted listing adds nothing");
+  assert.equal(attest2(3).ok, true, "the listing of its own active job adds nothing");
+  assert.equal(attest2(9, 16 * MIN).ok, true, "quote #8 is past its deadline: no longer counted");
+});
+
+test("reserve with tokenIndex: early LEASE_CAP (scope market) and a listing mismatch on retry is refused", () => {
+  const state = { jobs: { 1: { tokenIndex: 1, renter: renter(5), returned: false } }, reservations: {} };
+  const cap1 = policy({ MAX_ACTIVE_LEASES: "1" });
+  const early = admitReservation(state, { renter: renter(1), nonce: nonce(1), tokenIndex: 2, nowMs: 0, policy: cap1 });
+  assert.equal(early.code, "LEASE_CAP");
+  assert.equal(early.details.scope, RefusalScope.MARKET);
+  assert.equal(admitReservation(state, { renter: renter(1), nonce: nonce(1), tokenIndex: 2, nowMs: 0, policy: policy() }).tokenIndex, 2);
+  reserveRandomOperator(state, nonce(1), { now: 0, renter: renter(1) });
+  state.reservations[nonce(1)].tokenIndex = 2;
+  const other = admitReservation(state, { renter: renter(1), nonce: nonce(1), tokenIndex: 7, nowMs: 0, policy: policy() });
+  assert.equal(other.status, 400);
+  assert.match(other.error, /different listing/);
+});
+
+test("holdAttestationSlot: a held slot counts toward LEASE_CAP at once; rollback restores; it expires on its own", () => {
+  const state = withReservations(2, { renterOf: (i) => renter(60 + i) });
+  const first = state.reservations[nonce(1)];
+  const slot = holdAttestationSlot(first, 12, 0);
+  let capacity = leaseCapacity(state, { nowMs: 0, ttlMs: 20 * MIN });
+  assert.deepEqual([...capacity.pendingTokens], [12]);
+  const cap1 = policy({ MAX_ACTIVE_LEASES: "1" });
+  const second = admitAttestation(state, state.reservations[nonce(2)], { quote: { renter: renter(61), tokenIndex: 13 }, nowMs: 0, policy: cap1 });
+  assert.equal(second.code, "LEASE_CAP", "the in-flight attest already holds the only slot");
+  slot.rollback();
+  assert.equal(first.tokenIndex, undefined);
+  assert.equal(first.attestPendingUntil, undefined);
+  assert.equal(leaseCapacity(state, { nowMs: 0, ttlMs: 20 * MIN }).used, 0);
+  // A crash leaves the stamp behind: it stops counting after ATTEST_PROVISIONAL_MS.
+  holdAttestationSlot(first, 12, 0);
+  capacity = leaseCapacity(state, { nowMs: ATTEST_PROVISIONAL_MS + 1, ttlMs: 20 * MIN });
+  assert.equal(capacity.used, 0);
+  // commit() keeps the token and drops only the stamp.
+  first.tokenIndex = 4;
+  const kept = holdAttestationSlot(first, 12, 0);
+  kept.commit();
+  kept.rollback();
+  assert.equal(first.tokenIndex, 12);
+  assert.equal(first.attestPendingUntil, undefined);
 });

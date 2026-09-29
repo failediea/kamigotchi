@@ -7,6 +7,32 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 /** Legacy rule for attested reservations that predate quoteDeadline tracking. */
 export const LEGACY_RESERVATION_MAX_AGE_MS = 24 * 60 * 60_000;
 
+/**
+ * Machine-readable `scope` on every 429 body (and on the alert line), so the
+ * quote API can show the right message:
+ *   reservation  this renter has MAX_RESERVATIONS_PER_RENTER open checkouts
+ *   renter       this renter holds MAX_ACTIVE_LEASES_PER_RENTER leases
+ *                (unreturned jobs + open/attested reservations)
+ *   lease        this listing has MAX_RESERVATIONS_PER_LISTING open checkouts
+ *   market       the market is full: MAX_ACTIVE_LEASES (code LEASE_CAP) or
+ *                MAX_LIVE_RESERVATIONS checkouts in flight (code RESERVATION_CAP)
+ */
+export const RefusalScope = Object.freeze({
+  RESERVATION: "reservation",
+  RENTER: "renter",
+  LEASE: "lease",
+  MARKET: "market",
+});
+
+/**
+ * How long an attestation in progress holds its lease slot before the keeper
+ * signature is recorded. The attest handler reserves the slot synchronously,
+ * before its awaits (listing check, quoteDigest), so a burst of concurrent
+ * attests can never all pass while the market sits at cap - 1. Rolled back on
+ * failure; an entry left behind by a crash simply expires.
+ */
+export const ATTEST_PROVISIONAL_MS = 60_000;
+
 export function normalizeRenter(value) {
   const text = String(value ?? "").trim();
   if (!ADDRESS_RE.test(text)) return null;
@@ -48,6 +74,7 @@ export function normalizeTokenIndex(value) {
  * recorded deadline fall back to the reservation TTL.
  */
 export function isPendingAttestation(reservation, nowMs, ttlMs) {
+  if (Number(reservation?.attestPendingUntil) > nowMs) return true;
   if (!reservation?.attestedDigest) return false;
   const deadline = Number(reservation.quoteDeadline);
   if (deadline > 0) return nowMs <= deadline * 1000;
@@ -85,7 +112,54 @@ function leaseCapRefusal(capacity, cap) {
     status: 429,
     code: "LEASE_CAP",
     error: "the market is at its concurrent lease limit; try again later",
-    details: { active: capacity.activeTokens.size, pending: capacity.pendingTokens.size, cap },
+    details: { scope: RefusalScope.MARKET, active: capacity.activeTokens.size, pending: capacity.pendingTokens.size, cap },
+  };
+}
+
+/** A reservation that stands for a lease its renter may still get: open
+ * (unattested, inside the TTL), attested with a quote still submittable, or
+ * with an attestation in progress. */
+function reservationHoldsLease(reservation, nowMs, ttlMs) {
+  if (isPendingAttestation(reservation, nowMs, ttlMs)) return true;
+  return !reservation?.attestedDigest && isLiveReservation(reservation, nowMs, ttlMs);
+}
+
+/**
+ * Leases one renter holds or may still get: DISTINCT tokens among its
+ * unreturned jobs and its lease-holding reservations, plus reservations that
+ * do not name a listing yet (each counts once). `candidate` ({ nonce,
+ * tokenIndex }) is the request being admitted; it replaces any stored entry
+ * with the same nonce.
+ */
+export function renterLeaseLoad(state, renter, { nowMs, ttlMs, candidate = null }) {
+  const tokens = new Set();
+  let unnamed = 0;
+  const count = (token) => {
+    if (token === null) unnamed++;
+    else tokens.add(token);
+  };
+  for (const job of Object.values(state.jobs ?? {})) {
+    if (job.returned || normalizeRenter(job.renter) !== renter) continue;
+    count(normalizeTokenIndex(job.tokenIndex));
+  }
+  const skip = candidate ? String(candidate.nonce ?? "").toLowerCase() : null;
+  for (const [nonce, reservation] of Object.entries(state.reservations ?? {})) {
+    if (skip !== null && nonce.toLowerCase() === skip) continue;
+    if (normalizeRenter(reservation?.renter) !== renter) continue;
+    if (!reservationHoldsLease(reservation, nowMs, ttlMs)) continue;
+    count(normalizeTokenIndex(reservation.tokenIndex));
+  }
+  if (candidate) count(normalizeTokenIndex(candidate.tokenIndex));
+  return tokens.size + unnamed;
+}
+
+function renterLeaseCapRefusal(renter, load, cap) {
+  return {
+    ok: false,
+    status: 429,
+    code: "RESERVATION_CAP",
+    error: "this wallet already has the maximum number of active leases",
+    details: { scope: RefusalScope.RENTER, renter, leases: load - 1, cap },
   };
 }
 
@@ -125,6 +199,10 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
     if (bound && bound !== normalized) {
       return { ok: false, status: 400, code: null, error: "reservation nonce belongs to a different renter" };
     }
+    const reservedToken = normalizeTokenIndex(existing.tokenIndex);
+    if (token !== null && reservedToken !== null && reservedToken !== token) {
+      return { ok: false, status: 400, code: null, error: "reservation nonce belongs to a different listing" };
+    }
     return { ok: true, existing: true };
   }
   if (token !== null) {
@@ -149,7 +227,7 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
         status: 429,
         code: "RESERVATION_CAP",
         error: "too many checkouts are in progress for this Kami; try again in a few minutes",
-        details: { scope: "listing", tokenIndex: token, live: forListing, cap: policy.maxReservationsPerListing },
+        details: { scope: RefusalScope.LEASE, tokenIndex: token, live: forListing, cap: policy.maxReservationsPerListing },
       };
     }
   }
@@ -159,7 +237,7 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
       status: 429,
       code: "RESERVATION_CAP",
       error: "too many checkouts are in progress; try again in a few minutes",
-      details: { scope: "global", live: stats.live, cap: policy.maxLiveReservations },
+      details: { scope: RefusalScope.MARKET, live: stats.live, cap: policy.maxLiveReservations },
     };
   }
   const mine = stats.perRenter.get(normalized) ?? 0;
@@ -169,8 +247,16 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
       status: 429,
       code: "RESERVATION_CAP",
       error: "this wallet already has the maximum number of open checkouts",
-      details: { scope: "renter", renter: normalized, live: mine, cap: policy.maxReservationsPerRenter },
+      details: { scope: RefusalScope.RESERVATION, renter: normalized, live: mine, cap: policy.maxReservationsPerRenter },
     };
+  }
+  const load = renterLeaseLoad(state, normalized, {
+    nowMs,
+    ttlMs: policy.reservationTtlMs,
+    candidate: { nonce, tokenIndex: token },
+  });
+  if (load > policy.maxActiveLeasesPerRenter) {
+    return renterLeaseCapRefusal(normalized, load, policy.maxActiveLeasesPerRenter);
   }
   return { ok: true, existing: false, renter: normalized, tokenIndex: token };
 }
@@ -200,7 +286,49 @@ export function admitAttestation(state, reservation, { quote, nowMs, policy }) {
   if (exceedsLeaseCap(capacity, token, policy.maxActiveLeases)) {
     return leaseCapRefusal(capacity, policy.maxActiveLeases);
   }
+  const nonce = reservationNonce(state, reservation);
+  const load = renterLeaseLoad(state, renter, {
+    nowMs,
+    ttlMs: policy.reservationTtlMs,
+    candidate: { nonce: nonce ?? quote?.nonce, tokenIndex: token },
+  });
+  if (load > policy.maxActiveLeasesPerRenter) {
+    return renterLeaseCapRefusal(renter, load, policy.maxActiveLeasesPerRenter);
+  }
   return { ok: true, renter, tokenIndex: token };
+}
+
+function reservationNonce(state, reservation) {
+  for (const [nonce, entry] of Object.entries(state.reservations ?? {})) {
+    if (entry === reservation) return nonce;
+  }
+  return null;
+}
+
+/**
+ * Hold the lease slot of an admitted attestation BEFORE any await (see
+ * ATTEST_PROVISIONAL_MS). Returns rollback(), to call when the attestation
+ * does not complete; a completed one calls commit() instead.
+ */
+export function holdAttestationSlot(reservation, tokenIndex, nowMs, holdMs = ATTEST_PROVISIONAL_MS) {
+  const hadToken = Object.prototype.hasOwnProperty.call(reservation, "tokenIndex");
+  const previousToken = reservation.tokenIndex;
+  reservation.tokenIndex = tokenIndex;
+  reservation.attestPendingUntil = nowMs + holdMs;
+  let settled = false;
+  return {
+    commit() {
+      settled = true;
+      delete reservation.attestPendingUntil;
+    },
+    rollback() {
+      if (settled) return;
+      settled = true;
+      delete reservation.attestPendingUntil;
+      if (hadToken) reservation.tokenIndex = previousToken;
+      else delete reservation.tokenIndex;
+    },
+  };
 }
 
 /**

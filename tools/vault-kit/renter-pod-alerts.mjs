@@ -20,6 +20,8 @@ export const LeaseAlertCode = Object.freeze({
   STRATEGY_RESTART_STORM: "STRATEGY_RESTART_STORM",
   TX_TIMEOUT: "TX_TIMEOUT",
   STAGE_STUCK: "STAGE_STUCK",
+  // Startup: a missing or malformed .env setting; the worker idles until fixed.
+  CONFIG_ERROR: "CONFIG_ERROR",
 });
 
 const KNOWN_CODES = new Set(Object.values(LeaseAlertCode));

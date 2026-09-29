@@ -1,7 +1,13 @@
 import { timingSafeEqual } from "node:crypto";
 import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
 import { bindOperatorReservationQuote, reserveRandomOperator } from "./renter-pod-keys.mjs";
-import { admitAttestation, admitReservation, isLiveReservation } from "./renter-pod-reservations.mjs";
+import {
+  RefusalScope,
+  admitAttestation,
+  admitReservation,
+  holdAttestationSlot,
+  isLiveReservation,
+} from "./renter-pod-reservations.mjs";
 
 export const RESERVE_PATH = "/v1/operator-reservations";
 export const ATTEST_PATH = "/v1/operator-reservations/attest";
@@ -39,14 +45,20 @@ function writeJson(response, status, body) {
  *   401 bad token, 404 unknown route, 400 malformed/mismatched request,
  *   403 renter not allowlisted, 429 reservation or lease cap reached,
  *   503 worker stale or halted (heartbeat/ingest older than the limit).
+ * Every 429 body is { error, code, scope }: code LEASE_CAP | RESERVATION_CAP,
+ * scope one of RefusalScope (reservation | renter | lease | market; see
+ * renter-pod-reservations.mjs). The renter address stays in the alert only.
  *
  * Request bodies: reserve {market, factory, nonce, renter, tokenIndex?};
  * attest {market, factory, quote} where quote.tokenIndex is REQUIRED.
  * LEASE_CAP is decided at attest, counting active leases plus DISTINCT
  * listings with a keeper-attested quote still inside its deadline, so repeat
- * or unauthenticated quote requests cannot fill it. tokenIndex on reserve is
- * optional: when sent, the reserve answers LEASE_CAP early and the optional
- * per-listing cap (MAX_RESERVATIONS_PER_LISTING) applies.
+ * or unauthenticated quote requests cannot fill it. The attest holds its slot
+ * synchronously before any await, so concurrent attests cannot overrun the
+ * cap. tokenIndex on reserve is optional but the quote API sends it: then the
+ * reserve answers LEASE_CAP early, the per-listing cap
+ * (MAX_RESERVATIONS_PER_LISTING) applies and the per-renter lease cap
+ * (MAX_ACTIVE_LEASES_PER_RENTER) dedupes by listing.
  *
  * Reservations are persisted with saveReservations() (small separate file,
  * atomic) BEFORE the operator address is returned, so a crash can never hand
@@ -94,19 +106,23 @@ export function createReservationHandler({
       }
 
       const refuse = (admission) => {
+        const scope = admission.details?.scope;
         if (admission.code) {
-          const scope = admission.details?.scope;
           alert(
             LeaseAlertCode[admission.code],
             { ...(admission.details ?? {}), market: String(market).slice(0, 10) },
             {
-              key: scope === "renter"
-                ? `renter:${admission.details.renter}`
-                : scope === "listing" ? `listing:${admission.details.tokenIndex}` : admission.code,
+              key: scope === RefusalScope.RENTER || scope === RefusalScope.RESERVATION
+                ? `${scope}:${admission.details.renter}`
+                : scope === RefusalScope.LEASE ? `listing:${admission.details.tokenIndex}` : `${admission.code}:${scope ?? "-"}`,
             }
           );
         }
-        writeJson(response, admission.status, { error: admission.error, ...(admission.code ? { code: admission.code } : {}) });
+        writeJson(response, admission.status, {
+          error: admission.error,
+          ...(admission.code ? { code: admission.code } : {}),
+          ...(admission.status === 429 && scope ? { scope } : {}),
+        });
       };
 
       if (request.url === RESERVE_PATH) {
@@ -153,20 +169,29 @@ export function createReservationHandler({
         refuse(admission);
         return;
       }
-      // Pending leases are counted per listing, so the listing must be real:
-      // a made-up tokenIndex must not be able to occupy lease capacity.
-      if (!(await listingExists(admission.tokenIndex))) {
-        writeJson(response, 400, { error: "unknown listing" });
-        return;
+      // Hold the lease slot NOW, before the awaits below: a concurrent attest
+      // for another listing then already counts this one. Rolled back unless
+      // the keeper signature is recorded.
+      const slot = holdAttestationSlot(reservation, admission.tokenIndex, now());
+      try {
+        // Pending leases are counted per listing, so the listing must be real:
+        // a made-up tokenIndex must not be able to occupy lease capacity.
+        if (!(await listingExists(admission.tokenIndex))) {
+          writeJson(response, 400, { error: "unknown listing" });
+          return;
+        }
+        const digest = await quoteDigest(quote);
+        bindOperatorReservationQuote(state, nonce, quote.operator, digest);
+        const deadline = Number(quote.deadline);
+        if (Number.isSafeInteger(deadline) && deadline > 0) reservation.quoteDeadline = deadline;
+        reservation.renter ??= admission.renter;
+        reservation.tokenIndex = admission.tokenIndex;
+        slot.commit();
+        saveReservations();
+        writeJson(response, 200, { keeperSignature: signDigest(digest) });
+      } finally {
+        slot.rollback();
       }
-      const digest = await quoteDigest(quote);
-      bindOperatorReservationQuote(state, nonce, quote.operator, digest);
-      const deadline = Number(quote.deadline);
-      if (Number.isSafeInteger(deadline) && deadline > 0) reservation.quoteDeadline = deadline;
-      reservation.renter ??= admission.renter;
-      reservation.tokenIndex = admission.tokenIndex;
-      saveReservations();
-      writeJson(response, 200, { keeperSignature: signDigest(digest) });
     } catch (error) {
       log(`operator reservation failed: ${error instanceof Error ? error.message : error}`);
       writeJson(response, 400, { error: "operator reservation failed" });

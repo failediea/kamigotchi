@@ -13,6 +13,7 @@ test("alert lines use the shared prefix, code and key=value details", () => {
 
 test("the closed code set matches the interface contract", () => {
   assert.deepEqual(Object.values(LeaseAlertCode).sort(), [
+    "CONFIG_ERROR",
     "DEAD_KAMI",
     "ESCROW_LOW",
     "EXIT_RESERVE_STOP",
@@ -59,7 +60,7 @@ test("hardening defaults match the shared contract", () => {
 
 test("config parsing is strict", () => {
   assert.equal(parseRenterAllowlist(""), null);
-  assert.equal(parseRenterAllowlist(" , "), null);
+  assert.throws(() => parseRenterAllowlist(" , "), /lists no address/);
   const set = parseRenterAllowlist("0x00000000000000000000000000000000000000AA,0x00000000000000000000000000000000000000bb");
   assert.deepEqual([...set], ["0x00000000000000000000000000000000000000aa", "0x00000000000000000000000000000000000000bb"]);
   assert.throws(() => parseRenterAllowlist("0x123"), /invalid address/);

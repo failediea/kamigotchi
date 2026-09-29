@@ -123,9 +123,11 @@ test("429 + one rate-limited RESERVATION_CAP alert line at the per-renter cap", 
     const fourth = await h.post(RESERVE_PATH, { nonce: nonce(4), renter: renter(1) });
     assert.equal(third.status, 429);
     assert.equal(third.body.code, "RESERVATION_CAP");
+    assert.equal(third.body.scope, "reservation", "machine-readable scope for the web message");
+    assert.equal(third.body.renter, undefined, "the renter address stays in the alert only");
     assert.equal(fourth.status, 429);
     assert.equal(h.alertLines.length, 1, "repeat refusals are rate limited");
-    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] RESERVATION_CAP scope=renter /);
+    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] RESERVATION_CAP scope=reservation /);
   } finally {
     await h.close();
   }
@@ -146,7 +148,8 @@ test("429 LEASE_CAP at attest when active leases plus distinct attested listings
     const refused = await quoteFor(3, 9);
     assert.equal(refused.status, 429);
     assert.equal(refused.body.code, "LEASE_CAP");
-    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] LEASE_CAP active=1 pending=1 cap=2/);
+    assert.equal(refused.body.scope, "market");
+    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] LEASE_CAP scope=market active=1 pending=1 cap=2/);
     assert.equal(h.state.reservations[nonce(3)].attestedDigest, undefined, "nothing signed");
   } finally {
     await h.close();
@@ -221,6 +224,91 @@ test("unknown routes are 404", async () => {
   const h = await harness();
   try {
     assert.equal((await h.post("/v1/other", {})).status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test("final-verify repro: concurrent attests for different listings cannot overrun LEASE_CAP", async () => {
+  // Slow listing check: every attest is parked on this await together.
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const h = await harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 5: { tokenIndex: 5, returned: false } }, listingExists: () => gate });
+  try {
+    const quotes = [];
+    for (let n = 1; n <= 6; n++) {
+      const { body } = await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) });
+      quotes.push({ nonce: nonce(n), renter: renter(n), operator: body.operator, tokenIndex: 100 + n, deadline: "1790000900" });
+    }
+    // Market at cap - 1 (one active lease, cap 2): fire all six at once.
+    const inFlight = quotes.map((quote) => h.post(ATTEST_PATH, { quote }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    release(true);
+    const results = await Promise.all(inFlight);
+    const statuses = results.map((r) => r.status).sort();
+    assert.deepEqual(statuses, [200, 429, 429, 429, 429, 429], "exactly one attest gets the last slot");
+    for (const refused of results.filter((r) => r.status === 429)) {
+      assert.equal(refused.body.code, "LEASE_CAP");
+      assert.equal(refused.body.scope, "market");
+    }
+    const signed = Object.values(h.state.reservations).filter((r) => r.attestedDigest);
+    assert.equal(signed.length, 1);
+    assert.ok(Object.values(h.state.reservations).every((r) => r.attestPendingUntil === undefined), "no slot left held");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a failed attest releases its held slot (unknown listing / digest failure)", async () => {
+  const h = await harness({ env: { MAX_ACTIVE_LEASES: "1" }, listingExists: async (tokenIndex) => tokenIndex !== 99 });
+  try {
+    const { body: a } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
+    const bad = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: a.operator, tokenIndex: 99 } });
+    assert.equal(bad.status, 400);
+    assert.equal(h.state.reservations[nonce(1)].tokenIndex, undefined, "token rolled back");
+    assert.equal(h.state.reservations[nonce(1)].attestPendingUntil, undefined);
+    // Wrong operator: bindOperatorReservationQuote throws after the awaits.
+    const { body: b } = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2) });
+    const wrong = await h.post(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(2), operator: renter(77), tokenIndex: 7 } });
+    assert.equal(wrong.status, 400);
+    assert.equal(h.state.reservations[nonce(2)].attestPendingUntil, undefined);
+    // The only slot is still free for a real quote.
+    const good = await h.post(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(2), operator: b.operator, tokenIndex: 7 } });
+    assert.equal(good.status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+test("429 bodies carry a machine-readable scope for every cap (reservation | renter | lease | market)", async () => {
+  const h = await harness({
+    env: { MAX_LIVE_RESERVATIONS: "4", MAX_RESERVATIONS_PER_LISTING: "1", MAX_ACTIVE_LEASES: "1" },
+    jobs: { 3: { tokenIndex: 3, renter: renter(9), returned: false }, 4: { tokenIndex: 4, renter: renter(9), returned: false } },
+  });
+  try {
+    const reserve = (n, who, extra = {}) => h.post(RESERVE_PATH, { nonce: nonce(n), renter: who, ...extra });
+    // renter: renter(9) already holds two active leases.
+    const renterCap = await reserve(1, renter(9));
+    assert.deepEqual([renterCap.status, renterCap.body.code, renterCap.body.scope], [429, "RESERVATION_CAP", "renter"]);
+    // market (LEASE_CAP, early at reserve because tokenIndex is sent).
+    const full = await reserve(2, renter(1), { tokenIndex: 8 });
+    assert.deepEqual([full.status, full.body.code, full.body.scope], [429, "LEASE_CAP", "market"]);
+    // lease: per-listing cap 1 for a listing that is already counted (#3).
+    assert.equal((await reserve(3, renter(1), { tokenIndex: 3 })).status, 201);
+    const listing = await reserve(4, renter(2), { tokenIndex: 3 });
+    assert.deepEqual([listing.status, listing.body.scope], [429, "lease"]);
+    // reservation: the per-renter open-checkout cap (2).
+    assert.equal((await reserve(5, renter(1))).status, 201);
+    const open = await reserve(6, renter(1));
+    assert.deepEqual([open.status, open.body.scope], [429, "reservation"]);
+    // market (RESERVATION_CAP): 4 live checkouts market-wide.
+    assert.equal((await reserve(7, renter(3))).status, 201);
+    assert.equal((await reserve(8, renter(4))).status, 201);
+    const busy = await reserve(9, renter(5));
+    assert.deepEqual([busy.status, busy.body.code, busy.body.scope], [429, "RESERVATION_CAP", "market"]);
+    for (const response of [renterCap, full, listing, open, busy]) {
+      assert.deepEqual(Object.keys(response.body).sort(), ["code", "error", "scope"]);
+    }
   } finally {
     await h.close();
   }
