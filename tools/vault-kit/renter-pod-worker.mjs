@@ -25,6 +25,12 @@
  *   RESERVATION_STATE_FILE (default <state>.reservations.json next to the
  *   state file), WORKER_HALT_FILE (default HALT next to the state file; while
  *   it exists the reservation server answers 503).
+ * Lease safety (THR-02/03/10; defaults in renter-pod-config.mjs):
+ *   PREFS_FLOOR, PREFS_FLOOR_HP_LOW_MIN, PREFS_FLOOR_FARM_INTERVAL_MAX_SEC,
+ *   PREFS_FLOOR_SAFETY_MARGIN_MIN, PREFS_FLOOR_FEED_PERCENT_MIN,
+ *   EXIT_RESERVE_ACTIONS, EXIT_RESUME_HEADROOM_ACTIONS, PREFS_CADENCE_GUARD,
+ *   STRATEGY_RESTART_MIN_INTERVAL_SEC, KAMIBOTS_STOP_MAX_FAILURES,
+ *   KAMIBOTS_RETRY_MAX_SEC.
  * Alerts needing a human are single lines starting with "[LEASE-ALERT] ".
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -69,9 +75,11 @@ import { runWorkerTick, txKeyForJob } from "./renter-pod-tick.mjs";
 import { createTxTracker } from "./renter-pod-tx.mjs";
 import {
   buildKamibotsStartBody,
-  kamibotsStrategySignature,
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
+import { advanceActiveLease } from "./renter-pod-active.mjs";
+import { observeKamiState } from "./renter-pod-safety.mjs";
+import { createStrategyController } from "./renter-pod-strategy.mjs";
 import {
   assertCanonicalCheckpoint,
   assertCursorSequence,
@@ -532,6 +540,7 @@ async function returnUnusedOperatorGas(job, operator) {
   );
 }
 
+/** Raw Kamibots DELETE; 404 counts as stopped. Callers go through `strategy`. */
 async function stopStrategy(job) {
   if (!job.strategyStarted || !job.creds) return;
   try {
@@ -554,7 +563,7 @@ function normalizeJobPrefs(job, rawPrefs) {
   });
 }
 
-async function startStrategy(job, prefs) {
+async function startStrategyRemote(job, prefs) {
   await kb("/api/strategies/start", {
     method: "POST",
     apiKey: job.creds.apiKey,
@@ -564,18 +573,51 @@ async function startStrategy(job, prefs) {
       prefs
     ),
   });
-  job.strategyStarted = true;
-  job.strategySignature = kamibotsStrategySignature(prefs);
-  save();
 }
 
-async function reconcileStrategy(job) {
-  const rawPrefs = JSON.parse(await factory.prefs(job.tokenIndex));
-  const prefs = normalizeJobPrefs(job, rawPrefs);
-  const desired = kamibotsStrategySignature(prefs);
-  if (job.strategyStarted && job.strategySignature === desired) return;
-  if (job.strategyStarted) await stopStrategy(job);
-  await startStrategy(job, prefs);
+// THR-02 floor on every start and prefs update, THR-03 cadence guard,
+// THR-10 restart debounce, Kamibots backoff and the on-chain stop fallback.
+const strategy = createStrategyController({
+  startRemote: startStrategyRemote,
+  stopRemote: stopStrategy,
+  readRawPrefs: (job) => factory.prefs(job.tokenIndex),
+  normalize: normalizeJobPrefs,
+  floor: HARDENING.prefsFloor,
+  restartMinIntervalMs: HARDENING.strategyRestartMinIntervalMs,
+  stopMaxFailures: HARDENING.kamibotsStopMaxFailures,
+  retryMaxMs: HARDENING.kamibotsRetryMaxMs,
+  cadenceGuard: HARDENING.cadenceGuard,
+  market: MARKET,
+  alert: leaseAlert,
+  log: (line) => console.error(line),
+  save: () => save(),
+});
+
+/** Record DEAD / not-DEAD for a job; true means "DEAD, skip Kami actions". */
+function observeKami(job, kamiState, stage, action) {
+  return observeKamiState(job, kamiState, {
+    stage,
+    action,
+    market: MARKET,
+    alert: leaseAlert,
+    log: (line) => console.error(line),
+  });
+}
+
+async function kamiIsDead(job, kamiID, stage, action) {
+  return observeKami(job, await kamiStateComponent.get(kamiID), stage, action);
+}
+
+/** Operator balance, factory escrow and live gas price for the exit reserve. */
+async function readOperatorGas(job, request, operator) {
+  const [balance, feeData] = await Promise.all([
+    provider.getBalance(operator.address),
+    provider.getFeeData(),
+  ]);
+  if (feeData.gasPrice == null) {
+    throw new Error(`operator gas health failed for Kami #${job.tokenIndex}: RPC returned no gas price`);
+  }
+  return { balance, escrow: BigInt(request.gasBudget), gasPrice: feeData.gasPrice };
 }
 
 async function processJob(job) {
@@ -614,9 +656,13 @@ async function processJob(job) {
       return;
     }
     if (actualAccID !== podAccID) return;
+    if (await kamiIsDead(job, listing.kamiID, stage, "preparing")) {
+      await strategy.stopForOnChain(job, { force: true });
+      return;
+    }
     await ensureOperatorGas(job, request, operator);
     await advancePreparingLease({
-      reconcileStrategy: () => reconcileStrategy(job),
+      reconcileStrategy: () => strategy.reconcile(job),
       readKamiState: () => kamiStateComponent.get(listing.kamiID),
       activateLease: async () => {
         await sendTx(job, "activateProvisionedLease", () =>
@@ -628,43 +674,63 @@ async function processJob(job) {
   }
 
   if (stage === 3) {
-    await ensureOperatorGas(job, request, operator);
-    const now = Math.floor(Date.now() / 1000);
-    if (!listing.ending && Number(listing.leaseEnd) > 0 && now > Number(listing.leaseEnd)) {
-      await sendTx(job, "endLease", () => market.connect(operator).endLease(job.tokenIndex));
-      return;
-    }
-    if (listing.ending) {
-      await advanceEndingLease({
-        tokenIndex: job.tokenIndex,
-        stopStrategy: () => stopStrategy(job),
-        readKamiState: () => kamiStateComponent.get(listing.kamiID),
-        stopHarvest: async () => {
-          const harvestID = solidityPackedKeccak256(
-            ["string", "uint256"],
-            ["harvest", listing.kamiID]
-          );
-          const connectedStop = harvestStopSystem.connect(operator);
-          await connectedStop.executeTyped.staticCall(harvestID);
-          await sendTx(job, "stopHarvest", () => connectedStop.executeTyped(harvestID));
-        },
-        finalizeLease: async () => {
-          await sendTx(job, "finalizeMarketLease", () => factory.connect(operator).finalizeMarketLease(job.tokenIndex));
-        },
-        markFinalized: async () => {
-          job.finalized = true;
-          save();
-        },
-      });
-      return;
-    }
-    await reconcileStrategy(job);
+    const stopHarvest = async () => {
+      const harvestID = solidityPackedKeccak256(
+        ["string", "uint256"],
+        ["harvest", listing.kamiID]
+      );
+      const connectedStop = harvestStopSystem.connect(operator);
+      await connectedStop.executeTyped.staticCall(harvestID);
+      await sendTx(job, "stopHarvest", () => connectedStop.executeTyped(harvestID));
+    };
+    // THR-03: the exit reserve is checked before the fail-closed gas check.
+    await advanceActiveLease({
+      job,
+      nowSec: Math.floor(Date.now() / 1000),
+      listing,
+      market: MARKET,
+      readGas: () => readOperatorGas(job, request, operator),
+      actionGas: OPERATOR_ACTION_GAS_FLOOR,
+      exitReserveActions: HARDENING.exitReserveActions,
+      resumeHeadroomActions: HARDENING.exitResumeHeadroomActions,
+      ensureGas: ({ required }) => ensureOperatorGas(job, request, operator, { required }),
+      strategy,
+      readKamiState: () => kamiStateComponent.get(listing.kamiID),
+      stopHarvest,
+      endLease: () => sendTx(job, "endLease", () => market.connect(operator).endLease(job.tokenIndex)),
+      advanceEnding: () =>
+        advanceEndingLease({
+          tokenIndex: job.tokenIndex,
+          // THR-10: a Kamibots outage cannot hold the on-chain stop hostage.
+          stopStrategy: () => strategy.stopForOnChain(job),
+          readKamiState: async () => {
+            const kamiState = await kamiStateComponent.get(listing.kamiID);
+            observeKami(job, kamiState, stage, "ending");
+            return kamiState;
+          },
+          onDead: async () => {},
+          stopHarvest,
+          finalizeLease: async () => {
+            await sendTx(job, "finalizeMarketLease", () => factory.connect(operator).finalizeMarketLease(job.tokenIndex));
+          },
+          markFinalized: async () => {
+            job.finalized = true;
+            save();
+          },
+        }),
+      observeKami: (kamiState, action) => observeKami(job, kamiState, stage, action),
+      alert: leaseAlert,
+      log: (line) => console.error(line),
+      save,
+    });
     return;
   }
 
   if (stage === 4) {
-    await stopStrategy(job);
+    await strategy.stopForOnChain(job);
     if (actualAccID === podAccID) {
+      // KamiSend needs RESTING/LISTED: a DEAD Kami would revert every tick.
+      if (await kamiIsDead(job, listing.kamiID, stage, "kamiSend")) return;
       await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
@@ -700,8 +766,9 @@ async function processJob(job) {
   }
 
   if (stage === 5) {
-    await stopStrategy(job);
+    await strategy.stopForOnChain(job);
     if (actualAccID === podAccID) {
+      if (await kamiIsDead(job, listing.kamiID, stage, "kamiSend")) return;
       await ensureOperatorGas(job, request, operator, {
         allowPull: TERMINAL_GAS_PULL_MODE === TerminalGasPullMode.FACTORY,
       });
@@ -741,7 +808,11 @@ async function processJob(job) {
       returning: Boolean(listing.returning),
     });
     if (action === StageZeroAction.RETURN_FROM_POD) {
-      await stopStrategy(job);
+      await strategy.stopForOnChain(job);
+      if (await kamiIsDead(job, listing.kamiID, stage, "kamiSend")) {
+        save();
+        return;
+      }
       await ensureOperatorGas(job, request, operator, { allowPull: false });
       await sendTx(job, "kamiSend", () => sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner));
       save();
@@ -767,9 +838,10 @@ async function processJob(job) {
  * mark it returned. Market flags belong to the live job and are not touched.
  */
 async function finishRetiredJob(job, { listing, podAccID, actualAccID, operator }) {
-  await stopStrategy(job);
+  await strategy.stopForOnChain(job);
   const action = retiredJobAction({ actualAccID, podAccID });
   if (action === RetiredJobAction.RETURN_FROM_POD) {
+    if (await kamiIsDead(job, listing.kamiID, "retired", "kamiSend(retired)")) return;
     await ensureOperatorGas(job, { gasBudget: 0n }, operator, { allowPull: false });
     await sendTx(job, "kamiSend(retired)", () =>
       sendSystem.connect(operator).executeTyped(job.tokenIndex, listing.owner)
@@ -873,6 +945,15 @@ console.log(
     + `fetchTimeoutMs=${HARDENING.fetchTimeoutMs}, tickWatchdogSec=${HARDENING.tickWatchdogMs / 1000}, `
     + `heartbeatStaleSec=${HARDENING.heartbeatStaleMs / 1000}, heartbeat=${HEARTBEAT_FILE}, `
     + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}`
+);
+const FLOOR = HARDENING.prefsFloor;
+console.log(
+  `lease safety: prefsFloor=${FLOOR ? `hpLow>=${FLOOR.hpThresholdLowMin},farm<=${FLOOR.farmIntervalMaxSec}s,`
+    + `safetyMargin>=${FLOOR.safetyMarginMin},feed>=${FLOOR.feedPercentMin}%,no-${FLOOR.disallowedRisk}` : "off"}, `
+    + `exitReserveActions=${HARDENING.exitReserveActions}, exitResumeHeadroomActions=${HARDENING.exitResumeHeadroomActions}, `
+    + `cadenceGuard=${HARDENING.cadenceGuard ? "on" : "off"}, `
+    + `strategyRestartMinIntervalSec=${HARDENING.strategyRestartMinIntervalMs / 1000}, `
+    + `kamibotsStopMaxFailures=${HARDENING.kamibotsStopMaxFailures}, kamibotsRetryMaxSec=${HARDENING.kamibotsRetryMaxMs / 1000}`
 );
 for (;;) {
   const started = Date.now();

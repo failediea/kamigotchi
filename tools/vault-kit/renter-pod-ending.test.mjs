@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { EndingAction } from "./renter-pod-recovery.mjs";
-import { advanceEndingLease } from "./renter-pod-ending.mjs";
+import { ENDING_DEAD, advanceEndingLease } from "./renter-pod-ending.mjs";
 
 function harness(kamiState, { stopError } = {}) {
   const calls = [];
@@ -40,6 +40,21 @@ test("ending finalizes only after a fresh RESTING read", async () => {
   const { calls, args } = harness("RESTING");
   assert.equal(await advanceEndingLease(args), EndingAction.FINALIZE);
   assert.deepEqual(calls, ["stop-strategy", "read-state", "finalize", "mark-finalized"]);
+});
+
+test("a DEAD Kami with a handler is held (no throw, no stop, no finalize)", async () => {
+  const { calls, args } = harness("DEAD");
+  const seen = [];
+  args.onDead = async (state) => seen.push(state);
+  assert.equal(await advanceEndingLease(args), ENDING_DEAD);
+  assert.deepEqual(calls, ["stop-strategy", "read-state"]);
+  assert.deepEqual(seen, ["DEAD"]);
+});
+
+test("other unexpected states still fail closed even with a DEAD handler", async () => {
+  const { args } = harness("721_EXTERNAL");
+  args.onDead = async () => assert.fail("not DEAD");
+  await assert.rejects(advanceEndingLease(args), /unexpected on-chain state 721_EXTERNAL/);
 });
 
 test("unexpected states fail closed without harvest stop or finalization", async () => {
