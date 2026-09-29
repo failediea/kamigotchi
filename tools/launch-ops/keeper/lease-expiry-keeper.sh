@@ -15,9 +15,13 @@
 #   --apply              send endLease txs (needs SPONSOR_KEY_FILE + SPONSOR_ADDRESS),
 #                        at most EXPIRY_MAX_TX_PER_RUN per run, each simulated first
 #
-# Safety: flock shared with the gas sponsor (one sender per sponsor nonce),
-# key file must be root-owned mode 600 and is never printed, every tx waits at
-# most TX_WAIT_TIMEOUT_MS, a ledger line is appended per tx.
+# Safety: flock shared with the gas sponsor (one sender per sponsor nonce; a run
+# that finds the lock taken skips and exits 0), key file must be root-owned mode
+# 600 and is never printed, every tx waits at most TX_WAIT_TIMEOUT_MS. The signer
+# appends the ledger row ("sent") right after broadcasting and BEFORE waiting.
+# Before sending, --apply resolves unresolved ledger rows and compares the sponsor's
+# pending and latest nonce; while any sponsor tx (keeper or gas sponsor) is still
+# in flight it sends nothing and logs [LEASE-ALERT] TX_TIMEOUT source=expiry-keeper.
 # Idempotent: a lease that is already ending is not a candidate; a tx that
 # would revert (someone else ended it) is skipped by the eth_call simulation.
 # Rollback: nothing to roll back on-chain (endLease is what the protocol
@@ -52,6 +56,7 @@ SPONSOR_MIN_SEND_WEI="${SPONSOR_MIN_SEND_WEI:-100000000000000}" # 1e14: refuse t
 NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
 ETHERS_NODE_PATH="${ETHERS_NODE_PATH:-/root/kamigotchi/tools/vault-kit/node_modules}"
 PERSIST_DIR="${ALERT_PERSIST_DIR:-/var/lib/kami-lease-ops}"
+LEDGER="$PERSIST_DIR/expiry-keeper-ledger.tsv"
 LOCK_FILE="${SPONSOR_LOCK_FILE:-/run/lock/kami-lease-sponsor-key.lock}"
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -67,6 +72,14 @@ rpc_result() {
   printf '%s' "$r"
 }
 eth_call() { rpc_result eth_call "[{\"to\":\"$1\",\"data\":\"$2\"},\"latest\"]"; }
+rpc_raw() { # method params -> raw JSON reply (non-zero unless it carries a "result")
+  local out
+  out=$(curl -sS -m "$RPC_TIMEOUT_SEC" -X POST -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$RPC" 2>/dev/null) || return 1
+  grep -q '"result"' <<<"$out" || return 1
+  printf '%s' "$out"
+}
+result_is_null() { grep -Eq '"result"[[:space:]]*:[[:space:]]*null' <<<"$1"; }
 eth_call_from() { rpc_result eth_call "[{\"from\":\"$1\",\"to\":\"$2\",\"data\":\"$3\"},\"latest\"]"; }
 word() { local h=${1#0x}; printf '%s' "${h:$(( $2 * 64 )):64}"; }
 hex2dec() { local h=${1#0x}; h="${h#"${h%%[!0]*}"}"; if [ -z "$h" ]; then echo 0; elif [ ${#h} -gt 15 ]; then echo 1152921504606846975; else echo $((16#$h)); fi; }
@@ -92,14 +105,58 @@ const { JsonRpcProvider, Wallet } = require("ethers");
   tx.gasLimit = ((await provider.estimateGas({ ...tx, from: wallet.address })) * 12n) / 10n;
   const sent = await wallet.sendTransaction(tx);
   console.log("TXHASH " + sent.hash);
+  // Durable BEFORE waiting: a timeout or a kill still leaves this tx on the ledger,
+  // so the next run sees it in flight instead of sending a duplicate.
+  try {
+    fs.appendFileSync(process.env.LEDGER_FILE, [Math.floor(Date.now() / 1000), process.env.LEDGER_ROW, sent.hash, sent.nonce, "sent"].join("\t") + "\n");
+  } catch (e) { console.error("ledger append failed: " + e.message); }
   const receipt = await sent.wait(1, Number(process.env.TX_WAIT_TIMEOUT_MS || 120000));
   console.log("STATUS " + receipt.status + " GASUSED " + receipt.gasUsed);
   if (receipt.status !== 1) process.exit(3);
 })().catch((e) => { console.error("send failed: " + String((e && (e.shortMessage || e.message)) || e).slice(0, 300)); process.exit(1); });
 '
-send_tx() { # to data value -> stdout lines TXHASH/STATUS; non-zero on failure
+send_tx() { # to data value ledger_row -> stdout lines TXHASH/STATUS; non-zero on failure
   KEY_FILE="$SPONSOR_KEY_FILE" EXPECT_FROM="$SPONSOR_ADDRESS" RPC="$RPC" TX_TO="$1" TX_DATA="$2" TX_VALUE="$3" \
+    LEDGER_FILE="$LEDGER" LEDGER_ROW="$4" \
     TX_WAIT_TIMEOUT_MS="$TX_WAIT_TIMEOUT_MS" NODE_PATH="$ETHERS_NODE_PATH" "$NODE_BIN" -e "$SIGNER_JS"
+}
+
+# Ledger rows (tab separated):
+#   <ts> endLease <market> <token> <hash> <nonce> sent     (written by the signer, before waiting)
+#   <ts> result   -        -       <hash> -       mined|reverted|dropped
+INFLIGHT=0
+resolve_ledger() { # checks every endLease row without a result row; appends results in --apply
+  INFLIGHT=0
+  [ -r "$LEDGER" ] || return 0
+  local h raw st
+  for h in $(awk -F'\t' '$2=="endLease"{s[$5]=1} $2=="result"{r[$5]=1} END{for (h in s) if (!(h in r) && h ~ /^0x/) print h}' "$LEDGER"); do
+    if ! raw=$(rpc_raw eth_getTransactionReceipt "[\"$h\"]"); then
+      INFLIGHT=$((INFLIGHT + 1)); log "  ledger tx $h: receipt read failed (treated as in flight)"; continue
+    fi
+    if result_is_null "$raw"; then
+      if ! raw=$(rpc_raw eth_getTransactionByHash "[\"$h\"]"); then
+        INFLIGHT=$((INFLIGHT + 1)); log "  ledger tx $h: lookup failed (treated as in flight)"; continue
+      fi
+      if ! result_is_null "$raw"; then
+        INFLIGHT=$((INFLIGHT + 1)); log "  ledger tx $h: still in flight (known to the node, not mined)"; continue
+      fi
+      st=dropped
+    elif grep -Eq '"status"[[:space:]]*:[[:space:]]*"0x0*1"' <<<"$raw"; then
+      st=mined
+    else
+      st=reverted
+    fi
+    log "  ledger tx $h resolved: $st"
+    [ "$MODE" != apply ] || printf '%s\tresult\t-\t-\t%s\t-\t%s\n' "$(date +%s)" "$h" "$st" >> "$LEDGER"
+  done
+}
+sponsor_nonce_inflight() { # adds (pending - latest) of the sponsor address to INFLIGHT
+  local nl np
+  nl=$(rpc_result eth_getTransactionCount "[\"$SPONSOR_ADDRESS\",\"latest\"]") || return 1
+  np=$(rpc_result eth_getTransactionCount "[\"$SPONSOR_ADDRESS\",\"pending\"]") || return 1
+  nl=$(hex2dec "$nl"); np=$(hex2dec "$np")
+  if [ "$np" -gt "$nl" ]; then INFLIGHT=$((INFLIGHT + np - nl)); log "  sponsor nonce pending=$np > latest=$nl"; fi
+  return 0
 }
 
 check_key_file() {
@@ -120,7 +177,12 @@ if [ "$MODE" = apply ]; then
   check_key_file
   mkdir -p "$PERSIST_DIR" "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
-  flock -w 60 9 || die "another sponsor-key job holds $LOCK_FILE"
+  # The gas sponsor holds this lock while it waits on its own txs. Skipping is
+  # correct (the next timer run retries) and must not fire the OnFailure push.
+  if ! flock -n 9; then
+    log "another sponsor-key job (gas sponsor?) holds $LOCK_FILE; skipping this run"
+    exit 0
+  fi
 fi
 
 NOW=$(date +%s)
@@ -164,14 +226,24 @@ done
 
 log "${#CANDIDATES[@]} endLease candidate(s): ${CANDIDATES[*]:-none}"
 if [ "${#CANDIDATES[@]}" -gt 0 ]; then
-  log "[LEASE-ALERT] STAGE_STUCK expired leases not ending: ${CANDIDATES[*]} (expiry keeper mode=$MODE)"
+  cands="${CANDIDATES[*]}"
+  log "[LEASE-ALERT] STAGE_STUCK source=expiry-keeper reason=expired-not-ending count=${#CANDIDATES[@]} candidates=${cands// /,} mode=$MODE"
 fi
+resolve_ledger
+[ -z "$SPONSOR_ADDRESS" ] || sponsor_nonce_inflight || {
+  [ "$MODE" = apply ] && die "cannot read the sponsor nonce (latest/pending); not sending"
+  log "  sponsor nonce not readable (dry-run: ignored)"
+}
 [ "$MODE" = apply ] || { log "[dry-run] no transactions sent"; exit 0; }
 [ "${#CANDIDATES[@]}" -gt 0 ] || exit 0
+if [ "$INFLIGHT" -gt 0 ]; then
+  log "[LEASE-ALERT] TX_TIMEOUT source=expiry-keeper sponsor=$SPONSOR_ADDRESS inflight=$INFLIGHT action=no-new-sends candidates=${#CANDIDATES[@]}"
+  exit 0
+fi
 
 sb=$(rpc_result eth_getBalance "[\"$SPONSOR_ADDRESS\",\"latest\"]") || die "cannot read sponsor balance"
 if [ "$(hex2dec "$sb")" -lt "$SPONSOR_MIN_SEND_WEI" ]; then
-  log "[LEASE-ALERT] ESCROW_LOW sponsor=$SPONSOR_ADDRESS balance=$(hex2dec "$sb") below SPONSOR_MIN_SEND_WEI=$SPONSOR_MIN_SEND_WEI; not sending"
+  log "[LEASE-ALERT] ESCROW_LOW source=expiry-keeper sponsor=$SPONSOR_ADDRESS balance=$(hex2dec "$sb") min=$SPONSOR_MIN_SEND_WEI reason=sponsor-below-min action=not-sending"
   exit 1
 fi
 
@@ -179,7 +251,7 @@ sent=0
 failed=0
 for c in "${CANDIDATES[@]}"; do
   if [ "$sent" -ge "$EXPIRY_MAX_TX_PER_RUN" ]; then
-    log "[LEASE-ALERT] STAGE_STUCK per-run cap $EXPIRY_MAX_TX_PER_RUN reached; remaining candidates wait for the next run"
+    log "[LEASE-ALERT] STAGE_STUCK source=expiry-keeper reason=per-run-cap cap=$EXPIRY_MAX_TX_PER_RUN"
     break
   fi
   market=${c%%:*}; tok=${c##*:}
@@ -189,15 +261,19 @@ for c in "${CANDIDATES[@]}"; do
     continue
   fi
   log "sending endLease(#$tok) on $market"
-  if out=$(send_tx "$market" "$data" 0); then
-    hash=$(sed -n 's/^TXHASH //p' <<<"$out")
+  rc=0; out=$(send_tx "$market" "$data" 0 "endLease"$'\t'"$market"$'\t'"$tok" 2>&1) || rc=$?
+  hash=$(sed -n 's/^TXHASH //p' <<<"$out" | head -1)
+  if [ "$rc" = 0 ]; then
     log "endLease #$tok ok tx=$hash"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" endLease "$market" "$tok" "$hash" >> "$PERSIST_DIR/expiry-keeper-ledger.tsv"
+    printf '%s\tresult\t-\t-\t%s\t-\tmined\n' "$(date +%s)" "$hash" >> "$LEDGER"
     sent=$((sent + 1))
   else
-    log "[LEASE-ALERT] TX_TIMEOUT endLease #$tok on $market failed or timed out: $(tail -1 <<<"$out")"
+    [ -n "$hash" ] && [ "$rc" = 3 ] && printf '%s\tresult\t-\t-\t%s\t-\treverted\n' "$(date +%s)" "$hash" >> "$LEDGER"
+    log "[LEASE-ALERT] TX_TIMEOUT source=expiry-keeper market=$market token=$tok hash=${hash:-none} exit=$rc detail=$(tail -1 <<<"$out" | tr ' ' '_' | cut -c1-160)"
     failed=$((failed + 1))
     sent=$((sent + 1))
+    # broadcast but unconfirmed: stop; the next run resolves it before sending again
+    [ -z "$hash" ] || [ "$rc" = 3 ] || break
   fi
 done
 log "done: sent=$sent failed=$failed"
