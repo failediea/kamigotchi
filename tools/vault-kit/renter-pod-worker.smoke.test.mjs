@@ -7,13 +7,14 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AbiCoder, Interface, Wallet, getAddress, id as keccakId, keccak256, toBeHex, zeroPadValue } from "ethers";
+import { journalFileFor, readQuoteStore } from "./renter-pod-quote-store.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const coder = AbiCoder.defaultAbiCoder();
@@ -205,8 +206,13 @@ test("real worker survives a same-batch cancel/re-rent, keeps other Kamis moving
       WORKER_STATE_FILE: stateFile,
       TERMINAL_GAS_RETURN_MODE: "skip",
       POLL_MS: "1000",
+      // A live .env from the retired design: ignored, named, never fatal.
+      MAX_LIVE_RESERVATIONS: "200",
+      LISTING_SINGLE_CHECKOUT: "on",
     },
   });
+  // SIGTERM compacts the quote key store: wait for it before removing the dir.
+  const childExit = new Promise((resolve) => child.once("exit", resolve));
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));
   try {
@@ -223,10 +229,11 @@ test("real worker survives a same-batch cancel/re-rent, keeps other Kamis moving
     // prefix and ends with the per-renter lease cap.
     assert.match(output, /WARNING: RENTER_ALLOWLIST is NOT SET - this worker runs OPEN RENTALS\./);
     assert.match(output, /ALLOW_OPEN_RENTALS is not set/);
-    assert.match(
-      output,
-      /launch guards: allowlist=off, maxActiveLeases=20, maxLiveReservations=200, maxReservationsPerRenter=2, .*maxActiveLeasesPerRenter=2\n/
-    );
+    assert.match(output, /launch guards: allowlist=off, maxActiveLeases=20 \(on-chain\), .*maxActiveLeasesPerRenter=2\n/);
+    assert.doesNotMatch(output, /maxLiveReservations|listingSingleCheckout|soft.launch|private.beta/i);
+    assert.match(output, /open-rental guards: requireRenterBalance=on; quotes hold no capacity/);
+    assert.match(output, /ignored retired settings \(quotes no longer hold capacity\): MAX_LIVE_RESERVATIONS, LISTING_SINGLE_CHECKOUT\n/);
+    assert.match(output, /operator keys: random per quote, durable before return; .* entries=3 /, "legacy embedded keys migrated");
 
     const state = JSON.parse(readFileSync(stateFile, "utf8"));
     assert.doesNotMatch(output, /second active RoomPod event/);
@@ -241,7 +248,9 @@ test("real worker survives a same-batch cancel/re-rent, keeps other Kamis moving
     assert.equal(retired.operatorKey, undefined, "retired job secrets purged");
     assert.deepEqual(state.reservations, {}, "state file no longer carries operator keys");
     assert.equal(state.ingestRetry, undefined, "nothing parked");
-    assert.deepEqual(JSON.parse(readFileSync(reservationFile, "utf8")).reservations, {}, "claimed keys released");
+    assert.deepEqual(readQuoteStore(reservationFile).reservations, {}, "claimed keys deleted from the store after the job save");
+    assert.equal(statSync(reservationFile).mode & 0o777, 0o600);
+    assert.equal(statSync(journalFileFor(reservationFile)).mode & 0o777, 0o600);
 
     // Reservation server is live (fresh heartbeat) and enforces the renter contract.
     const post = (body) =>
@@ -253,19 +262,27 @@ test("real worker survives a same-batch cancel/re-rent, keeps other Kamis moving
     assert.equal((await post({ nonce: `0x${"01".repeat(32)}` })).status, 400);
     const ok = await post({ nonce: `0x${"01".repeat(32)}`, renter: RENTER });
     assert.equal(ok.status, 201);
-    assert.equal(
-      Object.keys(JSON.parse(readFileSync(reservationFile, "utf8")).reservations).length,
-      1,
-      "reservation persisted to its own file"
-    );
+    const { operator } = await ok.json();
+    // Durable before the answer: in the journal already (the snapshot is only
+    // rewritten on compaction).
+    assert.equal(readQuoteStore(reservationFile).reservations[`0x${"01".repeat(32)}`].operator, operator);
+    assert.equal(JSON.parse(readFileSync(reservationFile, "utf8")).reservations[`0x${"01".repeat(32)}`], undefined);
 
     // HALT file: new leases refused with 503, existing processing unaffected.
     writeFileSync(join(dir, "HALT"), "");
     const halted = await post({ nonce: `0x${"02".repeat(32)}`, renter: RENTER });
     assert.equal(halted.status, 503);
     assert.equal((await halted.json()).reason, "halted");
+
+    // SIGTERM (systemctl stop, launch-ops rollback) folds the journal into the
+    // snapshot, so the rollback merge - which reads the snapshot only - sees the key.
+    child.kill("SIGTERM");
+    assert.equal(await childExit, 0);
+    assert.match(output, /SIGTERM: quote key store compacted \(entries=1, /);
+    assert.equal(JSON.parse(readFileSync(reservationFile, "utf8")).reservations[`0x${"01".repeat(32)}`].operator, operator);
   } finally {
     child.kill("SIGTERM");
+    await childExit;
     await new Promise((resolve) => server.close(resolve));
     rmSync(dir, { recursive: true, force: true });
   }

@@ -17,6 +17,9 @@ tools/**/pods.json
 tools/**/*credentials*.json
 tools/**/*secrets*.json
 tools/**/*worker-state*.json
+tools/**/*.reservations.json
+tools/**/*.reservations.journal
+tools/**/*.journal.tmp
 tools/**/*deployment*.json
 !tools/**/*deployment.public.json
 tools/**/*.pem

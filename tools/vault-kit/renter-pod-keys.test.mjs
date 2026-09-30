@@ -7,8 +7,9 @@ import {
   claimOperatorReservation,
   migrateLegacyJobKeys,
   operatorWalletForJob,
+  OperatorMismatchError,
   purgeReturnedJobSecrets,
-  removeExpiredUnclaimedReservations,
+  randomOperatorWallet,
   reserveRandomOperator,
 } from "./renter-pod-keys.mjs";
 
@@ -67,11 +68,29 @@ test("a reservation nonce binds to exactly one quote digest", () => {
   );
 });
 
-test("expired unused quotes are removable after the event scan", () => {
+test("V14-01: keys are independently random - the same nonce in two workers gets unrelated keys; no seed is involved", () => {
+  const a = {};
+  const b = {};
+  const first = reserveRandomOperator(a, nonce(6));
+  const second = reserveRandomOperator(b, nonce(6));
+  assert.notEqual(first.operator, second.operator, "not derived from the (public) nonce");
+  const keys = new Set(Array.from({ length: 200 }, () => randomOperatorWallet().privateKey));
+  assert.equal(keys.size, 200);
+  for (const key of keys) assert.match(key, /^0x[0-9a-f]{64}$/);
+  assert.equal(new Wallet(a.reservations[nonce(6)].operatorKey).address, first.operator);
+});
+
+test("claim errors are typed OPERATOR_MISMATCH causes: missing vs mismatch", () => {
   const state = {};
-  reserveRandomOperator(state, nonce(6), { now: 1 });
-  assert.equal(removeExpiredUnclaimedReservations(state, 1_001, 500), 1);
-  assert.equal(Object.keys(state.reservations).length, 0);
+  const reserved = reserveRandomOperator(state, nonce(9));
+  assert.throws(
+    () => claimOperatorReservation(state, nonce(10), reserved.operator),
+    (error) => error instanceof OperatorMismatchError && error.reason === "missing"
+  );
+  assert.throws(
+    () => claimOperatorReservation(state, nonce(9), Wallet.createRandom().address),
+    (error) => error instanceof OperatorMismatchError && error.reason === "mismatch"
+  );
 });
 
 test("legacy active jobs migrate once and returned jobs do not retain secrets", () => {

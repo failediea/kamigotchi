@@ -382,6 +382,8 @@ test("real worker: billed-fee exit reserve, no duplicate pullGas across a broadc
       LOG_CHUNKS_PER_TICK: "2",
     },
   });
+  // SIGTERM compacts the quote key store: wait for it before removing the dir.
+  const childExit = new Promise((resolve) => child.once("exit", resolve));
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));
   const pulls = () => chain.sent.filter((tx) => tx.to === FACTORY && tx.selector === selector("pullGas"));
@@ -432,6 +434,7 @@ test("real worker: billed-fee exit reserve, no duplicate pullGas across a broadc
     assert.match(output, /ingest catching up: at block/);
   } finally {
     child.kill("SIGTERM");
+    await childExit;
     await new Promise((resolve) => chain.server.close(resolve));
     await new Promise((resolve) => kamibots.server.close(resolve));
     rmSync(dir, { recursive: true, force: true });

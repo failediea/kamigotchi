@@ -184,7 +184,24 @@ test("the snapshot carries every number web and ops must mirror", () => {
   assert.equal(snap.gas.examples[0].feePerGasWei, "5000000");
   assert.equal(snap.gas.examples[0].exitStopTriggerWei, "37400000000000");
   assert.equal(snap.gas.examples[2].feePerGasWei, "2500000", "legacy example");
+  assert.equal(snap.version, 2);
+  assert.equal(snap.reservations.maxActiveLeases, 20);
   assert.equal(snap.reservations.maxActiveLeasesPerRenter, 2);
-  assert.deepEqual(Object.keys(snap.reservations.refusalScopes).sort(), ["lease", "market", "renter", "reservation"]);
+  assert.equal(snap.reservations.reservationTtlSec, 1_200);
+  // Quotes hold no capacity: only the two on-chain scopes remain.
+  assert.equal(snap.reservations.quotesHoldCapacity, false);
+  assert.deepEqual(Object.keys(snap.reservations.refusalScopes).sort(), ["market", "renter"]);
+  assert.doesNotMatch(snap.reservations.refusal429Body, /LISTING_COOLDOWN/);
+  for (const retired of ["maxLiveReservations", "maxReservationsPerRenter", "maxReservationsPerListing", "listingSingleCheckout", "listingReserveCooldownSec", "maxReservationAttemptsPerRenter"]) {
+    assert.equal(snap.reservations[retired], undefined, retired);
+  }
+  assert.ok(snap.reservations.retiredSettings.includes("LISTING_SINGLE_CHECKOUT"));
+  assert.match(snap.reservations.retryAfterRule, /Retry-After: 60/);
+  assert.match(snap.reservations.reserveBody, /tokenIndex/);
+  assert.match(snap.reservations.reserveBody, /fundingWei/);
+  assert.match(snap.operatorKeys.generation, /CSPRNG/);
+  assert.match(snap.operatorKeys.durability, /fsync/);
+  assert.match(snap.operatorKeys.ingestRule, /OPERATOR_MISMATCH/);
+  assert.doesNotMatch(JSON.stringify(snap), /soft.launch|private.beta/i);
   assert.ok(snap.renterAllowlist.vectors.length >= 10);
 });

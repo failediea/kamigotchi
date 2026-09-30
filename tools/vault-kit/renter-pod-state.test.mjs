@@ -94,17 +94,42 @@ test("legacy state with embedded reservations migrates them to the store (store 
     assert.equal(loaded.migratedReservations, 1);
     assert.equal(loaded.state.reservations[nonce].operator, wallet.address);
     const store = JSON.parse(readFileSync(reservationFile, "utf8"));
-    assert.equal(store.reservations[nonce].operatorKey, wallet.privateKey);
+    assert.equal(store.reservations[nonce].operatorKey, wallet.privateKey, "store made durable first");
     const stateOnDisk = JSON.parse(readFileSync(stateFile, "utf8"));
-    // Mirrored so a rollback to the pre-hardening worker needs no manual
-    // merge; the reservation store stays the source of truth.
-    assert.deepEqual(stateOnDisk.reservations, store.reservations, "mirrored for rollback");
+    // Only then does the job state file drop the keys (it keeps the empty map).
+    assert.deepEqual(stateOnDisk.reservations, {});
     assert.deepEqual(stateOnDisk.jobs, legacy.jobs);
+    loaded.quoteStore.close();
 
     // Restart after migration keeps the reservation.
     const again = loadWorkerState({ stateFile, reservationFile });
     assert.equal(again.migratedReservations, 0);
     assert.equal(again.state.reservations[nonce].operator, wallet.address);
+    again.quoteStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("quote keys journaled after load survive a crash (no compaction) and a restart; the state file never holds them", () => {
+  const { dir, stateFile, reservationFile } = scratch();
+  try {
+    copyFileSync(FIXTURE, stateFile);
+    const first = loadWorkerState({ stateFile, reservationFile });
+    const wallet = Wallet.createRandom();
+    const nonce = `0x${"cd".repeat(32)}`;
+    first.state.reservations[nonce] = { operator: wallet.address, operatorKey: wallet.privateKey, createdAt: 1, attestedDigest: `0x${"ee".repeat(32)}`, quoteDeadline: 99 };
+    first.persistReservations([nonce]);
+    first.save();
+    // Killed here: no SIGTERM compaction, the snapshot does not have the key yet.
+    assert.equal(JSON.parse(readFileSync(reservationFile, "utf8")).reservations[nonce], undefined);
+    assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).reservations[nonce], undefined);
+    const second = loadWorkerState({ stateFile, reservationFile });
+    assert.equal(second.storeLoad.replayed, 1);
+    assert.equal(second.state.reservations[nonce].operatorKey, wallet.privateKey);
+    assert.equal(JSON.parse(readFileSync(reservationFile, "utf8")).reservations[nonce].quoteDeadline, 99, "compacted at startup");
+    second.quoteStore.close();
+    first.quoteStore.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

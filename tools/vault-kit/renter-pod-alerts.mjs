@@ -22,6 +22,9 @@ export const LeaseAlertCode = Object.freeze({
   STAGE_STUCK: "STAGE_STUCK",
   // Startup: a missing or malformed .env setting; the worker idles until fixed.
   CONFIG_ERROR: "CONFIG_ERROR",
+  // Ingest: an on-chain pod whose operator does not match the key stored for
+  // its quote nonce (or no key is stored). Parked and retried every tick.
+  OPERATOR_MISMATCH: "OPERATOR_MISMATCH",
 });
 
 const KNOWN_CODES = new Set(Object.values(LeaseAlertCode));

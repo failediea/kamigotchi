@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import * as fs from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { createLeaseAlerter } from "./renter-pod-alerts.mjs";
 import { hardeningConfigFromEnv } from "./renter-pod-config.mjs";
+import { claimOperatorReservation } from "./renter-pod-keys.mjs";
+import { journalFileFor, openQuoteStore, readQuoteStore } from "./renter-pod-quote-store.mjs";
 import { ATTEST_PATH, RELEASE_PATH, RESERVE_PATH, createReservationHandler } from "./renter-pod-reservation-server.mjs";
-import { pruneReservations } from "./renter-pod-reservations.mjs";
+import { pruneReservations, reservationStats } from "./renter-pod-reservations.mjs";
 
 const TOKEN = "t".repeat(40);
 const MARKET = "0x00000000000000000000000000000000000000aa";
@@ -12,17 +17,77 @@ const FACTORY = "0x00000000000000000000000000000000000000bb";
 const DIGEST = `0x${"cd".repeat(32)}`;
 const nonce = (n) => `0x${n.toString(16).padStart(64, "0")}`;
 const renter = (n) => `0x${n.toString(16).padStart(40, "0")}`;
-
+const T0 = 1_790_000_000_000;
+const MIN = 60_000;
 // Every harness renter is funded unless a test passes its own balance reader.
 const RICH = 10n ** 30n;
 // Attest quotes carry the gas totals the keeper signs (REQUIRE_RENTER_BALANCE).
 const GAS = { setupGasWei: "1000", hubGasWei: "2000", operatingGasWei: "3000" };
+const job = (tokenIndex, who) => ({ tokenIndex, renter: who, returned: false });
 
-async function harness({ env = {}, healthy = true, jobs = {}, listingExists, renterBalance = async () => RICH, now } = {}) {
-  const state = { jobs, reservations: {} };
+/** In-process request/response pair (no sockets): fast enough for hour-long simulations. */
+async function invoke(handler, { method = "POST", url, headers = {}, body, onHead }) {
+  const payload = body === undefined ? [] : [Buffer.from(typeof body === "string" ? body : JSON.stringify(body))];
+  const request = {
+    method,
+    url,
+    headers,
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of payload) yield chunk;
+    },
+  };
+  const response = {
+    status: null,
+    headers: null,
+    body: null,
+    headersSent: false,
+    writeHead(status, head) {
+      onHead?.(status);
+      this.status = status;
+      this.headers = head;
+      this.headersSent = true;
+    },
+    end(text) {
+      this.body = JSON.parse(text);
+    },
+  };
+  await handler(request, response);
+  return { status: response.status, body: response.body, retryAfter: response.headers?.["Retry-After"] ?? null };
+}
+
+/**
+ * store: "memory" records persist() calls; "disk" uses the real quote store
+ * (append + fsync) in a temp dir. `fsImpl` lets a test make fsync a no-op for
+ * long simulations (file sizes stay real).
+ */
+function harness({
+  env = {},
+  jobs = {},
+  ingestRetry = {},
+  listingExists,
+  renterBalance = async () => RICH,
+  store = "memory",
+  fsImpl = fs,
+  persistHook,
+  signHook,
+  startMs = T0,
+} = {}) {
+  const state = { jobs, reservations: {}, ingestRetry };
   const events = [];
   const alertLines = [];
-  let health = healthy ? { ok: true, reason: "ok" } : { ok: false, reason: "heartbeat-stale" };
+  const balanceReads = [];
+  let clock = startMs;
+  let health = { ok: true, reason: "ok" };
+  let dir = null;
+  let quoteStore = null;
+  let file = null;
+  if (store === "disk") {
+    dir = mkdtempSync(join(tmpdir(), "rp-res-srv-"));
+    file = join(dir, "state.reservations.json");
+    quoteStore = openQuoteStore({ file, getReservations: () => state.reservations, fs: fsImpl });
+    state.reservations = quoteStore.load().reservations;
+    quoteStore.compact();
+  }
   const handler = createReservationHandler({
     state,
     token: TOKEN,
@@ -31,596 +96,501 @@ async function harness({ env = {}, healthy = true, jobs = {}, listingExists, ren
     policy: hardeningConfigFromEnv(env),
     health: () => health,
     quoteDigest: async () => DIGEST,
-    signDigest: (digest) => `sig(${digest})`,
-    saveReservations: () => events.push(["save", JSON.parse(JSON.stringify(state.reservations))]),
-    alert: createLeaseAlerter({ log: (line) => alertLines.push(line), minIntervalMs: 60_000 }),
+    signDigest: (digest) => {
+      signHook?.(digest);
+      events.push(["sign", digest]);
+      return `sig(${digest})`;
+    },
+    persist: (nonces) => {
+      persistHook?.(nonces);
+      if (quoteStore) quoteStore.sync(nonces);
+      events.push(["persist", nonces]);
+    },
+    alert: createLeaseAlerter({ log: (line) => alertLines.push(line), minIntervalMs: 60_000, now: () => clock }),
     log: () => {},
+    now: () => clock,
     ...(listingExists ? { listingExists } : {}),
-    renterBalance,
-    ...(now ? { now } : {}),
+    renterBalance: async (who) => {
+      balanceReads.push(who);
+      return renterBalance(who);
+    },
   });
-  const server = createServer(handler);
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const post = async (path, body, { auth = `Bearer ${TOKEN}` } = {}) => {
-    const payload = path === ATTEST_PATH && body.quote ? { ...body, quote: { ...GAS, ...body.quote } } : body;
-    const response = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
-      body: JSON.stringify({ market: MARKET, factory: FACTORY, ...payload }),
+  const call = (path, body, { auth = `Bearer ${TOKEN}`, method, onHead } = {}) => {
+    const payload = path === ATTEST_PATH && body?.quote ? { ...body, quote: { ...GAS, ...body.quote } } : body;
+    return invoke(handler, {
+      method,
+      url: path,
+      headers: auth ? { authorization: auth } : {},
+      body: { market: MARKET, factory: FACTORY, ...payload },
+      onHead,
     });
-    return { status: response.status, body: await response.json(), retryAfter: response.headers.get("retry-after") };
+  };
+  const deadline = (aheadSec = 900) => String(Math.floor(clock / 1000) + aheadSec);
+  /** reserve -> attest, the web's two worker calls for one checkout. */
+  const checkout = async (n, who, tokenIndex, { fundingWei, deadlineSec } = {}) => {
+    const reserved = await call(RESERVE_PATH, { nonce: nonce(n), renter: who, tokenIndex, ...(fundingWei !== undefined ? { fundingWei } : {}) });
+    if (reserved.status !== 201) return { ...reserved, stage: "reserve" };
+    const attested = await call(ATTEST_PATH, {
+      quote: { nonce: nonce(n), renter: who, operator: reserved.body.operator, tokenIndex, deadline: deadlineSec ?? deadline() },
+    });
+    return { ...attested, stage: "attest", operator: reserved.body.operator };
   };
   return {
     state,
     events,
     alertLines,
-    post,
+    balanceReads,
+    call,
+    checkout,
+    deadline,
+    file,
+    quoteStore,
+    now: () => clock,
+    advance: (ms) => {
+      clock += ms;
+    },
     setHealth: (value) => {
       health = value;
     },
-    close: () => new Promise((resolve) => server.close(resolve)),
+    close: () => {
+      quoteStore?.close();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
 
-test("reserve: 201 with an operator, persisted before the response", async () => {
-  const h = await harness();
+test("reserve: 201 with a fresh random operator that is on disk BEFORE the answer; a retry returns the same one", async () => {
+  const h = harness({ store: "disk" });
   try {
-    const result = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
+    let durableAtAnswer = null;
+    const result = await h.call(
+      RESERVE_PATH,
+      { nonce: nonce(1), renter: renter(1), tokenIndex: 7 },
+      { onHead: () => (durableAtAnswer = readQuoteStore(h.file).reservations[nonce(1)] ?? null) }
+    );
     assert.equal(result.status, 201);
     assert.match(result.body.operator, /^0x[0-9a-fA-F]{40}$/);
-    assert.equal(h.events.length, 1);
-    const saved = h.events[0][1][nonce(1)];
-    assert.equal(saved.operator, result.body.operator);
-    assert.equal(saved.renter, renter(1));
-    // Idempotent retry returns the same operator without another write.
-    const again = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
+    assert.equal(durableAtAnswer?.operator, result.body.operator, "key durable before the operator left the worker");
+    assert.equal(durableAtAnswer.renter, renter(1));
+    assert.equal(durableAtAnswer.tokenIndex, 7);
+    const persists = h.events.filter(([kind]) => kind === "persist").length;
+    const again = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
     assert.equal(again.body.operator, result.body.operator);
-    assert.equal(h.events.length, 1);
+    assert.equal(h.events.filter(([kind]) => kind === "persist").length, persists, "an idempotent retry writes nothing");
+    const other = await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(1) });
+    assert.notEqual(other.body.operator, result.body.operator, "independent random keys per quote");
+    assert.notEqual(h.state.reservations[nonce(1)].operatorKey, h.state.reservations[nonce(2)].operatorKey);
+    assert.equal(statSync(h.file).mode & 0o777, 0o600);
+    assert.equal(statSync(journalFileFor(h.file)).mode & 0o777, 0o600);
   } finally {
-    await h.close();
+    h.close();
   }
 });
 
-test("401 without the token; 400 without a renter (web must send it)", async () => {
-  const h = await harness();
+test("request validation: 401 token, 404 route, 400 renter / nonce / market / tokenIndex / fundingWei / nonce reuse", async () => {
+  const h = harness();
   try {
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) }, { auth: "Bearer nope" })).status, 401);
-    const missing = await h.post(RESERVE_PATH, { nonce: nonce(1) });
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) }, { auth: "Bearer nope" })).status, 401);
+    assert.equal((await h.call("/v1/other", {})).status, 404);
+    assert.equal((await h.call(RESERVE_PATH, {}, { method: "GET" })).status, 404);
+    const missing = await h.call(RESERVE_PATH, { nonce: nonce(1) });
     assert.equal(missing.status, 400);
     assert.match(missing.body.error, /renter/);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), market: FACTORY })).status, 400);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: "0x12", renter: renter(1) })).status, 400);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), market: FACTORY })).status, 400);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: "x" })).status, 400);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), fundingWei: "0x10" })).status, 400);
+    assert.equal(h.balanceReads.length, 0, "invalid requests never cost an RPC");
+    assert.equal(Object.keys(h.state.reservations).length, 0, "nor a key");
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 })).status, 201);
+    assert.match((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(2) })).body.error, /different renter/);
+    assert.match((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 5 })).body.error, /different listing/);
   } finally {
-    await h.close();
+    h.close();
   }
 });
 
-test("503 on both routes while the worker is stale or halted", async () => {
-  const h = await harness({ healthy: false });
+test("503 on reserve and attest while the worker is stale or halted; release is still answered", async () => {
+  const h = harness();
   try {
-    const reserve = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    assert.equal(reserve.status, 503);
-    assert.equal(reserve.body.reason, "heartbeat-stale");
-    const attest = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1) } });
-    assert.equal(attest.status, 503);
-    assert.equal(h.events.length, 0, "nothing reserved or signed while unhealthy");
-    h.setHealth({ ok: true, reason: "ok" });
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) })).status, 201);
-  } finally {
-    await h.close();
-  }
-});
-
-test("403 for renters outside RENTER_ALLOWLIST", async () => {
-  const h = await harness({ env: { RENTER_ALLOWLIST: renter(1) } });
-  try {
-    const refused = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(2) });
-    assert.equal(refused.status, 403);
-    assert.equal(h.events.length, 0);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1) })).status, 201);
-  } finally {
-    await h.close();
-  }
-});
-
-test("429 + one rate-limited RESERVATION_CAP alert line at the per-renter cap", async () => {
-  const h = await harness();
-  try {
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) })).status, 201);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1) })).status, 201);
-    const third = await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(1) });
-    const fourth = await h.post(RESERVE_PATH, { nonce: nonce(4), renter: renter(1) });
-    assert.equal(third.status, 429);
-    assert.equal(third.body.code, "RESERVATION_CAP");
-    assert.equal(third.body.scope, "reservation", "machine-readable scope for the web message");
-    assert.equal(third.body.renter, undefined, "the renter address stays in the alert only");
-    assert.equal(fourth.status, 429);
-    assert.equal(h.alertLines.length, 1, "repeat refusals are rate limited");
-    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] RESERVATION_CAP scope=reservation /);
-  } finally {
-    await h.close();
-  }
-});
-
-test("429 LEASE_CAP at attest when active leases plus distinct attested listings reach MAX_ACTIVE_LEASES", async () => {
-  const h = await harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 5: { tokenIndex: 5, returned: false } } });
-  try {
-    const deadline = String(Math.floor(Date.now() / 1000) + 900);
-    const quoteFor = async (n, tokenIndex) => {
-      const { body } = await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) });
-      return h.post(ATTEST_PATH, { quote: { nonce: nonce(n), renter: renter(n), operator: body.operator, tokenIndex, deadline } });
-    };
-    // Reserving is never refused for lease capacity by unattested requests.
-    for (let n = 10; n < 20; n++) assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) })).status, 201);
-    assert.equal((await quoteFor(1, 8)).status, 200, "listing #8 takes the second slot");
-    assert.equal((await quoteFor(2, 8)).status, 200, "a second quote for #8 adds nothing");
-    const refused = await quoteFor(3, 9);
-    assert.equal(refused.status, 429);
-    assert.equal(refused.body.code, "LEASE_CAP");
-    assert.equal(refused.body.scope, "market");
-    assert.match(h.alertLines[0], /^\[LEASE-ALERT\] LEASE_CAP scope=market active=1 pending=1 cap=2/);
-    assert.equal(h.state.reservations[nonce(3)].attestedDigest, undefined, "nothing signed");
-  } finally {
-    await h.close();
-  }
-});
-
-test("attest refuses a tokenIndex that is not a real listing", async () => {
-  const h = await harness({ listingExists: async (tokenIndex) => tokenIndex === 8 });
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 99 };
-    const refused = await h.post(ATTEST_PATH, { quote });
-    assert.equal(refused.status, 400);
-    assert.match(refused.body.error, /unknown listing/);
-    assert.equal((await h.post(ATTEST_PATH, { quote: { ...quote, tokenIndex: 8 } })).status, 200);
-    assert.equal(h.state.reservations[nonce(1)].tokenIndex, 8);
-  } finally {
-    await h.close();
-  }
-});
-
-test("attest: signs the digest, records the quote deadline, and enforces renter binding", async () => {
-  const h = await harness();
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 4, deadline: "1790000900" };
-    const signed = await h.post(ATTEST_PATH, { quote });
-    assert.equal(signed.status, 200);
-    assert.equal(signed.body.keeperSignature, `sig(${DIGEST})`);
-    const saved = h.events.at(-1)[1][nonce(1)];
-    assert.equal(saved.attestedDigest, DIGEST);
-    assert.equal(saved.quoteDeadline, 1_790_000_900);
-
-    const wrongRenter = await h.post(ATTEST_PATH, { quote: { ...quote, renter: renter(2) } });
-    assert.equal(wrongRenter.status, 400);
-    const unknown = await h.post(ATTEST_PATH, { quote: { ...quote, nonce: nonce(9) } });
-    assert.equal(unknown.status, 400);
-  } finally {
-    await h.close();
-  }
-});
-
-test("attest refuses a renter removed from the allowlist after reserving (403)", async () => {
-  const h = await harness({ env: { RENTER_ALLOWLIST: renter(1) } });
-  try {
-    h.state.reservations[nonce(1)] = { operator: renter(77), operatorKey: "0x00", createdAt: Date.now(), renter: renter(2) };
-    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(2), operator: renter(77), tokenIndex: 4 } });
-    assert.equal(refused.status, 403);
-  } finally {
-    await h.close();
-  }
-});
-
-test("an unattested reservation past its TTL is never signed", async () => {
-  const h = await harness();
-  try {
-    h.state.reservations[nonce(1)] = {
-      operator: renter(77),
-      operatorKey: "0x00",
-      createdAt: Date.now() - 21 * 60_000,
-      renter: renter(1),
-    };
-    const refused = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: renter(77), tokenIndex: 4 } });
-    assert.equal(refused.status, 400);
-    assert.equal(h.state.reservations[nonce(1)].attestedDigest, undefined);
-  } finally {
-    await h.close();
-  }
-});
-
-test("unknown routes are 404", async () => {
-  const h = await harness();
-  try {
-    assert.equal((await h.post("/v1/other", {})).status, 404);
-  } finally {
-    await h.close();
-  }
-});
-
-test("final-verify repro: concurrent attests for different listings cannot overrun LEASE_CAP", async () => {
-  // Slow listing check: every attest is parked on this await together.
-  let release;
-  const gate = new Promise((resolve) => (release = resolve));
-  const h = await harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 5: { tokenIndex: 5, returned: false } }, listingExists: () => gate });
-  try {
-    const quotes = [];
-    for (let n = 1; n <= 6; n++) {
-      const { body } = await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n) });
-      quotes.push({ nonce: nonce(n), renter: renter(n), operator: body.operator, tokenIndex: 100 + n, deadline: "1790000900" });
-    }
-    // Market at cap - 1 (one active lease, cap 2): fire all six at once.
-    const inFlight = quotes.map((quote) => h.post(ATTEST_PATH, { quote }));
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    release(true);
-    const results = await Promise.all(inFlight);
-    const statuses = results.map((r) => r.status).sort();
-    assert.deepEqual(statuses, [200, 429, 429, 429, 429, 429], "exactly one attest gets the last slot");
-    for (const refused of results.filter((r) => r.status === 429)) {
-      assert.equal(refused.body.code, "LEASE_CAP");
-      assert.equal(refused.body.scope, "market");
-    }
-    const signed = Object.values(h.state.reservations).filter((r) => r.attestedDigest);
-    assert.equal(signed.length, 1);
-    assert.ok(Object.values(h.state.reservations).every((r) => r.attestPendingUntil === undefined), "no slot left held");
-  } finally {
-    await h.close();
-  }
-});
-
-test("a failed attest releases its held slot (unknown listing / digest failure)", async () => {
-  const h = await harness({ env: { MAX_ACTIVE_LEASES: "1" }, listingExists: async (tokenIndex) => tokenIndex !== 99 });
-  try {
-    const { body: a } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const bad = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: a.operator, tokenIndex: 99 } });
-    assert.equal(bad.status, 400);
-    assert.equal(h.state.reservations[nonce(1)].tokenIndex, undefined, "token rolled back");
-    assert.equal(h.state.reservations[nonce(1)].attestPendingUntil, undefined);
-    // Wrong operator: bindOperatorReservationQuote throws after the awaits.
-    const { body: b } = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2) });
-    const wrong = await h.post(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(2), operator: renter(77), tokenIndex: 7 } });
-    assert.equal(wrong.status, 400);
-    assert.equal(h.state.reservations[nonce(2)].attestPendingUntil, undefined);
-    // The only slot is still free for a real quote.
-    const good = await h.post(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(2), operator: b.operator, tokenIndex: 7 } });
-    assert.equal(good.status, 200);
-  } finally {
-    await h.close();
-  }
-});
-
-test("429 bodies carry a machine-readable scope for every cap (reservation | renter | lease | market)", async () => {
-  const h = await harness({
-    env: { MAX_LIVE_RESERVATIONS: "4", MAX_RESERVATIONS_PER_LISTING: "1", MAX_ACTIVE_LEASES: "1" },
-    jobs: { 3: { tokenIndex: 3, renter: renter(9), returned: false }, 4: { tokenIndex: 4, renter: renter(9), returned: false } },
-  });
-  try {
-    const reserve = (n, who, extra = {}) => h.post(RESERVE_PATH, { nonce: nonce(n), renter: who, ...extra });
-    // renter: renter(9) already holds two active leases.
-    const renterCap = await reserve(1, renter(9));
-    assert.deepEqual([renterCap.status, renterCap.body.code, renterCap.body.scope], [429, "RESERVATION_CAP", "renter"]);
-    // market (LEASE_CAP, early at reserve because tokenIndex is sent).
-    const full = await reserve(2, renter(1), { tokenIndex: 8 });
-    assert.deepEqual([full.status, full.body.code, full.body.scope], [429, "LEASE_CAP", "market"]);
-    // lease: per-listing cap 1 for a listing that is already counted (#3).
-    assert.equal((await reserve(3, renter(1), { tokenIndex: 3 })).status, 201);
-    const listing = await reserve(4, renter(2), { tokenIndex: 3 });
-    assert.deepEqual([listing.status, listing.body.scope], [429, "lease"]);
-    // reservation: the per-renter open-checkout cap (2).
-    assert.equal((await reserve(5, renter(1))).status, 201);
-    const open = await reserve(6, renter(1));
-    assert.deepEqual([open.status, open.body.scope], [429, "reservation"]);
-    // market (RESERVATION_CAP): 4 live checkouts market-wide.
-    assert.equal((await reserve(7, renter(3))).status, 201);
-    assert.equal((await reserve(8, renter(4))).status, 201);
-    const busy = await reserve(9, renter(5));
-    assert.deepEqual([busy.status, busy.body.code, busy.body.scope], [429, "RESERVATION_CAP", "market"]);
-    for (const response of [renterCap, full, listing, open, busy]) {
-      assert.deepEqual(Object.keys(response.body).sort(), ["code", "error", "scope"]);
-    }
-  } finally {
-    await h.close();
-  }
-});
-
-// --- Open-rental (Sybil quote-spam) guards: THR-04 / FE-2 without an allowlist ---
-
-const T0 = 1_790_000_000_000;
-const clock = (start = T0) => {
-  let at = start;
-  return { now: () => at, advance: (ms) => (at += ms), set: (ms) => (at = ms) };
-};
-const TTL_MS = 1200 * 1000;
-const COOLDOWN_MS = 900 * 1000;
-
-test("balance gate at attest: 403 INSUFFICIENT_BALANCE below setup + hub + operating gas, nothing signed, listing freed", async () => {
-  let balance = 5_999n;
-  const h = await harness({ renterBalance: async () => balance });
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, deadline: "1790000900" };
-    const refused = await h.post(ATTEST_PATH, { quote });
-    assert.equal(refused.status, 403);
-    assert.deepEqual(refused.body, {
-      error: "this wallet does not hold enough ETH to fund this lease",
-      code: "INSUFFICIENT_BALANCE",
-      scope: "renter",
-      requiredWei: "6000",
-    });
-    const entry = h.state.reservations[nonce(1)];
-    assert.equal(entry.attestedDigest, undefined, "nothing signed");
-    assert.equal(entry.attestPendingUntil, undefined, "slot rolled back");
-    assert.equal(entry.releaseReason, "insufficient-balance");
-    assert.equal(h.alertLines.length, 0, "a normal user condition, not an alert");
-    // The unfunded wallet's reservation holds nothing: another renter can take the Kami now.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), tokenIndex: 7 })).status, 201);
-    // Exactly enough is enough (new quote: the refused nonce stays released).
-    balance = 6_000n;
-    const { body: again } = await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(3), tokenIndex: 8 });
-    const ok = await h.post(ATTEST_PATH, { quote: { ...quote, nonce: nonce(3), renter: renter(3), operator: again.operator, tokenIndex: 8 } });
-    assert.equal(ok.status, 200);
-    assert.equal((await h.post(ATTEST_PATH, { quote })).status, 400, "a released reservation is never signed");
-  } finally {
-    await h.close();
-  }
-});
-
-test("balance gate fails CLOSED: an RPC failure is 503 BALANCE_UNAVAILABLE, never a signature or a reservation", async () => {
-  const h = await harness({
-    renterBalance: async () => {
-      throw new Error("rpc down");
-    },
-  });
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const attest = await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7 } });
-    assert.equal(attest.status, 503);
-    assert.equal(attest.body.code, "BALANCE_UNAVAILABLE");
-    assert.equal(attest.retryAfter, "60");
-    const entry = h.state.reservations[nonce(1)];
-    assert.equal(entry.attestedDigest, undefined);
-    assert.equal(entry.attestPendingUntil, undefined, "slot rolled back");
-    assert.equal(entry.releasedAt, undefined, "an RPC failure is not the renter's fault: nothing released");
-    const saves = h.events.length;
-    const reserve = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), fundingWei: "1" });
-    assert.equal(reserve.status, 503);
-    assert.equal(reserve.body.code, "BALANCE_UNAVAILABLE");
-    assert.equal(h.state.reservations[nonce(2)], undefined, "no operator reserved");
-    assert.equal(h.events.length, saves);
-  } finally {
-    await h.close();
-  }
-});
-
-test("balance gate at reserve (web sends fundingWei after pricing): refused before an operator is spent", async () => {
-  const h = await harness({ renterBalance: async (who) => (who === renter(1) ? 10_000n : 0n) });
-  try {
-    const poor = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(2), tokenIndex: 7, fundingWei: "6000" });
-    assert.equal(poor.status, 403);
-    assert.equal(poor.body.code, "INSUFFICIENT_BALANCE");
-    assert.equal(poor.body.scope, "renter");
-    assert.equal(poor.body.requiredWei, "6000");
-    assert.equal(h.events.length, 0, "nothing reserved");
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), fundingWei: "0x10" })).status, 400);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), fundingWei: "-1" })).status, 400);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), tokenIndex: 7, fundingWei: "10000" })).status, 201);
-    // Without fundingWei the reserve is not gated; the attest still is (authoritative).
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(2) })).status, 201);
-  } finally {
-    await h.close();
-  }
-});
-
-test("balance gate: attest requires the quote gas totals; REQUIRE_RENTER_BALANCE=off skips the read", async () => {
-  const h = await harness();
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, hubGasWei: undefined };
-    const missing = await h.post(ATTEST_PATH, { quote });
-    assert.equal(missing.status, 400);
-    assert.match(missing.body.error, /hubGasWei/);
-    assert.equal(h.state.reservations[nonce(1)].attestPendingUntil, undefined);
-  } finally {
-    await h.close();
-  }
-  const off = await harness({
-    env: { REQUIRE_RENTER_BALANCE: "off" },
-    renterBalance: async () => {
-      throw new Error("must not be called");
-    },
-  });
-  try {
-    const { body } = await off.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), fundingWei: "1" });
-    assert.equal((await off.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7 } })).status, 200);
-  } finally {
-    await off.close();
-  }
-  assert.throws(
-    () => createReservationHandler({ state: {}, token: TOKEN, market: MARKET, factory: FACTORY, policy: hardeningConfigFromEnv({}) }),
-    /REQUIRE_RENTER_BALANCE is on/,
-    "the gate is never silently skipped"
-  );
-});
-
-test("single checkout per Kami: another renter gets 429 scope=lease + Retry-After; the holder may re-quote; release frees it", async () => {
-  const c = clock();
-  const h = await harness({ now: c.now });
-  try {
-    const deadlineSec = Math.floor(T0 / 1000) + 900;
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, deadline: String(deadlineSec) };
-    assert.equal((await h.post(ATTEST_PATH, { quote })).status, 200);
-    c.advance(60_000);
-    const blocked = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), tokenIndex: 7 });
-    assert.equal(blocked.status, 429);
-    assert.deepEqual(Object.keys(blocked.body).sort(), ["code", "error", "scope"], "429 body shape unchanged");
-    assert.deepEqual([blocked.body.code, blocked.body.scope], ["RESERVATION_CAP", "lease"]);
-    assert.equal(blocked.retryAfter, "840", "until the holder's quote deadline");
-    assert.equal(h.state.reservations[nonce(2)], undefined);
-    // Other Kamis are unaffected; the holder itself may re-quote its Kami (wallet rejected the tx).
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(2), tokenIndex: 8 })).status, 201);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(4), renter: renter(1), tokenIndex: 7 })).status, 201);
-    // The holder closes checkout: both of its reservations are released, the Kami is free at once.
-    for (const n of [1, 4]) {
-      const released = await h.post(RELEASE_PATH, { nonce: nonce(n), renter: renter(1) });
-      assert.deepEqual([released.status, released.body], [200, { released: true }]);
-    }
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(5), renter: renter(2), tokenIndex: 7 })).status, 201);
-  } finally {
-    await h.close();
-  }
-  // Past the quote deadline an attested quote no longer holds the Kami either.
-  const c2 = clock();
-  const h2 = await harness({ now: c2.now });
-  try {
-    const deadlineSec = Math.floor(T0 / 1000) + 900;
-    const { body } = await h2.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, deadline: String(deadlineSec) };
-    assert.equal((await h2.post(ATTEST_PATH, { quote })).status, 200);
-    c2.set(deadlineSec * 1000 + 1);
-    assert.equal((await h2.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), tokenIndex: 7 })).status, 201);
-  } finally {
-    await h2.close();
-  }
-});
-
-test("single checkout per Kami: concurrent reserves from different renters admit exactly one (balance read first)", async () => {
-  let release;
-  const gate = new Promise((resolve) => (release = resolve));
-  const h = await harness({ renterBalance: () => gate.then(() => RICH) });
-  try {
-    const inFlight = [1, 2, 3, 4, 5].map((n) =>
-      h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(n), tokenIndex: 9, fundingWei: "6000" })
-    );
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    release();
-    const statuses = (await Promise.all(inFlight)).map((r) => r.status).sort();
-    assert.deepEqual(statuses, [201, 429, 429, 429, 429]);
-    assert.equal(Object.keys(h.state.reservations).length, 1);
-  } finally {
-    await h.close();
-  }
-});
-
-test("listing cooldown: a checkout that EXPIRED unused blocks the same renter on the same Kami; a released one never does", async () => {
-  const c = clock();
-  const h = await harness({ now: c.now });
-  try {
-    // Expired unattested (e.g. a spam wallet that never finished): cooldown.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 })).status, 201);
-    c.advance(TTL_MS + 1_000);
-    const cooling = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), tokenIndex: 7 });
-    assert.equal(cooling.status, 429);
-    assert.deepEqual([cooling.body.code, cooling.body.scope], ["LISTING_COOLDOWN", "lease"]);
-    assert.deepEqual(Object.keys(cooling.body).sort(), ["code", "error", "scope"]);
-    assert.equal(cooling.retryAfter, String(COOLDOWN_MS / 1000 - 1));
-    assert.equal(h.alertLines.length, 0, "cooldowns are not alerts");
-    // Only that renter and only that Kami.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(1), tokenIndex: 8 })).status, 201);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(4), renter: renter(2), tokenIndex: 7 })).status, 201);
-    // The pruner removes the expired entry but keeps the cooldown (persisted with the store).
-    assert.equal(pruneReservations(h.state, { nowMs: c.now(), ttlMs: TTL_MS, ingestedThroughSec: null, cooldownMs: COOLDOWN_MS }), 1);
-    assert.equal(h.state.reservations[nonce(1)], undefined);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(5), renter: renter(1), tokenIndex: 7 })).body.code, "LISTING_COOLDOWN");
-    c.set(T0 + TTL_MS + COOLDOWN_MS + 1);
-    // renter(2)'s checkout on #7 still holds (single-checkout lock), until it is released.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(5), renter: renter(1), tokenIndex: 7 })).body.code, "RESERVATION_CAP");
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(4), renter: renter(2) })).status, 200);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(5), renter: renter(1), tokenIndex: 7 })).status, 201);
-
-    // Released (renter closed checkout / wallet rejected the tx): immediate retry, no cooldown ever.
-    c.set(T0 + 10 * TTL_MS);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(10), renter: renter(3), tokenIndex: 20 })).status, 201);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(10), renter: renter(3) })).status, 200);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(11), renter: renter(3), tokenIndex: 20 })).status, 201);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(11), renter: renter(3) })).status, 200);
-    c.advance(TTL_MS + 1_000);
-    pruneReservations(h.state, { nowMs: c.now(), ttlMs: TTL_MS, ingestedThroughSec: null, cooldownMs: COOLDOWN_MS });
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(12), renter: renter(3), tokenIndex: 20 })).status, 201);
-  } finally {
-    await h.close();
-  }
-});
-
-test("listing cooldown also follows an attested quote whose deadline passed without a pod", async () => {
-  const c = clock();
-  const h = await harness({ now: c.now });
-  try {
-    const deadlineSec = Math.floor(T0 / 1000) + 900;
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    const quote = { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, deadline: String(deadlineSec) };
-    assert.equal((await h.post(ATTEST_PATH, { quote })).status, 200);
-    c.set(deadlineSec * 1000 + 5_000);
-    const cooling = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), tokenIndex: 7 });
-    assert.equal(cooling.body.code, "LISTING_COOLDOWN");
-    assert.equal(cooling.retryAfter, String(COOLDOWN_MS / 1000 - 5));
-    // Pruned only once ingest covered the deadline; the cooldown survives the prune.
-    c.set(T0 + TTL_MS + 1_000);
-    assert.equal(pruneReservations(h.state, { nowMs: c.now(), ttlMs: TTL_MS, ingestedThroughSec: deadlineSec + 1, cooldownMs: COOLDOWN_MS }), 1);
-    assert.equal(h.state.listingCooldowns[`${renter(1)}:7`], deadlineSec * 1000 + COOLDOWN_MS);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), tokenIndex: 7 })).body.code, "LISTING_COOLDOWN");
-  } finally {
-    await h.close();
-  }
-});
-
-test("release/retry is bounded per wallet (MAX_RESERVATION_ATTEMPTS_PER_RENTER) so one wallet cannot fill MAX_LIVE_RESERVATIONS", async () => {
-  const h = await harness();
-  try {
-    for (let n = 1; n <= 6; n++) {
-      assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(n), renter: renter(1), tokenIndex: 7 })).status, 201, `attempt ${n}`);
-      assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(n), renter: renter(1) })).status, 200);
-    }
-    const seventh = await h.post(RESERVE_PATH, { nonce: nonce(7), renter: renter(1), tokenIndex: 7 });
-    assert.deepEqual([seventh.status, seventh.body.code, seventh.body.scope], [429, "RESERVATION_CAP", "reservation"]);
-    assert.match(h.alertLines.at(-1), /RESERVATION_CAP scope=reservation .*attempts=6 cap=6/);
-    // Released checkouts do not count as open ones.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(8), renter: renter(2) })).status, 201);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(8), renter: renter(2) })).status, 200);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(9), renter: renter(2) })).status, 201);
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(10), renter: renter(2) })).status, 201, "two open + one released");
-  } finally {
-    await h.close();
-  }
-});
-
-test("release route: authenticated, renter-bound, idempotent, answered while halted; a released nonce is dead", async () => {
-  const h = await harness();
-  try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) }, { auth: "Bearer nope" })).status, 401);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(1), market: FACTORY })).status, 400);
-    const stranger = await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(2) });
-    assert.equal(stranger.status, 400);
-    assert.equal(h.state.reservations[nonce(1)].releasedAt, undefined);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: "nope" })).status, 400);
     h.setHealth({ ok: false, reason: "halted" });
-    const saves = h.events.length;
-    assert.deepEqual((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).body, { released: true });
-    assert.equal(h.events.length, saves + 1, "persisted");
-    assert.deepEqual((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).body, { released: false });
-    assert.deepEqual((await h.post(RELEASE_PATH, { nonce: nonce(99), renter: renter(1) })).body, { released: false });
+    const reserve = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1) });
+    assert.deepEqual([reserve.status, reserve.body.reason, reserve.retryAfter], [503, "halted", "60"]);
+    assert.equal((await h.call(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1) } })).status, 503);
+    assert.deepEqual((await h.call(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).body, { released: false });
+    assert.equal(h.events.length, 0);
     h.setHealth({ ok: true, reason: "ok" });
-    assert.equal(h.state.reservations[nonce(1)].operator, body.operator, "the key is kept until the pruner proves it unusable");
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 })).status, 400);
-    assert.equal((await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7 } })).status, 400);
+    assert.equal((await h.checkout(1, renter(1), 4)).status, 200);
   } finally {
-    await h.close();
+    h.close();
   }
 });
 
-test("a released ATTESTED quote still counts toward LEASE_CAP (it can still be submitted on-chain)", async () => {
-  const h = await harness({ env: { MAX_ACTIVE_LEASES: "1" } });
+test("optional allowlist (off by default): 403 at reserve and at attest when set", async () => {
+  const h = harness({ env: { RENTER_ALLOWLIST: renter(1) } });
   try {
-    const { body } = await h.post(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
-    const deadline = String(Math.floor(Date.now() / 1000) + 900);
-    assert.equal((await h.post(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: body.operator, tokenIndex: 7, deadline } })).status, 200);
-    assert.equal((await h.post(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).status, 200);
-    const full = await h.post(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), tokenIndex: 8 });
-    assert.deepEqual([full.status, full.body.code], [429, "LEASE_CAP"]);
-    // ...but it no longer locks its own Kami for other renters.
-    assert.equal((await h.post(RESERVE_PATH, { nonce: nonce(3), renter: renter(2), tokenIndex: 7 })).status, 201);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(2) })).status, 403);
+    const ok = await h.checkout(2, renter(1), 4);
+    assert.equal(ok.status, 200);
   } finally {
-    await h.close();
+    h.close();
+  }
+  const open = harness();
+  try {
+    assert.equal((await open.checkout(1, renter(99), 4)).status, 200, "no allowlist: any funded renter");
+  } finally {
+    open.close();
+  }
+});
+
+test("caps count ON-CHAIN leases only: LEASE_CAP scope market / RESERVATION_CAP scope renter, no Retry-After, one alert line", async () => {
+  const h = harness({ env: { MAX_ACTIVE_LEASES: "2" }, jobs: { 1: job(1, renter(1)) }, ingestRetry: { e: { tokenIndex: 2, renter: renter(1) } } });
+  try {
+    const market = await h.checkout(1, renter(5), 9);
+    assert.deepEqual([market.stage, market.status, market.body.code, market.body.scope, market.retryAfter], ["reserve", 429, "LEASE_CAP", "market", null]);
+    assert.equal((await h.checkout(2, renter(5), 2)).status, 200, "a Kami that already has an on-chain lease never trips the cap");
+    h.state.jobs[1].returned = true;
+    const mine = await h.checkout(3, renter(1), 9);
+    assert.equal(mine.status, 200, "a returned lease frees both caps");
+    h.state.jobs[9] = job(9, renter(1));
+    const renterCap = await h.checkout(4, renter(1), 10);
+    assert.deepEqual([renterCap.status, renterCap.body.code, renterCap.body.scope], [429, "LEASE_CAP", "market"]);
+    const perRenter = harness({ jobs: { 1: job(1, renter(1)), 2: job(2, renter(1)) } });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const refused = await perRenter.checkout(10 + i, renter(1), 30 + i);
+        assert.deepEqual([refused.status, refused.body.code, refused.body.scope], [429, "RESERVATION_CAP", "renter"]);
+      }
+      assert.equal(perRenter.alertLines.filter((line) => line.includes("RESERVATION_CAP")).length, 1, "rate-limited");
+      assert.equal((await perRenter.checkout(20, renter(2), 30)).status, 200);
+    } finally {
+      perRenter.close();
+    }
+  } finally {
+    h.close();
+  }
+});
+
+test("concurrent checkouts at cap - 1 are ALL signed (overshoot bounded by listings); the cap binds once pods exist", async () => {
+  const h = harness({ env: { MAX_ACTIVE_LEASES: "3" }, jobs: { 1: job(1, renter(1)), 2: job(2, renter(2)) } });
+  try {
+    const results = await Promise.all([10, 11, 12, 13].map((token, i) => h.checkout(100 + i, renter(20 + i), token)));
+    assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200]);
+    for (const token of [10, 11]) h.state.jobs[token] = job(token, renter(30));
+    assert.equal((await h.checkout(200, renter(40), 14)).body.code, "LEASE_CAP");
+  } finally {
+    h.close();
+  }
+});
+
+test("attest: signs only the stored operator for the nonce, a real listing, a bounded deadline; binding durable before the signature", async () => {
+  let durableAtSign = null;
+  const h = harness({
+    store: "disk",
+    listingExists: async (token) => token !== 666,
+    signHook: () => (durableAtSign = readQuoteStore(h.file).reservations[nonce(1)] ?? null),
+  });
+  try {
+    const reserved = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    const quote = { nonce: nonce(1), renter: renter(1), operator: reserved.body.operator, tokenIndex: 4, deadline: h.deadline() };
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, nonce: nonce(9) } })).body.error, /stored reservation/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, operator: renter(77) } })).body.error, /operator reserved/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, renter: renter(2) } })).body.error, /renter does not match/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, tokenIndex: 5 } })).body.error, /tokenIndex does not match/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, tokenIndex: undefined } })).body.error, /tokenIndex required/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, deadline: h.deadline(-1) } })).body.error, /already passed/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, deadline: h.deadline(3600) } })).body.error, /further ahead/);
+    assert.match((await h.call(ATTEST_PATH, { quote: { ...quote, deadline: undefined } })).body.error, /deadline required/);
+    assert.equal(h.events.filter(([kind]) => kind === "sign").length, 0, "nothing signed so far");
+
+    const signed = await h.call(ATTEST_PATH, { quote });
+    assert.deepEqual([signed.status, signed.body.keeperSignature], [200, `sig(${DIGEST})`]);
+    assert.equal(durableAtSign?.attestedDigest, DIGEST, "binding on disk when the keeper signed");
+    assert.equal(durableAtSign.quoteDeadline, Number(quote.deadline));
+    assert.equal(durableAtSign.operator, reserved.body.operator);
+    assert.equal((await h.call(ATTEST_PATH, { quote })).status, 200, "an identical retry re-signs the same quote");
+
+    const fake = await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(1) });
+    const unknownListing = await h.call(ATTEST_PATH, { quote: { ...quote, nonce: nonce(2), operator: fake.body.operator, tokenIndex: 666 } });
+    assert.match(unknownListing.body.error, /unknown listing/);
+  } finally {
+    h.close();
+  }
+});
+
+test("attest: an unattested reservation past its TTL is never signed", async () => {
+  const h = harness();
+  try {
+    const reserved = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    h.advance(20 * MIN + 1);
+    const late = await h.call(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: reserved.body.operator, tokenIndex: 4, deadline: h.deadline() } });
+    assert.match(late.body.error, /expired before attestation/);
+  } finally {
+    h.close();
+  }
+});
+
+test("balance filter: unfunded reserve refused BEFORE any key exists; unfunded attest deletes the unsigned key; RPC failure fails closed", async () => {
+  const balances = new Map([[renter(1), 0n], [renter(2), 6_000n]]);
+  const h = harness({ renterBalance: async (who) => balances.get(who) ?? RICH });
+  try {
+    const poor = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4, fundingWei: "6000" });
+    assert.deepEqual([poor.status, poor.body.code, poor.body.scope, poor.body.requiredWei], [403, "INSUFFICIENT_BALANCE", "renter", "6000"]);
+    assert.equal(h.state.reservations[nonce(1)], undefined, "no key generated for an unfunded wallet");
+    assert.equal((await h.checkout(2, renter(2), 4, { fundingWei: "6000" })).status, 200, "exactly funded");
+
+    // Reserved without fundingWei, then the attest finds the wallet unfunded.
+    const reserved = await h.call(RESERVE_PATH, { nonce: nonce(3), renter: renter(1), tokenIndex: 5 });
+    const refused = await h.call(ATTEST_PATH, { quote: { nonce: nonce(3), renter: renter(1), operator: reserved.body.operator, tokenIndex: 5, deadline: h.deadline() } });
+    assert.deepEqual([refused.status, refused.body.code], [403, "INSUFFICIENT_BALANCE"]);
+    assert.equal(h.state.reservations[nonce(3)], undefined, "never signed: key dropped at once");
+    assert.equal(h.events.filter(([kind]) => kind === "sign").length, 1);
+
+    const capped = harness({ env: { MAX_ACTIVE_LEASES: "1" }, jobs: { 1: job(1, renter(9)) } });
+    try {
+      assert.equal((await capped.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4, fundingWei: "1" })).status, 429);
+      assert.equal(capped.balanceReads.length, 0, "a capped request never reads a balance");
+    } finally {
+      capped.close();
+    }
+  } finally {
+    h.close();
+  }
+  const down = harness({ renterBalance: async () => {
+    throw new Error("rpc down");
+  } });
+  try {
+    const reserve = await down.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), fundingWei: "1" });
+    assert.deepEqual([reserve.status, reserve.body.code, reserve.retryAfter], [503, "BALANCE_UNAVAILABLE", "60"]);
+    const reserved = await down.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(1), tokenIndex: 4 });
+    const attest = await down.call(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(1), operator: reserved.body.operator, tokenIndex: 4, deadline: down.deadline() } });
+    assert.deepEqual([attest.status, attest.body.code], [503, "BALANCE_UNAVAILABLE"]);
+    assert.equal(down.events.filter(([kind]) => kind === "sign").length, 0);
+  } finally {
+    down.close();
+  }
+  const off = harness({ env: { REQUIRE_RENTER_BALANCE: "off" }, renterBalance: async () => 0n });
+  try {
+    const result = await off.call(ATTEST_PATH, { quote: { nonce: nonce(1) } });
+    assert.equal(result.status, 400);
+    assert.equal((await off.checkout(2, renter(1), 4, { fundingWei: "1" })).status, 200);
+    assert.equal(off.balanceReads.length, 0);
+  } finally {
+    off.close();
+  }
+});
+
+test("release: renter-bound, idempotent, answered while halted; unsigned keys deleted, signed keys kept and never re-signed", async () => {
+  const h = harness({ store: "disk" });
+  try {
+    const open = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    assert.equal((await h.call(RELEASE_PATH, { nonce: nonce(1), renter: renter(2) })).status, 400);
+    h.setHealth({ ok: false, reason: "halted" });
+    assert.deepEqual((await h.call(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).body, { released: true });
+    h.setHealth({ ok: true, reason: "ok" });
+    assert.equal(readQuoteStore(h.file).reservations[nonce(1)], undefined, "unsigned key deleted on disk too");
+    assert.deepEqual((await h.call(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).body, { released: false });
+    const late = await h.call(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: open.body.operator, tokenIndex: 4, deadline: h.deadline() } });
+    assert.equal(late.status, 400, "a released nonce is dead");
+
+    const signed = await h.checkout(2, renter(1), 5);
+    assert.equal(signed.status, 200);
+    assert.deepEqual((await h.call(RELEASE_PATH, { nonce: nonce(2), renter: renter(1) })).body, { released: true });
+    const kept = readQuoteStore(h.file).reservations[nonce(2)];
+    assert.equal(kept.attestedDigest, DIGEST, "the signed quote can still be submitted: its key stays");
+    assert.ok(kept.releasedAt > 0);
+    const again = await h.call(ATTEST_PATH, { quote: { nonce: nonce(2), renter: renter(1), operator: signed.operator, tokenIndex: 5, deadline: h.deadline() } });
+    assert.match(again.body.error, /released/);
+    assert.match((await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(1) })).body.error, /released/);
+  } finally {
+    h.close();
+  }
+});
+
+// --- Crash / durability ordering -------------------------------------------
+
+test("CRASH: a key-store failure at reserve returns 503 KEY_STORE_UNAVAILABLE and hands out no operator", async () => {
+  let fail = true;
+  const h = harness({ persistHook: () => {
+    if (fail) throw new Error("EIO");
+  } });
+  try {
+    const result = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    assert.deepEqual([result.status, result.body.code, result.body.operator, result.retryAfter], [503, "KEY_STORE_UNAVAILABLE", undefined, "60"]);
+    assert.equal(h.state.reservations[nonce(1)], undefined, "an operator never handed out is not kept");
+    fail = false;
+    assert.equal((await h.checkout(1, renter(1), 4)).status, 200, "a retry succeeds once the disk is back");
+  } finally {
+    h.close();
+  }
+});
+
+test("CRASH: a key-store failure at attest signs NOTHING and rolls the binding back", async () => {
+  let fail = false;
+  const h = harness({ persistHook: () => {
+    if (fail) throw new Error("ENOSPC");
+  } });
+  try {
+    const reserved = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    fail = true;
+    const quote = { nonce: nonce(1), renter: renter(1), operator: reserved.body.operator, tokenIndex: 4, deadline: h.deadline() };
+    const result = await h.call(ATTEST_PATH, { quote });
+    assert.deepEqual([result.status, result.body.code, result.body.keeperSignature], [503, "KEY_STORE_UNAVAILABLE", undefined]);
+    assert.equal(h.events.filter(([kind]) => kind === "sign").length, 0);
+    assert.equal(h.state.reservations[nonce(1)].attestedDigest, undefined, "binding rolled back");
+    assert.equal(h.state.reservations[nonce(1)].quoteDeadline, undefined);
+    fail = false;
+    assert.equal((await h.call(ATTEST_PATH, { quote })).status, 200);
+  } finally {
+    h.close();
+  }
+});
+
+test("CRASH between persist and sign: the process dies after the fsync; on restart the key + binding are on disk and the pod is adoptable", async () => {
+  const h = harness({ store: "disk", signHook: () => {
+    throw new Error("SIGKILL (simulated) right after the binding was fsync'd");
+  } });
+  try {
+    const reserved = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 4 });
+    const quote = { nonce: nonce(1), renter: renter(1), operator: reserved.body.operator, tokenIndex: 4, deadline: h.deadline() };
+    const result = await h.call(ATTEST_PATH, { quote });
+    assert.equal(result.body.keeperSignature, undefined, "no signature left the worker");
+    // Restart from disk only (the in-memory state died with the process).
+    const restarted = { jobs: {}, reservations: readQuoteStore(h.file).reservations };
+    const entry = restarted.reservations[nonce(1)];
+    assert.deepEqual([entry.operator, entry.attestedDigest, entry.quoteDeadline], [reserved.body.operator, DIGEST, Number(quote.deadline)]);
+    // Had the signature escaped anyway, the pod's RenterPodCreated would find its key.
+    assert.equal(claimOperatorReservation(restarted, nonce(1), reserved.body.operator, { remove: false }), entry.operatorKey);
+    // The pruner keeps it until ingest proves the deadline passed on-chain.
+    assert.deepEqual(pruneReservations(restarted, { nowMs: h.now() + 60 * MIN, ttlMs: 20 * MIN, ingestedThroughSec: Number(quote.deadline) }), []);
+  } finally {
+    h.close();
+  }
+});
+
+// --- Jam simulations (the review PoCs against the retired design) ----------
+
+test("JAM (a): 20 funded throwaway wallets quoting EVERY listing every 14 min for 4 h (and releasing) never block an honest renter", async () => {
+  const h = harness({ env: { MAX_ACTIVE_LEASES: "20" } });
+  try {
+    const LISTINGS = 30;
+    let n = 0;
+    let attackerSigned = 0;
+    let honestSigned = 0;
+    let honestRefused = 0;
+    let previous = [];
+    for (let minute = 0; minute < 240; minute++) {
+      if (minute % 14 === 0) {
+        const current = [];
+        for (let wallet = 0; wallet < 20; wallet++) {
+          for (let token = 0; token < LISTINGS; token++) {
+            const result = await h.checkout(++n, renter(1_000 + wallet), token);
+            if (result.status === 200) attackerSigned++;
+            current.push([n, renter(1_000 + wallet)]);
+          }
+        }
+        for (const [old, who] of previous) await h.call(RELEASE_PATH, { nonce: nonce(old), renter: who });
+        previous = current;
+      }
+      if (minute % 5 === 0) {
+        const result = await h.checkout(++n, renter(7), minute % LISTINGS);
+        if (result.status === 200) honestSigned++;
+        else honestRefused++;
+        // The honest renter declines (closes checkout) every time: still never locked out.
+        await h.call(RELEASE_PATH, { nonce: nonce(n), renter: renter(7) });
+      }
+      h.advance(MIN);
+      pruneReservations(h.state, { nowMs: h.now(), ttlMs: 20 * MIN, ingestedThroughSec: Math.floor(h.now() / 1000) - 20 });
+    }
+    assert.equal(honestRefused, 0);
+    assert.equal(honestSigned, 48);
+    assert.equal(attackerSigned, 18 * 20 * LISTINGS, "the attacker gets quotes too - they just hold nothing");
+    // What bounds the attacker is on-chain: only submitted, funded checkouts count.
+    assert.equal(h.state.jobs && Object.keys(h.state.jobs).length, 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("JAM (b): zero-ETH wallets hammering one Kami are refused before a key exists and never affect anyone else", async () => {
+  const h = harness({ renterBalance: async (who) => (who === renter(7) ? RICH : 0n) });
+  try {
+    for (let i = 0; i < 500; i++) {
+      const result = await h.checkout(i + 1, renter(10_000 + i), 4, { fundingWei: "6000" });
+      assert.equal(result.status, 403);
+    }
+    assert.equal(Object.keys(h.state.reservations).length, 0, "no key, no store growth");
+    assert.equal(h.events.length, 0, "no disk write at all");
+    assert.equal((await h.checkout(1_000, renter(7), 4, { fundingWei: "6000" })).status, 200);
+  } finally {
+    h.close();
+  }
+});
+
+test("JAM (c): quote volume cannot fill the market; only on-chain pods can, and contention for one Kami resolves on-chain", async () => {
+  const h = harness({ env: { MAX_ACTIVE_LEASES: "2" } });
+  try {
+    for (let i = 0; i < 300; i++) assert.equal((await h.checkout(i + 1, renter(2_000 + i), i % 5)).status, 200);
+    // Two renters raced for Kami #3 and both hold signed quotes; the chain
+    // accepts the first create and reverts the second (the web simulates it and
+    // shows "this Kami was just rented"). The worker only ever sees the winner.
+    h.state.jobs[3] = job(3, renter(2_003));
+    assert.equal((await h.checkout(900, renter(8), 3)).status, 200, "Kami #3's slot is already counted");
+    h.state.jobs[4] = job(4, renter(2_004));
+    assert.equal((await h.checkout(901, renter(8), 1)).body.code, "LEASE_CAP", "two real pods fill a cap of 2");
+  } finally {
+    h.close();
+  }
+});
+
+test("BURST: 50 IPs at the web's per-IP limit (12/min) for 1 h - every quote signed, no key ever refused or evicted, store bounded", { timeout: 300_000 }, async () => {
+  // fsync is a no-op here to keep the test fast; sizes and counts are real.
+  // Measured fsync cost: bench-quote-store-burst.mjs.
+  const quick = { ...fs, fsyncSync: () => {} };
+  const h = harness({ store: "disk", fsImpl: quick });
+  try {
+    const PER_MINUTE = 50 * 12;
+    const WALLETS = 2_000; // web per-renter limit 6/min -> at least 100 wallets needed
+    let n = 0;
+    let maxEntries = 0;
+    let maxJournal = 0;
+    let maxSnapshot = 0;
+    const signedNonces = [];
+    for (let second = 0; second < 3_600; second++) {
+      for (let i = 0; i < PER_MINUTE / 60; i++) {
+        n++;
+        const result = await h.checkout(n, renter(50_000 + (n % WALLETS)), n % 5_000);
+        assert.equal(result.status, 200, `quote ${n} refused: ${JSON.stringify(result.body)}`);
+        signedNonces.push([n, h.now()]);
+      }
+      h.advance(1_000);
+      if (second % 30 === 29) {
+        // Worker tick: ingest has covered chain time up to ~20 s ago.
+        pruneReservations(h.state, { nowMs: h.now(), ttlMs: 20 * MIN, ingestedThroughSec: Math.floor(h.now() / 1000) - 20 });
+        h.quoteStore.maybeCompact();
+        const entries = Object.keys(h.state.reservations).length;
+        maxEntries = Math.max(maxEntries, entries);
+        maxJournal = Math.max(maxJournal, statSync(journalFileFor(h.file)).size);
+        maxSnapshot = Math.max(maxSnapshot, statSync(h.file).size);
+        // Never evicted early: every signed quote younger than its deadline + ingest lag is still stored.
+        for (let k = signedNonces.length - 1; k >= 0 && h.now() - signedNonces[k][1] < 15 * MIN; k -= 97) {
+          assert.ok(h.state.reservations[nonce(signedNonces[k][0])], `key of quote ${signedNonces[k][0]} evicted early`);
+        }
+      }
+    }
+    assert.equal(n, 36_000);
+    // Live keys = rate x (deadline 15 min + ingest lag + prune period) ~ 600 x 15.8.
+    assert.ok(maxEntries <= PER_MINUTE * 16 + PER_MINUTE, `maxEntries=${maxEntries}`);
+    assert.ok(maxEntries >= PER_MINUTE * 15, `maxEntries=${maxEntries}`);
+    assert.ok(maxSnapshot < 6 * 1024 * 1024, `snapshot ${maxSnapshot} B`);
+    assert.ok(maxJournal < 3 * maxSnapshot + 2 * 1024 * 1024, `journal ${maxJournal} B`);
+    // After the burst the store drains on its own.
+    h.advance(16 * MIN);
+    pruneReservations(h.state, { nowMs: h.now(), ttlMs: 20 * MIN, ingestedThroughSec: Math.floor(h.now() / 1000) - 20 });
+    assert.equal(Object.keys(h.state.reservations).length, 0);
+    assert.equal(reservationStats(h.state, { nowMs: h.now(), ttlMs: 20 * MIN }).total, 0);
+    console.log(`burst: 36000 quotes, max live keys ${maxEntries}, max snapshot ${maxSnapshot} B, max journal ${maxJournal} B, compactions ${h.quoteStore.stats().compactions}`);
+  } finally {
+    h.close();
   }
 });

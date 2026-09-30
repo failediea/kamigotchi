@@ -12,8 +12,9 @@
  *     (OPERATOR_TX_PRICING=eip1559 default: maxFeePerGas), the 10% unused-gas
  *     charge, and the exit reserve (EXIT_RESERVE_ACTIONS) with its stop and
  *     resume triggers (THR-03);
- *   - the reservation caps, the 429 scopes, the open-rental (Sybil) guards and
- *     the release route, and the allowlist parsing rules.
+ *   - the on-chain lease caps (quotes hold no capacity), the 429 scopes, the
+ *     balance filter, the quote deadline bound, the release route, the
+ *     operator key custody rules and the allowlist parsing rules.
  *
  * `node renter-pod-lease-policy.mjs` prints leasePolicySnapshot() as JSON; the committed
  * renter-pod-lease-policy.json is that output (a test fails when they drift). Web and ops
@@ -34,11 +35,14 @@ import {
   minRestIntervalSec,
   normalizeKamibotsPrefs,
 } from "./kamibots-rental-config.mjs";
-import { ALLOWLIST_PARSE_VECTORS, HARDENING_DEFAULTS, OperatorTxPricing } from "./renter-pod-config.mjs";
-import { RefusalScope } from "./renter-pod-reservations.mjs";
+import { ALLOWLIST_PARSE_VECTORS, HARDENING_DEFAULTS, OperatorTxPricing, RETIRED_HARDENING_KNOBS } from "./renter-pod-config.mjs";
+import { QUOTE_DEADLINE_SKEW_SEC, RefusalScope } from "./renter-pod-reservations.mjs";
 import { billedActionGas } from "./renter-pod-safety.mjs";
 
-export const LEASE_POLICY_VERSION = 1;
+// 2: quotes hold no capacity (on-chain-only caps; listing lock, cooldown,
+// attempt counter and reservation caps removed; scopes renter + market only;
+// bounded quote deadline; durable random per-quote operator keys).
+export const LEASE_POLICY_VERSION = 2;
 
 /** Worker defaults for OPERATOR_ACTION_GAS_FLOOR / OPERATOR_RESERVE_GAS_UNITS. */
 export const OPERATOR_GAS_DEFAULTS = Object.freeze({
@@ -197,56 +201,73 @@ export function leasePolicySnapshot() {
       ],
     },
     reservations: {
+      quotesHoldCapacity: false,
+      quoteRule:
+        "a quote holds NO capacity: no reservation cap, listing lock, cooldown, attempt counter or quote-held lease slot "
+        + "exists. Each quote still gets its own random operator key, stored durably before reserve/attest answer; nothing "
+        + "counts that store. Contention for one Kami is settled on-chain (factory ActiveRequest / market pending-lease "
+        + "revert), so the web must simulate the checkout (eth_call / estimateGas) before asking the wallet to send, and "
+        + "show that the Kami was just rented when the simulation reverts",
       maxActiveLeases: HARDENING_DEFAULTS.MAX_ACTIVE_LEASES,
       maxActiveLeasesPerRenter: HARDENING_DEFAULTS.MAX_ACTIVE_LEASES_PER_RENTER,
-      maxLiveReservations: HARDENING_DEFAULTS.MAX_LIVE_RESERVATIONS,
-      maxReservationsPerRenter: HARDENING_DEFAULTS.MAX_RESERVATIONS_PER_RENTER,
-      maxReservationsPerListing: HARDENING_DEFAULTS.MAX_RESERVATIONS_PER_LISTING,
+      capRule:
+        "both caps count ON-CHAIN leases only: unreturned ingested pods plus on-chain pods parked for ingest retry, "
+        + "distinct per listing. Quotes never count. A listing that already has an on-chain lease never trips a cap. "
+        + "Honest concurrent checkouts may overshoot by the quotes issued just under the cap (bounded by listings)",
       reservationTtlSec: HARDENING_DEFAULTS.RESERVATION_TTL_SEC,
+      reservationTtlRule:
+        "an unattested operator key can be attested for reservationTtlSec; the keeper signs only quote deadlines in the "
+        + `future and at most reservationTtlSec + ${QUOTE_DEADLINE_SKEW_SEC} s ahead`,
       reserveBody:
-        "{ market, factory, nonce, renter, tokenIndex, fundingWei }  (tokenIndex optional but should be sent; "
-        + "fundingWei optional decimal string = setupGasWei + hubGasWei + operatingGasWei of the priced quote, should be sent)",
+        "{ market, factory, nonce, renter, tokenIndex, fundingWei }  -> 201 { operator }  (nonce 0x + 64 hex; tokenIndex "
+        + "optional but should be sent; fundingWei optional decimal string = setupGasWei + hubGasWei + operatingGasWei of "
+        + "the priced quote, should be sent)",
+      reserveOrder:
+        "body checks -> on-chain caps (no RPC) -> balance (only when fundingWei is sent) -> fresh random key -> durable "
+        + "(journal append + fsync) -> answer",
       attestBody:
-        "{ market, factory, quote }  (quote.renter and quote.tokenIndex required; with requireRenterBalance "
-        + "quote.setupGasWei, hubGasWei and operatingGasWei are required)",
+        "{ market, factory, quote }  -> 200 { keeperSignature }  (quote.nonce must name a stored reservation of the same "
+        + "renter, quote.operator must be its operator; quote.tokenIndex and quote.deadline required; with "
+        + "requireRenterBalance quote.setupGasWei, hubGasWei and operatingGasWei are required; the listing must exist)",
+      attestOrder:
+        "body checks -> deadline bound -> on-chain caps -> listing exists -> balance -> quoteDigest -> binding durable "
+        + "(journal append + fsync) -> keeper signature",
       releasePath: "/v1/operator-reservations/release",
       releaseBody: "{ market, factory, nonce, renter }  -> 200 { released: boolean }; idempotent; answered even while the worker is stale or halted",
       releaseRule:
-        "send when the renter closes or cancels checkout or the wallet rejects the tx: the reservation stops blocking "
-        + "the listing and the renter's open-checkout count and never starts a cooldown; an attested quote still counts "
-        + "toward the lease caps until its deadline (it can still be submitted)",
-      refusal429Body: "{ error, code: LEASE_CAP | RESERVATION_CAP | LISTING_COOLDOWN, scope }",
+        "optional hygiene when the renter cancels checkout or the wallet rejects the tx: an unattested key is deleted at "
+        + "once; an attested one is only marked (kept until its deadline has passed on-chain). Frees no capacity (none is held)",
+      refusal429Body: "{ error, code: LEASE_CAP | RESERVATION_CAP, scope }",
       refusalScopes: {
-        [RefusalScope.RESERVATION]:
-          "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts, or started "
-          + "maxReservationAttemptsPerRenter reservations within reservationTtlSec",
-        [RefusalScope.RENTER]: "RESERVATION_CAP: this wallet holds maxActiveLeasesPerRenter leases (active + in checkout)",
-        [RefusalScope.LEASE]:
-          "RESERVATION_CAP: another renter holds this listing's open checkout (listingSingleCheckout) or the listing has "
-          + "maxReservationsPerListing open checkouts; LISTING_COOLDOWN: this wallet's last checkout for this listing expired "
-          + "unused less than listingReserveCooldownSec ago",
-        [RefusalScope.MARKET]: "LEASE_CAP: market at maxActiveLeases; RESERVATION_CAP: maxLiveReservations checkouts in flight",
+        [RefusalScope.RENTER]: "RESERVATION_CAP: this wallet holds maxActiveLeasesPerRenter on-chain leases",
+        [RefusalScope.MARKET]: "LEASE_CAP: the market holds maxActiveLeases on-chain leases",
       },
-      retryAfterRule:
-        "scope lease refusals from listingSingleCheckout and LISTING_COOLDOWN carry a Retry-After header (seconds until "
-        + "the other checkout stops holding / the cooldown ends); every 503 carries Retry-After: 60",
-      // Open-rental (Sybil quote-spam) guards, all on by default.
+      retryAfterRule: "every 503 carries Retry-After: 60; 429s carry none (a cap frees up only when an on-chain lease ends)",
       requireRenterBalance: HARDENING_DEFAULTS.REQUIRE_RENTER_BALANCE,
       renterBalanceRule:
         "attest: renter ETH balance (latest block) >= quote setupGasWei + hubGasWei + operatingGasWei; reserve: >= fundingWei "
-        + "when sent. RPC failure fails closed (503 BALANCE_UNAVAILABLE). An INSUFFICIENT_BALANCE attest releases the "
-        + "unattested reservation.",
+        + "when sent, checked before any key is generated. RPC failure fails closed (503 BALANCE_UNAVAILABLE). A filter for "
+        + "unfunded requests only: it reserves nothing. An INSUFFICIENT_BALANCE attest deletes the unattested key.",
       insufficientBalanceBody: "403 { error, code: INSUFFICIENT_BALANCE, scope: renter, requiredWei }",
       balanceUnavailableBody: "503 { error, code: BALANCE_UNAVAILABLE }",
-      listingSingleCheckout: HARDENING_DEFAULTS.LISTING_SINGLE_CHECKOUT,
-      listingSingleCheckoutRule:
-        "at reserve (tokenIndex sent): refused when ANOTHER renter holds an open checkout for the listing: not released, and "
-        + "unattested inside reservationTtlSec or attested with its quote deadline ahead; the same renter may re-quote",
-      listingReserveCooldownSec: HARDENING_DEFAULTS.LISTING_RESERVE_COOLDOWN_SEC,
-      listingReserveCooldownRule:
-        "at reserve (tokenIndex sent): after one of this renter's checkouts for the listing stopped holding (TTL / quote "
-        + "deadline) without a pod and without a release, the renter cannot reserve that listing for listingReserveCooldownSec",
-      maxReservationAttemptsPerRenter: HARDENING_DEFAULTS.MAX_RESERVATION_ATTEMPTS_PER_RENTER,
+      keyStoreUnavailableBody: "503 { error, code: KEY_STORE_UNAVAILABLE }  (the key could not be made durable; nothing was returned)",
+      retiredSettings: RETIRED_HARDENING_KNOBS,
+    },
+    operatorKeys: {
+      generation: "one fresh key per quote nonce: 32 bytes from the OS CSPRNG (node:crypto randomBytes); no seed, no derivation",
+      durability:
+        "reserve: the key is appended to <state>.reservations.journal and fsync'd before the operator address is returned; "
+        + "attest: the quote binding (digest, deadline) is appended and fsync'd before the keeper signature is returned",
+      store:
+        "<state>.reservations.json snapshot { version: 1, generation, reservations } + <state>.reservations.journal (JSON lines); "
+        + "both mode 0600; compacted when the journal outgrows the snapshot, at startup and on SIGTERM",
+      pruneRule:
+        "unattested: after reservationTtlSec; attested: only once ingest has covered a confirmed block whose timestamp is past "
+        + "the quote deadline; never while an event for the nonce is parked for ingest retry; never evicted for space",
+      ingestRule:
+        "on RenterPodCreated the stored key for the event nonce must reproduce the event operator; otherwise the event is "
+        + "parked and [LEASE-ALERT] OPERATOR_MISMATCH is raised. A claimed key moves into the job; it is deleted from the "
+        + "store only after the job state is saved",
     },
     renterAllowlist: {
       rules: [

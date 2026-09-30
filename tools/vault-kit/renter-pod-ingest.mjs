@@ -1,6 +1,6 @@
 import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
 import { eventIdentity } from "./renter-pod-events.mjs";
-import { claimOperatorReservation } from "./renter-pod-keys.mjs";
+import { OperatorMismatchError, claimOperatorReservation } from "./renter-pod-keys.mjs";
 
 /**
  * RenterPodCreated ingestion that can never wedge the worker.
@@ -22,6 +22,12 @@ import { claimOperatorReservation } from "./renter-pod-keys.mjs";
  *    later tick. The cursor still advances, because the parked event is
  *    durably stored with everything needed to apply it later - nothing is
  *    skipped silently and no other token waits on it.
+ *  - the event operator must match the key stored for its nonce (quote
+ *    store). A missing or different key is OPERATOR_MISMATCH instead of
+ *    INGEST_ERROR: the worker cannot operate that pod, and a human must look
+ *    (store restored from an old backup, a quote this worker never issued).
+ *    The event stays parked, its nonce is never pruned, and restoring the
+ *    right store + restarting adopts it.
  */
 
 export class IngestConflictError extends Error {
@@ -197,14 +203,17 @@ export async function ingestRenterPodRecords(state, records, { readRequestPod, n
         lastError: message.slice(0, 300),
       };
       log(`ingest #${plain.tokenIndex} ${record.eventId} parked for retry (attempt ${attempts}): ${message}`);
+      const mismatch = error instanceof OperatorMismatchError;
       alert(
-        LeaseAlertCode.INGEST_ERROR,
+        mismatch ? LeaseAlertCode.OPERATOR_MISMATCH : LeaseAlertCode.INGEST_ERROR,
         {
           token: plain.tokenIndex,
           nonce: lower(plain.nonce).slice(0, 18),
           event: record.eventId,
           attempts,
-          err: message.slice(0, 160),
+          ...(mismatch
+            ? { reason: error.reason, pod: plain.pod, operator: plain.operator }
+            : { err: message.slice(0, 160) }),
         },
         { key: record.eventId }
       );

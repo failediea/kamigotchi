@@ -23,19 +23,25 @@
  * "[LEASE-ALERT] CONFIG_ERROR key=<KEY>" and waits, idle, for a fixed .env
  * and a restart (renter-pod-config.mjs ConfigError).
  * Launch hardening (see renter-pod-config.mjs for defaults):
- *   RENTER_ALLOWLIST, MAX_ACTIVE_LEASES, MAX_ACTIVE_LEASES_PER_RENTER,
- *   MAX_LIVE_RESERVATIONS,
- *   MAX_RESERVATIONS_PER_RENTER, RESERVATION_TTL_SEC, TX_WAIT_TIMEOUT_MS,
- *   FETCH_TIMEOUT_MS, TICK_WATCHDOG_SEC, HEARTBEAT_STALE_SEC,
- *   ALERT_MIN_INTERVAL_SEC, STAGE_STUCK_ALERT_SEC,
- *   RESERVATION_STATE_FILE (default <state>.reservations.json next to the
- *   state file), WORKER_HALT_FILE (default HALT next to the state file; while
- *   it exists the reservation server answers 503), MAX_RESERVATIONS_PER_LISTING,
+ *   RENTER_ALLOWLIST (optional, off by default), MAX_ACTIVE_LEASES,
+ *   MAX_ACTIVE_LEASES_PER_RENTER (both count ON-CHAIN leases only; quotes
+ *   hold no capacity), RESERVATION_TTL_SEC, REQUIRE_RENTER_BALANCE,
+ *   TX_WAIT_TIMEOUT_MS, FETCH_TIMEOUT_MS, TICK_WATCHDOG_SEC,
+ *   HEARTBEAT_STALE_SEC, ALERT_MIN_INTERVAL_SEC, STAGE_STUCK_ALERT_SEC,
+ *   RESERVATION_STATE_FILE (quote key store snapshot, default
+ *   <state>.reservations.json next to the state file; its append-only journal
+ *   is <state>.reservations.journal), WORKER_HALT_FILE (default HALT next to
+ *   the state file; while it exists the reservation server answers 503),
  *   LOG_CHUNK_BLOCKS, LOG_CHUNKS_PER_TICK, OPERATOR_TX_PRICING (eip1559|legacy),
  *   RETIRED_JOB_RETENTION_DAYS, ALLOW_OPEN_RENTALS.
- * Open-rental (Sybil quote-spam) guards, all on by default:
- *   REQUIRE_RENTER_BALANCE, LISTING_SINGLE_CHECKOUT,
- *   LISTING_RESERVE_COOLDOWN_SEC, MAX_RESERVATION_ATTEMPTS_PER_RENTER.
+ * Retired (ignored, named in the startup log when set): MAX_LIVE_RESERVATIONS,
+ *   MAX_RESERVATIONS_PER_RENTER, MAX_RESERVATIONS_PER_LISTING,
+ *   LISTING_SINGLE_CHECKOUT, LISTING_RESERVE_COOLDOWN_SEC,
+ *   MAX_RESERVATION_ATTEMPTS_PER_RENTER.
+ * Operator keys: every quote gets a fresh random key, durable (journal
+ * append + fsync) before its operator address or keeper signature is
+ * returned; see OPERATOR-KEY-CUSTODY.md. SIGTERM/SIGINT fold the journal into
+ * the snapshot before exiting.
  * Lease safety (THR-02/03/10; defaults in renter-pod-config.mjs):
  *   PREFS_FLOOR, PREFS_FLOOR_HP_LOW_MIN, PREFS_FLOOR_FARM_INTERVAL_MAX_SEC,
  *   PREFS_FLOOR_SAFETY_MARGIN_MIN, PREFS_FLOOR_FEED_PERCENT_MIN,
@@ -64,6 +70,7 @@ import {
   OperatorTxPricing,
   hardeningConfigFromEnv,
   loadEnvFile,
+  retiredKnobsSet,
   workerRuntimeConfigFromEnv,
 } from "./renter-pod-config.mjs";
 import { OPERATOR_GAS_DEFAULTS } from "./renter-pod-lease-policy.mjs";
@@ -232,16 +239,45 @@ const POD_ABI = [
   "function sweepMusu() returns (uint256)",
   "function musuBalance() view returns (uint256)",
 ];
-// Job state (custody, cursor) and reservations (operator keys for quotes in
-// flight) are separate atomic files: a quote request rewrites only the small
-// reservation file. Legacy state files that embed reservations are migrated:
-// the store is written first, then the state file without them.
-const { state, save, saveReservations } = loadWorkerState({
+// Job state (custody, cursor) and the quote key store (operator keys for
+// quotes in flight: snapshot + append-only journal) are separate files: a
+// quote appends one fsync'd journal line and never rewrites anything whole.
+// Legacy state files that embed reservations are migrated: the store is made
+// durable first, then the state file drops them.
+const { state, save, persistReservations, quoteStore, storeLoad } = loadWorkerState({
   stateFile: STATE_FILE,
   reservationFile: RESERVATION_FILE,
   startBlock: RUNTIME.startBlock,
   legacySeed: LEGACY_OPERATOR_SEED,
 });
+
+/** Journal the current entries of `nonces`; compaction problems never fail it. */
+function persistQuoteKeys(nonces) {
+  persistReservations(nonces);
+  try {
+    quoteStore.maybeCompact();
+  } catch (error) {
+    console.error(`quote key store compaction failed (will retry): ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+// A normal stop (systemctl stop / restart, launch-ops rollback) folds the
+// journal into the snapshot, so tools that read only the snapshot (the
+// rollback merge, gate R1) see every key.
+let stopping = false;
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    if (stopping) return;
+    stopping = true;
+    try {
+      const result = quoteStore.compact();
+      console.error(`${signal}: quote key store compacted (entries=${result.entries}, generation=${result.generation})`);
+    } catch (error) {
+      console.error(`${signal}: quote key store compaction failed; the journal still holds every key: ${error instanceof Error ? error.message : error}`);
+    }
+    process.exit(0);
+  });
+}
 
 const txs = createTxTracker({
   state,
@@ -329,7 +365,8 @@ function startReservationServer() {
       health: reservationHealth,
       quoteDigest: (quote) => factory.quoteDigest(quote),
       signDigest: (digest) => keeper.signingKey.sign(digest).serialized,
-      saveReservations,
+      // Durable (append + fsync) BEFORE any operator or signature is returned.
+      persist: persistQuoteKeys,
       alert: leaseAlert,
       listingExists: async (tokenIndex) => (await market.listings(tokenIndex)).owner !== ZeroAddress,
       // REQUIRE_RENTER_BALANCE: read on this worker's RPC (with its timeout);
@@ -474,15 +511,21 @@ async function applyIngest(records) {
 }
 
 /**
- * Persist ingest results. Claimed reservations leave the in-memory map BEFORE
- * the job-state save (the state file mirrors reservations for rollback), and
- * the reservation store is written only AFTER it, so on disk every operator
- * key is always in the saved job, the store, or both - never in neither.
+ * Persist ingest results. The job-state save (which now holds each claimed
+ * operator key in its job) happens FIRST; only then are the claimed keys
+ * deleted from the quote store, so on disk every operator key is always in
+ * the saved job, the store, or both - never in neither. A failed delete only
+ * leaves a spare copy in the store (pruned after its quote deadline).
  */
 function persistIngest(claimedNonces) {
-  for (const nonce of claimedNonces) delete state.reservations[nonce];
   save();
-  if (claimedNonces.length) saveReservations();
+  if (!claimedNonces.length) return;
+  for (const nonce of claimedNonces) delete state.reservations[nonce];
+  try {
+    persistQuoteKeys(claimedNonces);
+  } catch (error) {
+    console.error(`quote key store delete failed (keys are safe in the saved jobs): ${error instanceof Error ? error.message : error}`);
+  }
 }
 
 async function ingestEvents() {
@@ -972,18 +1015,21 @@ async function processRetiredJob(job) {
 }
 
 function pruneExpiredReservations() {
+  // Only keys that can provably never be used (unattested past the TTL, or
+  // attested with the quote deadline passed in ingested CHAIN time; never a
+  // nonce parked for ingest retry). Nothing is ever evicted for space.
   const removed = pruneReservations(state, {
     nowMs: Date.now(),
     ttlMs: HARDENING.reservationTtlMs,
     ingestedThroughSec: state.ingestedThroughSec,
     protectedNonces: protectedReservationNonces(state),
-    cooldownMs: HARDENING.listingReserveCooldownMs,
   });
-  if (removed) saveReservations();
+  if (removed.length) persistQuoteKeys(removed);
+  else quoteStore.maybeCompact();
   // Superseded pods that finished returning are kept for the retention window
   // only (dropped from the next state save).
   pruneRetiredJobs(state, { nowMs: Date.now(), retentionMs: HARDENING.retiredJobRetentionMs });
-  return removed;
+  return removed.length;
 }
 
 function writeHeartbeat({ tickMs, lastTickOk }) {
@@ -1057,23 +1103,26 @@ console.log(
 );
 console.log(
   `launch guards: allowlist=${HARDENING.renterAllowlist ? `${HARDENING.renterAllowlist.size} renters` : "off"}, `
-    + `maxActiveLeases=${HARDENING.maxActiveLeases}, maxLiveReservations=${HARDENING.maxLiveReservations}, `
-    + `maxReservationsPerRenter=${HARDENING.maxReservationsPerRenter}, `
+    + `maxActiveLeases=${HARDENING.maxActiveLeases} (on-chain), `
     + `reservationTtlSec=${HARDENING.reservationTtlMs / 1000}, txWaitTimeoutMs=${HARDENING.txWaitTimeoutMs}, `
     + `fetchTimeoutMs=${HARDENING.fetchTimeoutMs}, tickWatchdogSec=${HARDENING.tickWatchdogMs / 1000}, `
     + `heartbeatStaleSec=${HARDENING.heartbeatStaleMs / 1000}, heartbeat=${HEARTBEAT_FILE}, `
     + `reservations=${RESERVATION_FILE}, haltFile=${HALT_FILE}, `
-    + `maxReservationsPerListing=${HARDENING.maxReservationsPerListing || "off"}, `
     + `logChunkBlocks=${HARDENING.logChunkBlocks}x${HARDENING.logChunksPerTick}, `
     + `operatorTxPricing=${HARDENING.operatorTxPricing}, `
     + `maxActiveLeasesPerRenter=${HARDENING.maxActiveLeasesPerRenter}`
 );
+console.log(`open-rental guards: requireRenterBalance=${HARDENING.requireRenterBalance ? "on" : "off"}; quotes hold no capacity`);
 console.log(
-  `open-rental guards: requireRenterBalance=${HARDENING.requireRenterBalance ? "on" : "off"}, `
-    + `listingSingleCheckout=${HARDENING.listingSingleCheckout ? "on" : "off"}, `
-    + `listingReserveCooldownSec=${HARDENING.listingReserveCooldownMs / 1000 || "off"}, `
-    + `maxReservationAttemptsPerRenter=${HARDENING.maxReservationAttemptsPerRenter}`
+  `operator keys: random per quote, durable before return; store=${RESERVATION_FILE} `
+    + `journal=${quoteStore.journalFile} entries=${Object.keys(state.reservations).length} `
+    + `journalReplayed=${storeLoad.replayed} tornTail=${storeLoad.tornTail} staleJournal=${storeLoad.staleJournal} `
+    + `journalAhead=${storeLoad.journalAhead}`
 );
+const retiredKnobs = retiredKnobsSet(process.env);
+if (retiredKnobs.length) {
+  console.log(`ignored retired settings (quotes no longer hold capacity): ${retiredKnobs.join(", ")}`);
+}
 if (!HARDENING.renterAllowlist) {
   const acknowledged = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_OPEN_RENTALS ?? "").trim());
   if (acknowledged) {

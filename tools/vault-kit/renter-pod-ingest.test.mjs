@@ -204,6 +204,36 @@ test("a missing reservation parks only that event (it can never throw out of the
   assert.equal(state.jobs[7], undefined);
 });
 
+test("OPERATOR_MISMATCH: an event whose operator is not the key stored for its nonce (or has none) is parked, protected and alerted", async () => {
+  const state = freshState();
+  const missing = quotedPod(state, { token: 7, nonceSeed: 1, podSeed: 0xa1, block: 200 });
+  delete state.reservations[missing.nonce];
+  const foreign = quotedPod(state, { token: 8, nonceSeed: 2, podSeed: 0xa2, block: 201 });
+  const storedOperator = foreign.operator;
+  foreign.operator = Wallet.createRandom().address;
+  const good = quotedPod(state, { token: 9, nonceSeed: 3, podSeed: 0xb1, block: 202 });
+  const alerts = [];
+  const { outcomes, claimedNonces } = await ingestRenterPodRecords(state, [missing, foreign, good], {
+    readRequestPod: chain().readRequestPod,
+    nowMs: 1,
+    alert: (code, details) => alerts.push({ code, details }),
+  });
+  assert.deepEqual(outcomes.map((o) => o.outcome), ["parked", "parked", "adopted"]);
+  assert.deepEqual(alerts.map((a) => [a.code, a.details.reason, a.details.token]), [
+    ["OPERATOR_MISMATCH", "missing", 7],
+    ["OPERATOR_MISMATCH", "mismatch", 8],
+  ]);
+  assert.equal(alerts[1].details.operator, foreign.operator);
+  assert.equal(alerts[1].details.err, undefined);
+  const storedKey = state.reservations[foreign.nonce].operatorKey.slice(2);
+  assert.ok(!JSON.stringify(alerts).includes(storedKey), "alerts never carry a key");
+  assert.deepEqual(claimedNonces, [good.nonce]);
+  assert.equal(state.jobs[8], undefined, "the worker never drives a pod it has no key for");
+  assert.equal(state.reservations[foreign.nonce].operator, storedOperator, "the stored key is left untouched");
+  const protectedNonces = protectedReservationNonces(state);
+  assert.ok(protectedNonces.has(missing.nonce) && protectedNonces.has(foreign.nonce));
+});
+
 test("chain still reporting the OLD pod for a newer event is inconsistent: park, never overwrite", async () => {
   const state = freshState();
   const first = quotedPod(state, { token: 7, nonceSeed: 1, podSeed: 0xa1, block: 200 });

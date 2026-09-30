@@ -9,7 +9,10 @@ const names = execFileSync("git", [...git, "diff", "--cached", "--name-only", "-
   encoding: "utf8",
 }).split("\0").filter(Boolean);
 
-const blockedName = /(?:^|\/)(?:pods\.json|[^/]*(?:credentials?|secrets?|worker-state)[^/]*\.json|[^/]*\.(?:pem|key))$/i;
+// Includes the renter-pod worker's operator key store: the snapshot
+// (<state>.reservations.json) and its append-only journal
+// (<state>.reservations.journal, plus .tmp leftovers of either).
+const blockedName = /(?:^|\/)(?:pods\.json|[^/]*(?:credentials?|secrets?|worker-state)[^/]*\.json|[^/]*\.(?:pem|key)|[^/]*\.reservations\.(?:json|journal)(?:\.tmp)?|[^/]*\.journal(?:\.tmp)?)$/i;
 const sensitiveAssignment = /"(?:privateKey|operatorKey|apiKey|mnemonic|seed|secret|reservationToken|accessToken|authToken)"\s*:\s*"[^"\s]+"/i;
 const envAssignment = /^\s*(?:export\s+)?(?:[A-Z0-9_]*(?:PRIVATE_KEY|MNEMONIC|OPERATOR_SEED|RESERVATION_TOKEN|API_KEY)[A-Z0-9_]*)\s*=\s*(.+?)\s*$/gim;
 const rawPrivateKey = /(?:private|operator|deployer|signer)[_-]?key[^\r\n]{0,40}0x[0-9a-f]{64}/i;

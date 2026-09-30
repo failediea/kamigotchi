@@ -310,6 +310,8 @@ test("real worker: DEAD Kami held, exit reserve stops harvest without Kamibots, 
       POLL_MS: "1000",
     },
   });
+  // SIGTERM compacts the quote key store: wait for it before removing the dir.
+  const childExit = new Promise((resolve) => child.once("exit", resolve));
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));
   try {
@@ -356,6 +358,7 @@ test("real worker: DEAD Kami held, exit reserve stops harvest without Kamibots, 
     assert.equal(state.jobs[13].appliedPrefs.hpThresholdLow, 45);
   } finally {
     child.kill("SIGTERM");
+    await childExit;
     await new Promise((resolve) => chain.server.close(resolve));
     await new Promise((resolve) => kamibots.server.close(resolve));
     rmSync(dir, { recursive: true, force: true });

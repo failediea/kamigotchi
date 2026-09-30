@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { Wallet } from "ethers";
 
 const NONCE_RE = /^0x[0-9a-fA-F]{64}$/;
@@ -6,6 +6,36 @@ const NONCE_RE = /^0x[0-9a-fA-F]{64}$/;
 function requireNonce(nonce) {
   if (!NONCE_RE.test(String(nonce))) throw new Error("invalid operator reservation nonce");
   return String(nonce).toLowerCase();
+}
+
+/**
+ * A RenterPodCreated event whose operator does not match the key stored for
+ * its nonce (or no key is stored for it). The worker cannot operate that pod;
+ * ingest parks the event and raises OPERATOR_MISMATCH (renter-pod-ingest.mjs).
+ */
+export class OperatorMismatchError extends Error {
+  constructor(message, { reason }) {
+    super(message);
+    this.name = "OperatorMismatchError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * A fresh RoomPod operator key: 32 bytes straight from the OS CSPRNG
+ * (node:crypto randomBytes), independent of every other key, of any seed and
+ * of every public input (V14-01). The rare out-of-range scalar is redrawn.
+ * About 0.2 ms, against about 4 ms for ethers' Wallet.createRandom (a BIP-39
+ * mnemonic + PBKDF2 + five HD derivations nothing here uses).
+ */
+export function randomOperatorWallet() {
+  for (;;) {
+    try {
+      return new Wallet(`0x${randomBytes(32).toString("hex")}`);
+    } catch {
+      // zero or >= the curve order: draw again
+    }
+  }
 }
 
 function walletFromPrivateKey(privateKey, provider) {
@@ -25,7 +55,7 @@ export function initializeOperatorKeyState(state) {
 export function reserveRandomOperator(
   state,
   nonce,
-  { now = Date.now(), walletFactory = Wallet.createRandom, renter } = {}
+  { now = Date.now(), walletFactory = randomOperatorWallet, renter } = {}
 ) {
   initializeOperatorKeyState(state);
   const key = requireNonce(nonce);
@@ -60,10 +90,12 @@ export function claimOperatorReservation(state, nonce, expectedOperator, { remov
   initializeOperatorKeyState(state);
   const key = requireNonce(nonce);
   const reservation = state.reservations[key];
-  if (!reservation) throw new Error("RoomPod operator reservation is missing");
+  if (!reservation) {
+    throw new OperatorMismatchError("RoomPod operator reservation is missing", { reason: "missing" });
+  }
   const wallet = walletFromPrivateKey(reservation.operatorKey);
   if (wallet.address.toLowerCase() !== String(expectedOperator).toLowerCase()) {
-    throw new Error("RoomPod operator reservation does not match the on-chain event");
+    throw new OperatorMismatchError("RoomPod operator reservation does not match the on-chain event", { reason: "mismatch" });
   }
   if (remove) delete state.reservations[key];
   return wallet.privateKey;
@@ -86,16 +118,9 @@ export function bindOperatorReservationQuote(state, nonce, expectedOperator, dig
   return normalizedDigest;
 }
 
-export function removeExpiredUnclaimedReservations(state, now = Date.now(), maxAgeMs = 24 * 60 * 60_000) {
-  initializeOperatorKeyState(state);
-  let removed = 0;
-  for (const [nonce, reservation] of Object.entries(state.reservations)) {
-    if (now - Number(reservation.createdAt || 0) <= maxAgeMs) continue;
-    delete state.reservations[nonce];
-    removed++;
-  }
-  return removed;
-}
+// (removeExpiredUnclaimedReservations is gone: it dropped keys by local age
+// alone, even a signed quote's. Pruning is renter-pod-reservations.mjs
+// prunableReservations, which needs on-chain proof for signed quotes.)
 
 function deriveLegacyOperator(nonce, seed) {
   for (let attempt = 0; attempt < 4; attempt++) {

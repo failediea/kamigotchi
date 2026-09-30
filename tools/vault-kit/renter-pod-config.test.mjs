@@ -11,6 +11,8 @@ import {
   loadEnvFile,
   parseEnvText,
   parseRenterAllowlist,
+  RETIRED_HARDENING_KNOBS,
+  retiredKnobsSet,
   stripMatchingQuotes,
   workerRuntimeConfigFromEnv,
 } from "./renter-pod-config.mjs";
@@ -42,7 +44,7 @@ test(".env values: one pair of MATCHING surrounding quotes is stripped, nothing 
   const env = parseEnvText([
     "# comment",
     'MAX_ACTIVE_LEASES="20"',
-    "MAX_LIVE_RESERVATIONS='150'",
+    "MAX_ACTIVE_LEASES_PER_RENTER='3'",
     "POLL_MS=30000\r",
     '  export RENTER_ALLOWLIST = "0x00000000000000000000000000000000000000c1,0x00000000000000000000000000000000000000c2"  ',
     'TOKEN_WITH_QUOTE="abc',
@@ -53,7 +55,7 @@ test(".env values: one pair of MATCHING surrounding quotes is stripped, nothing 
     "NOT A LINE",
   ].join("\n"));
   assert.equal(env.MAX_ACTIVE_LEASES, "20");
-  assert.equal(env.MAX_LIVE_RESERVATIONS, "150");
+  assert.equal(env.MAX_ACTIVE_LEASES_PER_RENTER, "3");
   assert.equal(env.POLL_MS, "30000");
   assert.equal(env.RENTER_ALLOWLIST, "0x00000000000000000000000000000000000000c1,0x00000000000000000000000000000000000000c2");
   assert.equal(env.TOKEN_WITH_QUOTE, '"abc', "an unmatched quote is kept (it is part of the value)");
@@ -187,29 +189,30 @@ test("final-verify: every env key the worker reads is documented in renter-pod-w
   hardeningConfigFromEnv(parsed);
 });
 
-test("open-rental guards default ON and are env-configurable (strict parsing)", () => {
+test("balance filter defaults ON with strict parsing; quote-capacity knobs are retired, never parsed", () => {
   const config = hardeningConfigFromEnv({});
   assert.equal(config.requireRenterBalance, true);
-  assert.equal(config.listingSingleCheckout, true);
-  assert.equal(config.listingReserveCooldownMs, 900_000);
-  assert.equal(config.maxReservationAttemptsPerRenter, 6);
   assert.equal(config.maxActiveLeasesPerRenter, HARDENING_DEFAULTS.MAX_ACTIVE_LEASES_PER_RENTER, "unchanged");
-  const tuned = hardeningConfigFromEnv({
-    REQUIRE_RENTER_BALANCE: "off",
-    LISTING_SINGLE_CHECKOUT: '"false"',
-    LISTING_RESERVE_COOLDOWN_SEC: "0",
-    MAX_RESERVATION_ATTEMPTS_PER_RENTER: "10",
-  });
-  assert.deepEqual(
-    [tuned.requireRenterBalance, tuned.listingSingleCheckout, tuned.listingReserveCooldownMs, tuned.maxReservationAttemptsPerRenter],
-    [false, false, 0, 10]
+  assert.equal(hardeningConfigFromEnv({ REQUIRE_RENTER_BALANCE: "off" }).requireRenterBalance, false);
+  assert.throws(
+    () => hardeningConfigFromEnv({ REQUIRE_RENTER_BALANCE: "maybe" }),
+    (error) => error instanceof ConfigError && error.key === "REQUIRE_RENTER_BALANCE"
   );
-  for (const [key, value] of [
-    ["REQUIRE_RENTER_BALANCE", "maybe"],
-    ["LISTING_SINGLE_CHECKOUT", "2"],
-    ["LISTING_RESERVE_COOLDOWN_SEC", "-1"],
-    ["MAX_RESERVATION_ATTEMPTS_PER_RENTER", "0"],
-  ]) {
-    assert.throws(() => hardeningConfigFromEnv({ [key]: value }), (error) => error instanceof ConfigError && error.key === key, key);
+  // A live .env that still sets the retired knobs (even to junk) starts
+  // normally: they are named in the startup log, and nothing reads them.
+  const legacyEnv = {
+    MAX_LIVE_RESERVATIONS: "200",
+    MAX_RESERVATIONS_PER_RENTER: "2",
+    MAX_RESERVATIONS_PER_LISTING: "junk",
+    LISTING_SINGLE_CHECKOUT: "2",
+    LISTING_RESERVE_COOLDOWN_SEC: "-1",
+    MAX_RESERVATION_ATTEMPTS_PER_RENTER: "0",
+  };
+  const retired = hardeningConfigFromEnv(legacyEnv);
+  for (const field of ["maxLiveReservations", "maxReservationsPerRenter", "maxReservationsPerListing", "listingSingleCheckout", "listingReserveCooldownMs", "maxReservationAttemptsPerRenter"]) {
+    assert.equal(retired[field], undefined, field);
   }
+  assert.deepEqual(retiredKnobsSet(legacyEnv), [...RETIRED_HARDENING_KNOBS]);
+  assert.deepEqual(retiredKnobsSet({ MAX_LIVE_RESERVATIONS: " " }), [], "an empty value is not 'set'");
+  for (const knob of RETIRED_HARDENING_KNOBS) assert.equal(HARDENING_DEFAULTS[knob], undefined, knob);
 });

@@ -63,12 +63,14 @@ export function loadEnvFile(path, env = process.env, { read = readFileSync, exis
 }
 
 export const HARDENING_DEFAULTS = Object.freeze({
+  // Leases that exist ON-CHAIN (unreturned ingested pods + on-chain pods parked
+  // for ingest retry, distinct per Kami). Quotes never count: they hold nothing.
   MAX_ACTIVE_LEASES: 20,
-  MAX_LIVE_RESERVATIONS: 200,
-  MAX_RESERVATIONS_PER_RENTER: 2,
-  // Leases one renter may hold at once: unreturned jobs plus live (open or
-  // keeper-attested, not yet expired) reservations for that renter.
+  // On-chain leases one renter may hold at once (same counting).
   MAX_ACTIVE_LEASES_PER_RENTER: 2,
+  // How long an UNATTESTED operator key stays attestable, and the furthest
+  // ahead a quote deadline the keeper signs may be (so a signed quote's key is
+  // kept at most this long plus the ingest lag).
   RESERVATION_TTL_SEC: 1200,
   TX_WAIT_TIMEOUT_MS: 120_000,
   FETCH_TIMEOUT_MS: 20_000,
@@ -94,9 +96,6 @@ export const HARDENING_DEFAULTS = Object.freeze({
   PREFS_FLOOR_FEED_PERCENT_MIN: LEASE_PREFS_FLOOR.feedPercentMin,
   PREFS_FLOOR_REST_PCT_OF_FARM: LEASE_PREFS_FLOOR.restPctOfFarmMin,
   PREFS_FLOOR_FAILSAFE_REST_MIN_SEC: LEASE_PREFS_FLOOR.failsafeRestMinSec,
-  // Optional per-listing cap on live reservations, applied when the quote API
-  // sends tokenIndex on reserve. 0 = off.
-  MAX_RESERVATIONS_PER_LISTING: 0,
   // Event ingest reads at most this many blocks per eth_getLogs call and at
   // most this many calls per tick, so a long outage backlog is caught up in
   // bounded steps instead of one call that times out forever.
@@ -105,30 +104,33 @@ export const HARDENING_DEFAULTS = Object.freeze({
   // Returned retired (superseded) jobs are dropped from the state file after
   // this many days.
   RETIRED_JOB_RETENTION_DAYS: 30,
-  // Sybil quote-spam guards for OPEN rentals (THR-04 / FE-2 without an
-  // allowlist). All on by default.
-  //  - REQUIRE_RENTER_BALANCE: the keeper attests a quote only when the
-  //    renter's current ETH balance covers setupGasWei + hubGasWei +
-  //    operatingGasWei of that quote (and a reserve that names fundingWei is
-  //    checked the same way). An RPC failure refuses (503), never admits.
+  // REQUIRE_RENTER_BALANCE: the keeper attests a quote only when the renter's
+  // current ETH balance covers setupGasWei + hubGasWei + operatingGasWei of
+  // that quote (and a reserve that names fundingWei is checked the same way,
+  // before any key is generated). An RPC failure refuses (503), never admits.
+  // A filter for obviously unfunded requests, NOT a capacity guard.
   REQUIRE_RENTER_BALANCE: true,
-  //  - LISTING_SINGLE_CHECKOUT: at most one open checkout (a reservation with
-  //    no submitted checkout that still holds, i.e. unattested inside the TTL
-  //    or attested with its quote deadline ahead, and not released) per
-  //    listing across all renters; another renter gets 429 scope "lease"
-  //    with Retry-After = the remaining hold.
-  LISTING_SINGLE_CHECKOUT: true,
-  //  - LISTING_RESERVE_COOLDOWN_SEC: after a renter's reservation for a listing
-  //    EXPIRES without a checkout (not when the renter released it), that
-  //    renter cannot reserve that listing again for this long. 0 = off.
-  LISTING_RESERVE_COOLDOWN_SEC: 900,
-  //  - MAX_RESERVATION_ATTEMPTS_PER_RENTER: reservations one renter may create
-  //    per RESERVATION_TTL_SEC window, released ones included. Released
-  //    checkouts do not count toward MAX_RESERVATIONS_PER_RENTER (so an honest
-  //    renter can retry right away), so this bounds the release/retry loop and
-  //    keeps one wallet from filling MAX_LIVE_RESERVATIONS.
-  MAX_RESERVATION_ATTEMPTS_PER_RENTER: 6,
 });
+
+/**
+ * Knobs of the retired reservation-capacity design (quotes used to hold
+ * worker-side capacity, which throwaway wallets could jam). They do nothing
+ * now: a live .env that still sets them starts normally, and the startup log
+ * names them as ignored.
+ */
+export const RETIRED_HARDENING_KNOBS = Object.freeze([
+  "MAX_LIVE_RESERVATIONS",
+  "MAX_RESERVATIONS_PER_RENTER",
+  "MAX_RESERVATIONS_PER_LISTING",
+  "LISTING_SINGLE_CHECKOUT",
+  "LISTING_RESERVE_COOLDOWN_SEC",
+  "MAX_RESERVATION_ATTEMPTS_PER_RENTER",
+]);
+
+/** Retired knobs that are set (non-empty) in `env`. */
+export function retiredKnobsSet(env = process.env) {
+  return RETIRED_HARDENING_KNOBS.filter((name) => env[name] !== undefined && String(env[name]).trim() !== "");
+}
 
 /**
  * How the worker prices (and, for "legacy", sends) its own txs.
@@ -265,8 +267,6 @@ export function hardeningConfigFromEnv(env = process.env) {
   const config = {
     renterAllowlist: parseRenterAllowlist(env.RENTER_ALLOWLIST),
     maxActiveLeases: positiveInteger(env, "MAX_ACTIVE_LEASES"),
-    maxLiveReservations: positiveInteger(env, "MAX_LIVE_RESERVATIONS"),
-    maxReservationsPerRenter: positiveInteger(env, "MAX_RESERVATIONS_PER_RENTER"),
     maxActiveLeasesPerRenter: positiveInteger(env, "MAX_ACTIVE_LEASES_PER_RENTER"),
     reservationTtlMs: positiveInteger(env, "RESERVATION_TTL_SEC") * 1000,
     txWaitTimeoutMs: positiveInteger(env, "TX_WAIT_TIMEOUT_MS"),
@@ -282,18 +282,15 @@ export function hardeningConfigFromEnv(env = process.env) {
     kamibotsStopMaxFailures: positiveInteger(env, "KAMIBOTS_STOP_MAX_FAILURES"),
     kamibotsRetryMaxMs: positiveInteger(env, "KAMIBOTS_RETRY_MAX_SEC") * 1000,
     prefsFloor: prefsFloorFromEnv(env),
-    maxReservationsPerListing: positiveIntegerOrZero(env, "MAX_RESERVATIONS_PER_LISTING"),
     logChunkBlocks: boundedInteger(env, "LOG_CHUNK_BLOCKS", 100, 1_000_000),
     logChunksPerTick: boundedInteger(env, "LOG_CHUNKS_PER_TICK", 1, 1_000),
     retiredJobRetentionMs: positiveInteger(env, "RETIRED_JOB_RETENTION_DAYS") * 86_400_000,
     operatorTxPricing: operatorTxPricing(env.OPERATOR_TX_PRICING),
     requireRenterBalance: parseSwitch(env, "REQUIRE_RENTER_BALANCE", HARDENING_DEFAULTS.REQUIRE_RENTER_BALANCE),
-    listingSingleCheckout: parseSwitch(env, "LISTING_SINGLE_CHECKOUT", HARDENING_DEFAULTS.LISTING_SINGLE_CHECKOUT),
-    listingReserveCooldownMs: positiveIntegerOrZero(env, "LISTING_RESERVE_COOLDOWN_SEC") * 1000,
-    maxReservationAttemptsPerRenter: positiveInteger(env, "MAX_RESERVATION_ATTEMPTS_PER_RENTER"),
   };
-  // The kamistats quote deadline is 15 minutes. A reservation that expires
-  // before its quote can still be submitted would orphan the pod's operator.
+  // The attest refuses quote deadlines more than RESERVATION_TTL_SEC ahead,
+  // and the kamistats quote deadline is up to 15 minutes: a smaller TTL would
+  // refuse every web quote.
   if (config.reservationTtlMs < 15 * 60_000) {
     throw new ConfigError("RESERVATION_TTL_SEC", "RESERVATION_TTL_SEC must be at least 900 (the quote deadline)");
   }

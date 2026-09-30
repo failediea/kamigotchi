@@ -19,6 +19,7 @@ test("the closed code set matches the interface contract", () => {
     "EXIT_RESERVE_STOP",
     "INGEST_ERROR",
     "LEASE_CAP",
+    "OPERATOR_MISMATCH",
     "RESERVATION_CAP",
     "STAGE_STUCK",
     "STRATEGY_RESTART_STORM",
@@ -47,8 +48,9 @@ test("hardening defaults match the shared contract", () => {
   const config = hardeningConfigFromEnv({});
   assert.equal(config.renterAllowlist, null);
   assert.equal(config.maxActiveLeases, 20);
-  assert.equal(config.maxLiveReservations, 200);
-  assert.equal(config.maxReservationsPerRenter, 2);
+  assert.equal(config.maxActiveLeasesPerRenter, 2);
+  assert.equal(config.maxLiveReservations, undefined, "retired: quotes hold no capacity");
+  assert.equal(config.maxReservationsPerRenter, undefined, "retired: quotes hold no capacity");
   assert.equal(config.reservationTtlMs, 1_200_000);
   assert.equal(config.txWaitTimeoutMs, 120_000);
   assert.equal(config.fetchTimeoutMs, 20_000);

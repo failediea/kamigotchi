@@ -3,16 +3,16 @@ import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
 import { bindOperatorReservationQuote, reserveRandomOperator } from "./renter-pod-keys.mjs";
 import {
   RefusalScope,
-  admitAttestation,
-  admitReservation,
-  holdAttestationSlot,
+  admitQuote,
   isLiveReservation,
   isReleasedReservation,
   normalizeRenter,
   parseWei,
+  quoteDeadlineAdmission,
   quoteFundingWei,
   releaseReservation,
   renterBalanceAdmission,
+  storedReservation,
 } from "./renter-pod-reservations.mjs";
 
 export const RESERVE_PATH = "/v1/operator-reservations";
@@ -20,6 +20,8 @@ export const ATTEST_PATH = "/v1/operator-reservations/attest";
 export const RELEASE_PATH = "/v1/operator-reservations/release";
 
 const ROUTES = new Set([RESERVE_PATH, ATTEST_PATH, RELEASE_PATH]);
+const NONCE_RE = /^0x[0-9a-fA-F]{64}$/;
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 export function authorizedReservationRequest(header, token) {
   const prefix = "Bearer ";
@@ -51,52 +53,47 @@ function writeJson(response, status, body, { retryAfterSec } = {}) {
 
 /**
  * HTTP handler for the quote API's operator reservation, keeper attestation
- * and checkout release calls. Status contract with the web lane:
+ * and checkout release calls.
+ *
+ * QUOTES HOLD NO CAPACITY (renter-pod-reservations.mjs): every quote gets a
+ * fresh random operator key, which is made durable (persist -> quote store
+ * append + fsync) BEFORE the operator address or the keeper signature is
+ * returned, but nothing counts those keys. The only caps are on-chain leases.
+ *
+ * Status contract with the web lane:
  *   401 bad token, 404 unknown route, 400 malformed/mismatched request,
  *   403 renter not allowlisted (no code) or, with REQUIRE_RENTER_BALANCE,
  *       { error, code: INSUFFICIENT_BALANCE, scope: "renter", requiredWei },
- *   429 reservation or lease cap reached,
+ *   429 { error, code, scope } when ON-CHAIN leases are at a cap:
+ *       code LEASE_CAP scope market (MAX_ACTIVE_LEASES), or
+ *       code RESERVATION_CAP scope renter (MAX_ACTIVE_LEASES_PER_RENTER);
+ *       no Retry-After (a cap frees up only when a lease ends),
  *   503 worker stale or halted (heartbeat/ingest older than the limit), or
  *       { error, code: BALANCE_UNAVAILABLE } when the renter's balance could
- *       not be read (fails closed, never admits).
- * Every 429 body is { error, code, scope }: code LEASE_CAP | RESERVATION_CAP |
- * LISTING_COOLDOWN, scope one of RefusalScope (reservation | renter | lease |
- * market; see renter-pod-reservations.mjs). Scope "lease" refusals from the
- * single-checkout lock (RESERVATION_CAP) and the per-listing cooldown
- * (LISTING_COOLDOWN) carry a Retry-After header: the seconds until the other
- * renter's checkout stops holding / the cooldown ends. The renter address
- * stays in the alert only.
+ *       not be read (fails closed, never admits), or
+ *       { error, code: KEY_STORE_UNAVAILABLE } when the operator key could not
+ *       be made durable (nothing is returned for that quote).
+ *       Every 503 carries Retry-After: 60.
  *
  * Request bodies:
  *   reserve {market, factory, nonce, renter, tokenIndex?, fundingWei?}
- *     tokenIndex is optional but the quote API sends it: then the reserve
- *     answers LEASE_CAP early, the single-checkout lock, the listing cooldown
- *     and the per-listing cap apply, and the per-renter lease cap dedupes by
- *     listing. fundingWei (decimal string: setupGasWei + hubGasWei +
- *     operatingGasWei of the quote being priced) makes the reserve refuse an
- *     underfunded wallet before an operator is spent; the attest re-checks.
- *   attest {market, factory, quote}: quote.tokenIndex is REQUIRED, and with
- *     REQUIRE_RENTER_BALANCE the renter's balance must cover the quote's
- *     setupGasWei + hubGasWei + operatingGasWei (authoritative: these are the
- *     totals the keeper signs). An INSUFFICIENT_BALANCE refusal releases an
- *     unattested reservation so it holds nothing.
+ *     -> 201 { operator }. Order: body checks, on-chain caps (no RPC), then -
+ *     only when fundingWei is sent - one balance read, then a fresh random key
+ *     is generated and PERSISTED, then the address is returned. A retry of the
+ *     same nonce by the same renter returns the same operator (nothing new).
+ *   attest {market, factory, quote} -> 200 { keeperSignature }.
+ *     quote.nonce must name a stored reservation of the same renter,
+ *     quote.operator must be its operator, quote.tokenIndex is required,
+ *     quote.deadline must be in the future and at most RESERVATION_TTL_SEC
+ *     ahead; the listing must exist; with REQUIRE_RENTER_BALANCE the renter's
+ *     balance must cover setupGasWei + hubGasWei + operatingGasWei. The
+ *     binding (digest, deadline) is PERSISTED before the signature is
+ *     returned: a signed quote whose key is not on disk cannot exist.
  *   release {market, factory, nonce, renter} -> 200 { released: boolean }.
- *     The renter closed or cancelled checkout: the reservation stops blocking
- *     the listing and its renter's open-checkout count, and never starts a
- *     cooldown. Idempotent (unknown / already released -> released: false);
- *     answered even while the worker is stale or halted.
- *
- * LEASE_CAP is decided at attest, counting active leases plus DISTINCT
- * listings with a keeper-attested quote still inside its deadline, so repeat
- * or unauthenticated quote requests cannot fill it. The attest holds its slot
- * synchronously before any await, so concurrent attests cannot overrun the
- * cap. The reserve reads the balance BEFORE admission, and admission plus the
- * reservation itself run with no await in between, so concurrent reserves
- * cannot both pass the single-checkout lock.
- *
- * Reservations are persisted with saveReservations() (small separate file,
- * atomic) BEFORE the operator address is returned, so a crash can never hand
- * out an operator whose key was not written down.
+ *     Optional hygiene: an unattested reservation is deleted (never signed,
+ *     so no pod can use it); an attested one is only marked (its key stays
+ *     until the quote deadline has passed on-chain). Frees no capacity,
+ *     because none is held. Idempotent; answered even while stale or halted.
  */
 export function createReservationHandler({
   state,
@@ -107,7 +104,9 @@ export function createReservationHandler({
   health,
   quoteDigest,
   signDigest,
-  saveReservations,
+  // persist(nonces): make the CURRENT in-memory entry of each nonce durable
+  // (quote store put / del + fsync). Must throw when it could not.
+  persist,
   alert = () => {},
   log = (line) => console.error(line),
   now = () => Date.now(),
@@ -118,6 +117,7 @@ export function createReservationHandler({
   // policy.requireRenterBalance is on (never silently skipped).
   renterBalance,
 }) {
+  if (typeof persist !== "function") throw new Error("a durable persist(nonces) is required");
   if (policy.requireRenterBalance && typeof renterBalance !== "function") {
     throw new Error("REQUIRE_RENTER_BALANCE is on but no renter balance reader was provided");
   }
@@ -137,6 +137,21 @@ export function createReservationHandler({
       };
     }
     return renterBalanceAdmission({ renter, balanceWei, requiredWei });
+  }
+
+  /** persist() or a 503 KEY_STORE_UNAVAILABLE answer; true when durable. */
+  function persistOr503(response, nonces) {
+    try {
+      persist(nonces);
+      return true;
+    } catch (error) {
+      log(`operator key store write failed: ${error instanceof Error ? error.message : error}`);
+      writeJson(response, 503, {
+        error: "the lease worker could not store this quote's operator key; try again shortly",
+        code: "KEY_STORE_UNAVAILABLE",
+      });
+      return false;
+    }
   }
 
   return async function handleReservationRequest(request, response) {
@@ -171,24 +186,15 @@ export function createReservationHandler({
           alert(
             LeaseAlertCode[admission.code],
             { ...(admission.details ?? {}), market: String(market).slice(0, 10) },
-            {
-              key: scope === RefusalScope.RENTER || scope === RefusalScope.RESERVATION
-                ? `${scope}:${admission.details.renter}`
-                : scope === RefusalScope.LEASE ? `listing:${admission.details.tokenIndex}` : `${admission.code}:${scope ?? "-"}`,
-            }
+            { key: scope === RefusalScope.RENTER ? `${scope}:${admission.details.renter}` : `${admission.code}:${scope ?? "-"}` }
           );
         }
-        writeJson(
-          response,
-          admission.status,
-          {
-            error: admission.error,
-            ...(admission.code ? { code: admission.code } : {}),
-            ...(admission.code && scope ? { scope } : {}),
-            ...(admission.body ?? {}),
-          },
-          { retryAfterSec: admission.retryAfterSec }
-        );
+        writeJson(response, admission.status, {
+          error: admission.error,
+          ...(admission.code ? { code: admission.code } : {}),
+          ...(admission.code && scope ? { scope } : {}),
+          ...(admission.body ?? {}),
+        });
       };
 
       if (request.url === RELEASE_PATH) {
@@ -197,116 +203,196 @@ export function createReservationHandler({
           writeJson(response, result.status, { error: result.error });
           return;
         }
-        if (result.released) saveReservations();
+        if (result.released && !persistOr503(response, [String(body.nonce).toLowerCase()])) return;
         writeJson(response, 200, { released: result.released });
         return;
       }
 
       if (request.url === RESERVE_PATH) {
-        // Balance first (async), then admission + reserve with no await in
-        // between (see above).
-        const renter = normalizeRenter(body.renter);
-        if (policy.requireRenterBalance && renter && body.fundingWei !== undefined && body.fundingWei !== null) {
-          const requiredWei = parseWei(body.fundingWei);
+        // Cheap checks first; the only RPC (balance) runs last and only for a
+        // request every other check has admitted.
+        if (!normalizeRenter(body.renter)) {
+          writeJson(response, 400, { error: "renter address required" });
+          return;
+        }
+        if (!NONCE_RE.test(String(body.nonce ?? ""))) {
+          writeJson(response, 400, { error: "invalid nonce" });
+          return;
+        }
+        const nonce = String(body.nonce).toLowerCase();
+        let requiredWei = null;
+        if (body.fundingWei !== undefined && body.fundingWei !== null) {
+          requiredWei = parseWei(body.fundingWei);
           if (requiredWei === null) {
             writeJson(response, 400, { error: "invalid fundingWei" });
             return;
           }
-          const verdict = await checkRenterBalance(renter, requiredWei);
+        }
+        const admission = admitQuote(state, { renter: body.renter, tokenIndex: body.tokenIndex, policy });
+        if (!admission.ok) {
+          refuse(admission);
+          return;
+        }
+        const checkExisting = () => {
+          const existing = storedReservation(state, nonce);
+          if (!existing) return null;
+          const bound = normalizeRenter(existing.renter);
+          if (bound && bound !== admission.renter) return "reservation nonce belongs to a different renter";
+          if (admission.tokenIndex !== null && existing.tokenIndex !== undefined && Number(existing.tokenIndex) !== admission.tokenIndex) {
+            return "reservation nonce belongs to a different listing";
+          }
+          if (isReleasedReservation(existing)) return "reservation nonce was released";
+          return "";
+        };
+        const early = checkExisting();
+        if (early) {
+          writeJson(response, 400, { error: early });
+          return;
+        }
+        if (policy.requireRenterBalance && requiredWei !== null && early === null) {
+          const verdict = await checkRenterBalance(admission.renter, requiredWei);
           if (!verdict.ok) {
             refuse(verdict);
             return;
           }
         }
-        const nowMs = now();
-        const admission = admitReservation(state, {
-          renter: body.renter,
-          nonce: body.nonce,
-          tokenIndex: body.tokenIndex,
-          nowMs,
-          policy,
-        });
-        if (!admission.ok) {
-          refuse(admission);
+        // From here to the answer there is no await: re-check (a concurrent
+        // request may have stored this nonce during the balance read), create
+        // the key, make it durable, then return the address.
+        const current = checkExisting();
+        if (current) {
+          writeJson(response, 400, { error: current });
           return;
         }
-        const reservation = reserveRandomOperator(state, String(body.nonce), {
-          now: nowMs,
-          renter: admission.existing ? undefined : admission.renter,
+        if (current === "") {
+          // Idempotent retry of the same quote: already durable.
+          writeJson(response, 201, { operator: storedReservation(state, nonce).operator });
+          return;
+        }
+        const reservation = reserveRandomOperator(state, nonce, {
+          now: now(),
+          renter: admission.renter,
           ...(walletFactory ? { walletFactory } : {}),
         });
-        if (!admission.existing) {
-          if (admission.tokenIndex !== null && admission.tokenIndex !== undefined) {
-            state.reservations[String(body.nonce).toLowerCase()].tokenIndex = admission.tokenIndex;
-          }
-          saveReservations();
+        if (admission.tokenIndex !== null) state.reservations[nonce].tokenIndex = admission.tokenIndex;
+        if (!persistOr503(response, [nonce])) {
+          // Never handed out: forget it (a later compaction must not keep it).
+          delete state.reservations[nonce];
+          return;
         }
         writeJson(response, 201, { operator: reservation.operator });
         return;
       }
 
+      // ATTEST
       const quote = body.quote;
-      const nonce = String(quote?.nonce ?? "").toLowerCase();
-      const reservation = state.reservations?.[nonce];
-      if (!quote || !reservation) {
-        throw new Error("operator attestation does not match a live reservation");
+      if (!quote || typeof quote !== "object") {
+        writeJson(response, 400, { error: "quote required" });
+        return;
+      }
+      if (!NONCE_RE.test(String(quote.nonce ?? "")) || !ADDRESS_RE.test(String(quote.operator ?? ""))) {
+        writeJson(response, 400, { error: "quote nonce and operator required" });
+        return;
+      }
+      const nonce = String(quote.nonce).toLowerCase();
+      const reservation = storedReservation(state, nonce);
+      if (!reservation) {
+        writeJson(response, 400, { error: "operator attestation does not match a stored reservation" });
+        return;
+      }
+      const bound = normalizeRenter(reservation.renter);
+      if (bound && bound !== normalizeRenter(quote.renter)) {
+        writeJson(response, 400, { error: "quote renter does not match the reservation" });
+        return;
+      }
+      if (isReleasedReservation(reservation)) {
+        writeJson(response, 400, { error: "operator reservation was released" });
+        return;
+      }
+      if (String(quote.operator).toLowerCase() !== String(reservation.operator).toLowerCase()) {
+        writeJson(response, 400, { error: "quote operator is not the operator reserved for this nonce" });
+        return;
       }
       if (!reservation.attestedDigest && !isLiveReservation(reservation, now(), policy.reservationTtlMs)) {
-        // An unattested reservation past its TTL no longer counts toward any
-        // cap and may be pruned at any moment; never sign a quote against it.
-        throw new Error("operator reservation expired before attestation");
+        // An unattested reservation past its TTL may be pruned at any moment;
+        // never sign a quote against it.
+        writeJson(response, 400, { error: "operator reservation expired before attestation" });
+        return;
       }
-      const admission = admitAttestation(state, reservation, { quote, nowMs: now(), policy });
+      const deadline = quoteDeadlineAdmission(quote.deadline, { nowMs: now(), ttlMs: policy.reservationTtlMs });
+      if (!deadline.ok) {
+        writeJson(response, deadline.status, { error: deadline.error });
+        return;
+      }
+      const admission = admitQuote(state, { renter: quote.renter, tokenIndex: quote.tokenIndex, requireTokenIndex: true, policy });
       if (!admission.ok) {
         refuse(admission);
         return;
       }
-      // Hold the lease slot NOW, before the awaits below: a concurrent attest
-      // for another listing then already counts this one. Rolled back unless
-      // the keeper signature is recorded.
-      const slot = holdAttestationSlot(reservation, admission.tokenIndex, now());
-      try {
-        // Pending leases are counted per listing, so the listing must be real:
-        // a made-up tokenIndex must not be able to occupy lease capacity.
-        if (!(await listingExists(admission.tokenIndex))) {
-          writeJson(response, 400, { error: "unknown listing" });
+      if (reservation.tokenIndex !== undefined && Number(reservation.tokenIndex) !== admission.tokenIndex) {
+        writeJson(response, 400, { error: "quote tokenIndex does not match the reservation" });
+        return;
+      }
+      let requiredWei = null;
+      if (policy.requireRenterBalance) {
+        requiredWei = quoteFundingWei(quote);
+        if (requiredWei === null) {
+          writeJson(response, 400, { error: "quote setupGasWei, hubGasWei and operatingGasWei are required" });
           return;
         }
-        if (policy.requireRenterBalance) {
-          const requiredWei = quoteFundingWei(quote);
-          if (requiredWei === null) {
-            writeJson(response, 400, { error: "quote setupGasWei, hubGasWei and operatingGasWei are required" });
-            return;
-          }
-          const verdict = await checkRenterBalance(admission.renter, requiredWei);
-          if (!verdict.ok) {
-            if (verdict.code === "INSUFFICIENT_BALANCE" && !reservation.attestedDigest && !isReleasedReservation(reservation)) {
-              // Nothing was signed: this reservation must not keep holding the
-              // listing (or start a cooldown) for an unfunded wallet.
-              reservation.releasedAt = now();
-              reservation.releaseReason = "insufficient-balance";
-              saveReservations();
-            }
-            refuse(verdict);
-            return;
-          }
-        }
-        const digest = await quoteDigest(quote);
-        if (isReleasedReservation(reservation)) throw new Error("operator reservation was released during attestation");
-        bindOperatorReservationQuote(state, nonce, quote.operator, digest);
-        const deadline = Number(quote.deadline);
-        if (Number.isSafeInteger(deadline) && deadline > 0) reservation.quoteDeadline = deadline;
-        reservation.renter ??= admission.renter;
-        reservation.tokenIndex = admission.tokenIndex;
-        slot.commit();
-        saveReservations();
-        writeJson(response, 200, { keeperSignature: signDigest(digest) });
-      } finally {
-        slot.rollback();
       }
+      // A made-up tokenIndex never gets a keeper signature.
+      if (!(await listingExists(admission.tokenIndex))) {
+        writeJson(response, 400, { error: "unknown listing" });
+        return;
+      }
+      if (requiredWei !== null) {
+        const verdict = await checkRenterBalance(admission.renter, requiredWei);
+        if (!verdict.ok) {
+          if (verdict.code === "INSUFFICIENT_BALANCE" && !reservation.attestedDigest) {
+            // Nothing was signed: drop the unattested key right away.
+            const released = releaseReservation(state, { nonce, renter: admission.renter, nowMs: now(), reason: "insufficient-balance" });
+            if (released.ok && released.released) {
+              try {
+                persist([nonce]);
+              } catch (error) {
+                log(`operator key store write failed: ${error instanceof Error ? error.message : error}`);
+              }
+            }
+          }
+          refuse(verdict);
+          return;
+        }
+      }
+      const digest = await quoteDigest(quote);
+      // No await from here to the answer. The entry may have been released,
+      // pruned or replaced during the awaits above: sign only the same entry.
+      if (storedReservation(state, nonce) !== reservation || isReleasedReservation(reservation)) {
+        writeJson(response, 400, { error: "operator reservation changed during attestation" });
+        return;
+      }
+      const before = {
+        attestedDigest: reservation.attestedDigest,
+        quoteDeadline: reservation.quoteDeadline,
+        renter: reservation.renter,
+        tokenIndex: reservation.tokenIndex,
+      };
+      bindOperatorReservationQuote(state, nonce, quote.operator, digest);
+      reservation.quoteDeadline = Math.max(Number(reservation.quoteDeadline) || 0, deadline.deadline);
+      reservation.renter ??= admission.renter;
+      reservation.tokenIndex = admission.tokenIndex;
+      if (!persistOr503(response, [nonce])) {
+        // Not durable: roll the binding back and sign nothing.
+        for (const [field, value] of Object.entries(before)) {
+          if (value === undefined) delete reservation[field];
+          else reservation[field] = value;
+        }
+        return;
+      }
+      writeJson(response, 200, { keeperSignature: signDigest(digest) });
     } catch (error) {
       log(`operator reservation failed: ${error instanceof Error ? error.message : error}`);
-      writeJson(response, 400, { error: "operator reservation failed" });
+      if (!response.headersSent) writeJson(response, 400, { error: "operator reservation failed" });
     }
   };
 }
