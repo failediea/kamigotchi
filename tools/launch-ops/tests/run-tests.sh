@@ -1083,6 +1083,9 @@ else
   check "[ -d '$T/stage/full/test-fixtures' ] && [ -f '$T/stage/code/renter-pod-worker.mjs' ] && [ ! -e '$T/stage/code/test-fixtures' ]" "full/ has test-fixtures, code/ holds only installable files"
   rc=0; asroot env NODE_BIN="$NODE" NODE_MODULES="$NM" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/stage" > "$T/st1.out" 2>&1 || rc=$?
   expect_rc "$rc" 0 "staged vault-kit tests pass in full/"
+  if [ "$rc" != 0 ]; then # name the failing worker test(s) so a flake is recognisable
+    grep -E 'not ok|# Subtest|error:|TX_TIMEOUT|Expected|actual' "$T/stage/test.log" 2>/dev/null | grep -B1 -A4 'not ok' | head -30 | sed 's/^/       | /' || true
+  fi
   expect_grep "$T/st1.out" "running: nice -n 19" "suite runs niced"
   expect_grep "$T/st1.out" "node --test --test-concurrency=1" "suite runs serially (one test file at a time)"
   grep -E '^# (tests|pass|fail)' "$T/st1.out" | sed 's/^/       /' || true
