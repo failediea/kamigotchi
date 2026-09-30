@@ -167,15 +167,28 @@
     "maxReservationsPerRenter": 2,
     "maxReservationsPerListing": 0,
     "reservationTtlSec": 1200,
-    "reserveBody": "{ market, factory, nonce, renter, tokenIndex }  (tokenIndex optional but should be sent)",
-    "attestBody": "{ market, factory, quote }  (quote.renter and quote.tokenIndex required)",
-    "refusal429Body": "{ error, code: LEASE_CAP | RESERVATION_CAP, scope }",
+    "reserveBody": "{ market, factory, nonce, renter, tokenIndex, fundingWei }  (tokenIndex optional but should be sent; fundingWei optional decimal string = setupGasWei + hubGasWei + operatingGasWei of the priced quote, should be sent)",
+    "attestBody": "{ market, factory, quote }  (quote.renter and quote.tokenIndex required; with requireRenterBalance quote.setupGasWei, hubGasWei and operatingGasWei are required)",
+    "releasePath": "/v1/operator-reservations/release",
+    "releaseBody": "{ market, factory, nonce, renter }  -> 200 { released: boolean }; idempotent; answered even while the worker is stale or halted",
+    "releaseRule": "send when the renter closes or cancels checkout or the wallet rejects the tx: the reservation stops blocking the listing and the renter's open-checkout count and never starts a cooldown; an attested quote still counts toward the lease caps until its deadline (it can still be submitted)",
+    "refusal429Body": "{ error, code: LEASE_CAP | RESERVATION_CAP | LISTING_COOLDOWN, scope }",
     "refusalScopes": {
-      "reservation": "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts",
+      "reservation": "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts, or started maxReservationAttemptsPerRenter reservations within reservationTtlSec",
       "renter": "RESERVATION_CAP: this wallet holds maxActiveLeasesPerRenter leases (active + in checkout)",
-      "lease": "RESERVATION_CAP: this listing has maxReservationsPerListing open checkouts",
+      "lease": "RESERVATION_CAP: another renter holds this listing's open checkout (listingSingleCheckout) or the listing has maxReservationsPerListing open checkouts; LISTING_COOLDOWN: this wallet's last checkout for this listing expired unused less than listingReserveCooldownSec ago",
       "market": "LEASE_CAP: market at maxActiveLeases; RESERVATION_CAP: maxLiveReservations checkouts in flight"
-    }
+    },
+    "retryAfterRule": "scope lease refusals from listingSingleCheckout and LISTING_COOLDOWN carry a Retry-After header (seconds until the other checkout stops holding / the cooldown ends); every 503 carries Retry-After: 60",
+    "requireRenterBalance": true,
+    "renterBalanceRule": "attest: renter ETH balance (latest block) >= quote setupGasWei + hubGasWei + operatingGasWei; reserve: >= fundingWei when sent. RPC failure fails closed (503 BALANCE_UNAVAILABLE). An INSUFFICIENT_BALANCE attest releases the unattested reservation.",
+    "insufficientBalanceBody": "403 { error, code: INSUFFICIENT_BALANCE, scope: renter, requiredWei }",
+    "balanceUnavailableBody": "503 { error, code: BALANCE_UNAVAILABLE }",
+    "listingSingleCheckout": true,
+    "listingSingleCheckoutRule": "at reserve (tokenIndex sent): refused when ANOTHER renter holds an open checkout for the listing: not released, and unattested inside reservationTtlSec or attested with its quote deadline ahead; the same renter may re-quote",
+    "listingReserveCooldownSec": 900,
+    "listingReserveCooldownRule": "at reserve (tokenIndex sent): after one of this renter's checkouts for the listing stopped holding (TTL / quote deadline) without a pod and without a release, the renter cannot reserve that listing for listingReserveCooldownSec",
+    "maxReservationAttemptsPerRenter": 6
   },
   "renterAllowlist": {
     "rules": [

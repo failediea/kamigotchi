@@ -186,3 +186,30 @@ test("final-verify: every env key the worker reads is documented in renter-pod-w
   assert.equal(parsed.OPERATOR_ACTION_GAS_FLOOR, "1700000");
   hardeningConfigFromEnv(parsed);
 });
+
+test("open-rental guards default ON and are env-configurable (strict parsing)", () => {
+  const config = hardeningConfigFromEnv({});
+  assert.equal(config.requireRenterBalance, true);
+  assert.equal(config.listingSingleCheckout, true);
+  assert.equal(config.listingReserveCooldownMs, 900_000);
+  assert.equal(config.maxReservationAttemptsPerRenter, 6);
+  assert.equal(config.maxActiveLeasesPerRenter, HARDENING_DEFAULTS.MAX_ACTIVE_LEASES_PER_RENTER, "unchanged");
+  const tuned = hardeningConfigFromEnv({
+    REQUIRE_RENTER_BALANCE: "off",
+    LISTING_SINGLE_CHECKOUT: '"false"',
+    LISTING_RESERVE_COOLDOWN_SEC: "0",
+    MAX_RESERVATION_ATTEMPTS_PER_RENTER: "10",
+  });
+  assert.deepEqual(
+    [tuned.requireRenterBalance, tuned.listingSingleCheckout, tuned.listingReserveCooldownMs, tuned.maxReservationAttemptsPerRenter],
+    [false, false, 0, 10]
+  );
+  for (const [key, value] of [
+    ["REQUIRE_RENTER_BALANCE", "maybe"],
+    ["LISTING_SINGLE_CHECKOUT", "2"],
+    ["LISTING_RESERVE_COOLDOWN_SEC", "-1"],
+    ["MAX_RESERVATION_ATTEMPTS_PER_RENTER", "0"],
+  ]) {
+    assert.throws(() => hardeningConfigFromEnv({ [key]: value }), (error) => error instanceof ConfigError && error.key === key, key);
+  }
+});

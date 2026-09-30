@@ -12,7 +12,12 @@ import {
   admitReservation,
   holdAttestationSlot,
   leaseCapacity,
+  parseWei,
+  quoteFundingWei,
+  releaseReservation,
+  renterBalanceAdmission,
   renterLeaseLoad,
+  reservationHoldEndsAt,
   loadReservationStore,
   pruneReservations,
   reservationFileFor,
@@ -87,7 +92,8 @@ test("lease cap counts active leases plus DISTINCT attested listings: 429 LEASE_
   attest(state, 1, { tokenIndex: 10 });
   attest(state, 2, { tokenIndex: 10 }); // same listing: counted once
   attest(state, 3, { tokenIndex: 3 }); // listing already active: not double counted
-  const cap3 = policy({ MAX_ACTIVE_LEASES: "3" });
+  // Other renters hold quotes for #10: the single-checkout lock is tested separately.
+  const cap3 = policy({ MAX_ACTIVE_LEASES: "3", LISTING_SINGLE_CHECKOUT: "off" });
   const quote = (tokenIndex) => ({ renter: renter(53), tokenIndex });
   const refused = admitAttestation(state, state.reservations[nonce(4)], { quote: quote(11), nowMs: 0, policy: cap3 });
   assert.equal(refused.status, 429);
@@ -119,7 +125,8 @@ test("attestation requires a valid quote tokenIndex matching the reservation", (
 test("optional per-listing reservation cap (off by default) applies when tokenIndex is sent", () => {
   const state = withReservations(2, { renterOf: (i) => renter(70 + i) });
   for (const entry of Object.values(state.reservations)) entry.tokenIndex = 4;
-  const args = (env) => ({ renter: renter(1), nonce: nonce(99), tokenIndex: 4, nowMs: 0, policy: policy(env) });
+  // The single-checkout lock (on by default) is tested separately.
+  const args = (env) => ({ renter: renter(1), nonce: nonce(99), tokenIndex: 4, nowMs: 0, policy: policy({ LISTING_SINGLE_CHECKOUT: "off", ...env }) });
   assert.equal(admitReservation(state, args({})).ok, true, "off by default");
   const refused = admitReservation(state, args({ MAX_RESERVATIONS_PER_LISTING: "2" }));
   assert.equal(refused.code, "RESERVATION_CAP");
@@ -343,4 +350,96 @@ test("holdAttestationSlot: a held slot counts toward LEASE_CAP at once; rollback
   kept.rollback();
   assert.equal(first.tokenIndex, 12);
   assert.equal(first.attestPendingUntil, undefined);
+});
+
+// --- Open-rental (Sybil quote-spam) guards ---
+
+test("quote funding: setupGasWei + hubGasWei + operatingGasWei, strict uint128 decimal parsing", () => {
+  assert.equal(quoteFundingWei({ setupGasWei: "1", hubGasWei: 2, operatingGasWei: "3000000000000000000" }), 3_000_000_000_000_000_003n);
+  for (const bad of [undefined, null, "", "0x10", "-1", "1.5", "1e3", " ", -1, 1.5, "340282366920938463463374607431768211456"]) {
+    assert.equal(quoteFundingWei({ setupGasWei: bad, hubGasWei: "0", operatingGasWei: "0" }), null, JSON.stringify(bad));
+  }
+  assert.equal(parseWei("340282366920938463463374607431768211455"), 2n ** 128n - 1n);
+  assert.equal(renterBalanceAdmission({ renter: renter(1), balanceWei: 10n, requiredWei: 10n }).ok, true);
+  const refused = renterBalanceAdmission({ renter: renter(1), balanceWei: 9n, requiredWei: 10n });
+  assert.deepEqual([refused.status, refused.code, refused.details.scope, refused.body], [403, "INSUFFICIENT_BALANCE", "renter", { requiredWei: "10" }]);
+});
+
+test("hold end: quote deadline for an attested quote, else the TTL; an attestation in progress extends it", () => {
+  assert.equal(reservationHoldEndsAt({ createdAt: 1_000 }, 20 * MIN), 1_000 + 20 * MIN);
+  assert.equal(reservationHoldEndsAt({ createdAt: 1_000, attestedDigest: "0x1", quoteDeadline: 900 }, 20 * MIN), 900_000);
+  assert.equal(reservationHoldEndsAt({ createdAt: 1_000, attestedDigest: "0x1" }, 20 * MIN), 1_000 + 20 * MIN, "legacy");
+  assert.equal(reservationHoldEndsAt({ createdAt: 0, attestPendingUntil: 30 * MIN }, 20 * MIN), 30 * MIN);
+});
+
+test("single checkout per listing is on by default; off restores the previous behaviour", () => {
+  const state = withReservations(1, { renterOf: () => renter(70) });
+  state.reservations[nonce(1)].tokenIndex = 4;
+  const args = (env, who = renter(1)) => ({ renter: who, nonce: nonce(99), tokenIndex: 4, nowMs: MIN, policy: policy(env) });
+  const refused = admitReservation(state, args({}));
+  assert.deepEqual([refused.status, refused.code, refused.details.scope, refused.retryAfterSec], [429, "RESERVATION_CAP", "lease", 19 * 60]);
+  assert.equal(admitReservation(state, args({}, renter(70))).ok, true, "the holder may re-quote");
+  assert.equal(admitReservation(state, args({ LISTING_SINGLE_CHECKOUT: "off" })).ok, true);
+  assert.equal(admitReservation(state, { ...args({}), tokenIndex: undefined }).ok, true, "no tokenIndex: not a listing lock");
+  releaseReservation(state, { nonce: nonce(1), renter: renter(70), nowMs: MIN });
+  assert.equal(admitReservation(state, args({})).ok, true, "released: free");
+});
+
+test("pruning an expired, unreleased checkout records the per-listing cooldown; released ones and expired cooldowns do not linger", () => {
+  const state = withReservations(3, { renterOf: (i) => renter(80 + i) });
+  state.reservations[nonce(1)].tokenIndex = 4;
+  state.reservations[nonce(2)].tokenIndex = 5;
+  releaseReservation(state, { nonce: nonce(2), renter: renter(81), nowMs: MIN });
+  // nonce(3) names no listing: nothing to cool down.
+  state.listingCooldowns = { [`${renter(1)}:9`]: 20 * MIN };
+  const nowMs = 21 * MIN;
+  assert.equal(pruneReservations(state, { nowMs, ttlMs: 20 * MIN, ingestedThroughSec: null, cooldownMs: 15 * MIN }), 3);
+  assert.deepEqual(state.listingCooldowns, { [`${renter(80)}:4`]: 35 * MIN });
+  const cooldown = policy();
+  const again = admitReservation(state, { renter: renter(80), nonce: nonce(99), tokenIndex: 4, nowMs, policy: cooldown });
+  assert.deepEqual([again.status, again.code, again.details.scope, again.retryAfterSec], [429, "LISTING_COOLDOWN", "lease", 14 * 60]);
+  assert.equal(admitReservation(state, { renter: renter(81), nonce: nonce(99), tokenIndex: 5, nowMs, policy: cooldown }).ok, true);
+  assert.equal(admitReservation(state, { renter: renter(80), nonce: nonce(99), tokenIndex: 4, nowMs, policy: policy({ LISTING_RESERVE_COOLDOWN_SEC: "0" }) }).ok, true);
+  assert.equal(admitReservation(state, { renter: renter(80), nonce: nonce(99), tokenIndex: 4, nowMs: 35 * MIN + 1, policy: cooldown }).ok, true);
+  // Without cooldownMs (old callers) nothing is recorded.
+  const plain = withReservations(1);
+  plain.reservations[nonce(1)].tokenIndex = 4;
+  pruneReservations(plain, { nowMs, ttlMs: 20 * MIN, ingestedThroughSec: null });
+  assert.equal(Object.keys(plain.listingCooldowns ?? {}).length, 0);
+});
+
+test("cooldowns persist in the reservation store only (never in the job state file); idle store keeps its shape", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cooldown-store-"));
+  try {
+    const file = join(dir, "state.reservations.json");
+    const state = withReservations(1);
+    state.listingCooldowns = {};
+    saveReservationStore(state, file);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(file, "utf8"))), ["version", "reservations"]);
+    state.listingCooldowns = { [`${renter(1)}:4`]: 123 };
+    saveReservationStore(state, file);
+    const loaded = { jobs: {}, reservations: {} };
+    loadReservationStore(loaded, file);
+    assert.deepEqual(loaded.listingCooldowns, { [`${renter(1)}:4`]: 123 });
+    assert.equal(Object.keys(loaded.reservations).length, 1);
+    const disk = stateForDisk(loaded);
+    assert.equal("listingCooldowns" in disk, false);
+    assert.equal(Object.keys(disk.reservations).length, 1, "reservations still mirrored for rollback");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("release: renter-bound and idempotent; released checkouts leave the open-checkout cap but not the attempts cap", () => {
+  const state = withReservations(2);
+  assert.equal(releaseReservation(state, { nonce: nonce(1), renter: renter(2), nowMs: 0 }).status, 400);
+  assert.deepEqual(releaseReservation(state, { nonce: nonce(1), renter: renter(1), nowMs: 5 }), { ok: true, released: true });
+  assert.deepEqual(releaseReservation(state, { nonce: nonce(1), renter: renter(1), nowMs: 6 }), { ok: true, released: false });
+  assert.equal(state.reservations[nonce(1)].releasedAt, 5);
+  const stats = reservationStats(state, { nowMs: 10, ttlMs: 20 * MIN });
+  assert.deepEqual([stats.live, stats.perRenter.get(renter(1)), stats.attemptsPerRenter.get(renter(1))], [2, 1, 2]);
+  assert.equal(admitReservation(state, { renter: renter(1), nonce: nonce(99), nowMs: 10, policy: policy() }).ok, true);
+  const capped = admitReservation(state, { renter: renter(1), nonce: nonce(99), nowMs: 10, policy: policy({ MAX_RESERVATION_ATTEMPTS_PER_RENTER: "2" }) });
+  assert.deepEqual([capped.status, capped.details.scope, capped.details.attempts], [429, "reservation", 2]);
+  assert.equal(admitAttestation(state, state.reservations[nonce(1)], { quote: { renter: renter(1), tokenIndex: 4 }, nowMs: 10, policy: policy() }).status, 400);
 });

@@ -1,7 +1,8 @@
 /**
  * Launch-hardening knobs. Every value is env-configurable; the defaults are
- * the soft-launch policy agreed for the v16 markets. Parsing is strict so a
- * typo in an .env fails at startup instead of silently disabling a guard.
+ * the launch policy agreed for the v16 markets (open to the public, with the
+ * Sybil guards below on). Parsing is strict so a typo in an .env fails at
+ * startup instead of silently disabling a guard.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { LEASE_PREFS_FLOOR } from "./kamibots-rental-config.mjs";
@@ -104,6 +105,29 @@ export const HARDENING_DEFAULTS = Object.freeze({
   // Returned retired (superseded) jobs are dropped from the state file after
   // this many days.
   RETIRED_JOB_RETENTION_DAYS: 30,
+  // Sybil quote-spam guards for OPEN rentals (THR-04 / FE-2 without an
+  // allowlist). All on by default.
+  //  - REQUIRE_RENTER_BALANCE: the keeper attests a quote only when the
+  //    renter's current ETH balance covers setupGasWei + hubGasWei +
+  //    operatingGasWei of that quote (and a reserve that names fundingWei is
+  //    checked the same way). An RPC failure refuses (503), never admits.
+  REQUIRE_RENTER_BALANCE: true,
+  //  - LISTING_SINGLE_CHECKOUT: at most one open checkout (a reservation with
+  //    no submitted checkout that still holds, i.e. unattested inside the TTL
+  //    or attested with its quote deadline ahead, and not released) per
+  //    listing across all renters; another renter gets 429 scope "lease"
+  //    with Retry-After = the remaining hold.
+  LISTING_SINGLE_CHECKOUT: true,
+  //  - LISTING_RESERVE_COOLDOWN_SEC: after a renter's reservation for a listing
+  //    EXPIRES without a checkout (not when the renter released it), that
+  //    renter cannot reserve that listing again for this long. 0 = off.
+  LISTING_RESERVE_COOLDOWN_SEC: 900,
+  //  - MAX_RESERVATION_ATTEMPTS_PER_RENTER: reservations one renter may create
+  //    per RESERVATION_TTL_SEC window, released ones included. Released
+  //    checkouts do not count toward MAX_RESERVATIONS_PER_RENTER (so an honest
+  //    renter can retry right away), so this bounds the release/retry loop and
+  //    keeps one wallet from filling MAX_LIVE_RESERVATIONS.
+  MAX_RESERVATION_ATTEMPTS_PER_RENTER: 6,
 });
 
 /**
@@ -263,6 +287,10 @@ export function hardeningConfigFromEnv(env = process.env) {
     logChunksPerTick: boundedInteger(env, "LOG_CHUNKS_PER_TICK", 1, 1_000),
     retiredJobRetentionMs: positiveInteger(env, "RETIRED_JOB_RETENTION_DAYS") * 86_400_000,
     operatorTxPricing: operatorTxPricing(env.OPERATOR_TX_PRICING),
+    requireRenterBalance: parseSwitch(env, "REQUIRE_RENTER_BALANCE", HARDENING_DEFAULTS.REQUIRE_RENTER_BALANCE),
+    listingSingleCheckout: parseSwitch(env, "LISTING_SINGLE_CHECKOUT", HARDENING_DEFAULTS.LISTING_SINGLE_CHECKOUT),
+    listingReserveCooldownMs: positiveIntegerOrZero(env, "LISTING_RESERVE_COOLDOWN_SEC") * 1000,
+    maxReservationAttemptsPerRenter: positiveInteger(env, "MAX_RESERVATION_ATTEMPTS_PER_RENTER"),
   };
   // The kamistats quote deadline is 15 minutes. A reservation that expires
   // before its quote can still be submitted would orphan the pod's operator.

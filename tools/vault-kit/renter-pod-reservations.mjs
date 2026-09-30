@@ -44,17 +44,45 @@ export function isLiveReservation(reservation, nowMs, ttlMs) {
   return nowMs - Number(reservation?.createdAt || 0) <= ttlMs;
 }
 
+/**
+ * Live reservation counts. `live` counts every reservation inside the TTL
+ * (released ones included: they still occupy the store). `perRenter` counts a
+ * renter's OPEN checkouts (released ones excluded) for
+ * MAX_RESERVATIONS_PER_RENTER; `attemptsPerRenter` counts every reservation
+ * the renter created inside the TTL for MAX_RESERVATION_ATTEMPTS_PER_RENTER.
+ */
 export function reservationStats(state, { nowMs, ttlMs }) {
   initializeOperatorKeyState(state);
   let live = 0;
   const perRenter = new Map();
+  const attemptsPerRenter = new Map();
   for (const reservation of Object.values(state.reservations)) {
     if (!isLiveReservation(reservation, nowMs, ttlMs)) continue;
     live++;
     const renter = normalizeRenter(reservation.renter);
-    if (renter) perRenter.set(renter, (perRenter.get(renter) ?? 0) + 1);
+    if (!renter) continue;
+    attemptsPerRenter.set(renter, (attemptsPerRenter.get(renter) ?? 0) + 1);
+    if (!isReleasedReservation(reservation)) perRenter.set(renter, (perRenter.get(renter) ?? 0) + 1);
   }
-  return { live, total: Object.keys(state.reservations).length, perRenter };
+  return { live, total: Object.keys(state.reservations).length, perRenter, attemptsPerRenter };
+}
+
+/** Released by its renter (POST /v1/operator-reservations/release) or by the
+ * worker after an INSUFFICIENT_BALANCE attest refusal. */
+export function isReleasedReservation(reservation) {
+  return Number(reservation?.releasedAt) > 0;
+}
+
+/**
+ * When a reservation stops holding its checkout: the quote deadline for an
+ * attested quote (the factory rejects it afterwards), else the reservation
+ * TTL. An attestation in progress holds at least until attestPendingUntil.
+ */
+export function reservationHoldEndsAt(reservation, ttlMs) {
+  let end = Number(reservation?.createdAt || 0) + ttlMs;
+  if (reservation?.attestedDigest && Number(reservation.quoteDeadline) > 0) end = Number(reservation.quoteDeadline) * 1000;
+  const pending = Number(reservation?.attestPendingUntil);
+  return pending > end ? pending : end;
 }
 
 export function activeJobCount(state) {
@@ -118,10 +146,117 @@ function leaseCapRefusal(capacity, cap) {
 
 /** A reservation that stands for a lease its renter may still get: open
  * (unattested, inside the TTL), attested with a quote still submittable, or
- * with an attestation in progress. */
-function reservationHoldsLease(reservation, nowMs, ttlMs) {
+ * with an attestation in progress. A released ATTESTED quote still holds (the
+ * renter can still submit it); a released unattested one never can. */
+export function reservationHoldsLease(reservation, nowMs, ttlMs) {
   if (isPendingAttestation(reservation, nowMs, ttlMs)) return true;
-  return !reservation?.attestedDigest && isLiveReservation(reservation, nowMs, ttlMs);
+  return !reservation?.attestedDigest && !isReleasedReservation(reservation) && isLiveReservation(reservation, nowMs, ttlMs);
+}
+
+/** Key of the per-(renter, listing) cooldown map. */
+export function listingCooldownKey(renter, tokenIndex) {
+  return `${renter}:${tokenIndex}`;
+}
+
+/**
+ * LISTING_SINGLE_CHECKOUT: the open checkout another renter holds on `token`,
+ * or null. Open = holds its lease (reservationHoldsLease) and not released.
+ * Returns { until } (ms) - the latest hold end among the blocking entries.
+ */
+export function listingCheckoutHold(state, { renter, token, nowMs, ttlMs }) {
+  let until = null;
+  for (const reservation of Object.values(state.reservations ?? {})) {
+    if (normalizeTokenIndex(reservation?.tokenIndex) !== token) continue;
+    if (normalizeRenter(reservation.renter) === renter) continue;
+    if (isReleasedReservation(reservation) || !reservationHoldsLease(reservation, nowMs, ttlMs)) continue;
+    const end = reservationHoldEndsAt(reservation, ttlMs);
+    if (until === null || end > until) until = end;
+  }
+  return until === null ? null : { until };
+}
+
+/**
+ * LISTING_RESERVE_COOLDOWN_SEC: when `renter` may reserve `token` again, or
+ * null when it may now. A cooldown starts when one of the renter's
+ * reservations for the listing stopped holding (TTL / quote deadline) without
+ * a checkout and without a release: from the recorded map (entries the pruner
+ * already removed) or from store entries not pruned yet.
+ */
+export function listingCooldownUntil(state, { renter, token, nowMs, ttlMs, cooldownMs }) {
+  if (!(cooldownMs > 0)) return null;
+  let until = Number(state.listingCooldowns?.[listingCooldownKey(renter, token)]) || 0;
+  for (const reservation of Object.values(state.reservations ?? {})) {
+    if (normalizeTokenIndex(reservation?.tokenIndex) !== token) continue;
+    if (normalizeRenter(reservation.renter) !== renter) continue;
+    if (isReleasedReservation(reservation) || reservationHoldsLease(reservation, nowMs, ttlMs)) continue;
+    const end = reservationHoldEndsAt(reservation, ttlMs) + cooldownMs;
+    if (end > until) until = end;
+  }
+  return until > nowMs ? until : null;
+}
+
+const retryAfterSec = (untilMs, nowMs) => Math.max(1, Math.ceil((untilMs - nowMs) / 1000));
+
+/**
+ * Release an open checkout (the renter closed or cancelled it). The entry is
+ * marked, never deleted: an attested quote can still be submitted until its
+ * deadline, so its operator key must stay until the pruner proves it unusable.
+ * A released reservation never starts a cooldown, never blocks the listing
+ * for other renters and no longer counts toward MAX_RESERVATIONS_PER_RENTER;
+ * it still counts toward MAX_LIVE_RESERVATIONS and
+ * MAX_RESERVATION_ATTEMPTS_PER_RENTER, and an attested one toward the lease
+ * caps (its quote is still valid on-chain). Idempotent.
+ * Returns { ok, status, error } or { ok: true, released: boolean }.
+ */
+export function releaseReservation(state, { nonce, renter, nowMs, reason = "renter" }) {
+  const normalized = normalizeRenter(renter);
+  if (!normalized) return { ok: false, status: 400, error: "renter address required" };
+  const reservation = state.reservations?.[String(nonce ?? "").toLowerCase()];
+  if (!reservation) return { ok: true, released: false };
+  if (normalizeRenter(reservation.renter) !== normalized) {
+    return { ok: false, status: 400, error: "reservation nonce belongs to a different renter" };
+  }
+  if (isReleasedReservation(reservation)) return { ok: true, released: false };
+  reservation.releasedAt = nowMs;
+  reservation.releaseReason = reason;
+  return { ok: true, released: true };
+}
+
+/** A uint128 wei amount as the quote carries it (decimal string or safe integer). */
+export function parseWei(value) {
+  if (typeof value === "bigint") return value >= 0n && value < 2n ** 128n ? value : null;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  const text = String(value ?? "").trim();
+  if (!/^\d{1,39}$/.test(text)) return null;
+  const wei = BigInt(text);
+  return wei < 2n ** 128n ? wei : null;
+}
+
+/** Full checkout funding of a quote (setupGasWei + hubGasWei + operatingGasWei), or null. */
+export function quoteFundingWei(quote) {
+  let total = 0n;
+  for (const field of ["setupGasWei", "hubGasWei", "operatingGasWei"]) {
+    const wei = parseWei(quote?.[field]);
+    if (wei === null) return null;
+    total += wei;
+  }
+  return total;
+}
+
+/**
+ * REQUIRE_RENTER_BALANCE verdict for a balance already read from the chain.
+ * Refusal: 403 { code INSUFFICIENT_BALANCE, scope renter, requiredWei }.
+ */
+export function renterBalanceAdmission({ renter, balanceWei, requiredWei }) {
+  if (BigInt(balanceWei) >= BigInt(requiredWei)) return { ok: true };
+  return {
+    ok: false,
+    status: 403,
+    code: "INSUFFICIENT_BALANCE",
+    error: "this wallet does not hold enough ETH to fund this lease",
+    details: { scope: RefusalScope.RENTER, renter, requiredWei: BigInt(requiredWei).toString() },
+    body: { requiredWei: BigInt(requiredWei).toString() },
+  };
 }
 
 /**
@@ -186,7 +321,7 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
     return { ok: false, status: 400, code: null, error: "renter address required" };
   }
   if (policy.renterAllowlist && !policy.renterAllowlist.has(normalized)) {
-    return { ok: false, status: 403, code: null, error: "renter is not on the soft-launch allowlist" };
+    return { ok: false, status: 403, code: null, error: "renter is not on the renter allowlist" };
   }
   const token = normalizeTokenIndex(tokenIndex);
   if (tokenIndex !== undefined && tokenIndex !== null && token === null) {
@@ -203,7 +338,44 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
     if (token !== null && reservedToken !== null && reservedToken !== token) {
       return { ok: false, status: 400, code: null, error: "reservation nonce belongs to a different listing" };
     }
+    if (isReleasedReservation(existing)) {
+      return { ok: false, status: 400, code: null, error: "reservation nonce was released" };
+    }
     return { ok: true, existing: true };
+  }
+  if (token !== null) {
+    // Sybil guards (open rentals). Evaluated synchronously with the reserve
+    // itself, so two concurrent reserves cannot both pass.
+    const cooldownUntil = listingCooldownUntil(state, {
+      renter: normalized,
+      token,
+      nowMs,
+      ttlMs: policy.reservationTtlMs,
+      cooldownMs: policy.listingReserveCooldownMs,
+    });
+    if (cooldownUntil !== null) {
+      return {
+        ok: false,
+        status: 429,
+        code: "LISTING_COOLDOWN",
+        error: "your last checkout for this Kami expired; you can reserve it again shortly",
+        details: { scope: RefusalScope.LEASE, renter: normalized, tokenIndex: token },
+        retryAfterSec: retryAfterSec(cooldownUntil, nowMs),
+      };
+    }
+    if (policy.listingSingleCheckout) {
+      const hold = listingCheckoutHold(state, { renter: normalized, token, nowMs, ttlMs: policy.reservationTtlMs });
+      if (hold) {
+        return {
+          ok: false,
+          status: 429,
+          code: "RESERVATION_CAP",
+          error: "someone else is checking out this Kami; try again when their checkout expires",
+          details: { scope: RefusalScope.LEASE, tokenIndex: token, live: 1, cap: 1 },
+          retryAfterSec: retryAfterSec(hold.until, nowMs),
+        };
+      }
+    }
   }
   if (token !== null) {
     // Early answer only when the listing is named: without it the reserve
@@ -217,7 +389,11 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
   if (token !== null && policy.maxReservationsPerListing > 0) {
     let forListing = 0;
     for (const reservation of Object.values(state.reservations)) {
-      if (normalizeTokenIndex(reservation.tokenIndex) === token && isLiveReservation(reservation, nowMs, policy.reservationTtlMs)) {
+      if (
+        normalizeTokenIndex(reservation.tokenIndex) === token
+        && !isReleasedReservation(reservation)
+        && isLiveReservation(reservation, nowMs, policy.reservationTtlMs)
+      ) {
         forListing++;
       }
     }
@@ -250,6 +426,16 @@ export function admitReservation(state, { renter, nonce, tokenIndex, nowMs, poli
       details: { scope: RefusalScope.RESERVATION, renter: normalized, live: mine, cap: policy.maxReservationsPerRenter },
     };
   }
+  const attempts = stats.attemptsPerRenter.get(normalized) ?? 0;
+  if (attempts >= policy.maxReservationAttemptsPerRenter) {
+    return {
+      ok: false,
+      status: 429,
+      code: "RESERVATION_CAP",
+      error: "this wallet started too many checkouts recently; try again in a few minutes",
+      details: { scope: RefusalScope.RESERVATION, renter: normalized, attempts, cap: policy.maxReservationAttemptsPerRenter },
+    };
+  }
   const load = renterLeaseLoad(state, normalized, {
     nowMs,
     ttlMs: policy.reservationTtlMs,
@@ -270,11 +456,14 @@ export function admitAttestation(state, reservation, { quote, nowMs, policy }) {
   const renter = normalizeRenter(quote?.renter);
   if (!renter) return { ok: false, status: 400, code: null, error: "quote renter address required" };
   if (policy.renterAllowlist && !policy.renterAllowlist.has(renter)) {
-    return { ok: false, status: 403, code: null, error: "renter is not on the soft-launch allowlist" };
+    return { ok: false, status: 403, code: null, error: "renter is not on the renter allowlist" };
   }
   const bound = normalizeRenter(reservation?.renter);
   if (bound && bound !== renter) {
     return { ok: false, status: 400, code: null, error: "quote renter does not match the reservation" };
+  }
+  if (isReleasedReservation(reservation)) {
+    return { ok: false, status: 400, code: null, error: "operator reservation was released" };
   }
   const token = normalizeTokenIndex(quote?.tokenIndex);
   if (token === null) return { ok: false, status: 400, code: null, error: "quote tokenIndex required" };
@@ -345,6 +534,11 @@ export function holdAttestationSlot(reservation, tokenIndex, nowMs, holdMs = ATT
  *    and still only after ingest has covered that time.
  *
  * Nonces in `protectedNonces` (events parked for retry) are never removed.
+ *
+ * A removed reservation that expired without a checkout and was not released
+ * leaves a LISTING_RESERVE_COOLDOWN_SEC entry for its (renter, listing) in
+ * state.listingCooldowns (persisted with the reservation store); expired
+ * cooldown entries are dropped here too.
  */
 export function pruneReservations(state, {
   nowMs,
@@ -352,8 +546,12 @@ export function pruneReservations(state, {
   ingestedThroughSec,
   protectedNonces = new Set(),
   legacyMaxAgeMs = LEGACY_RESERVATION_MAX_AGE_MS,
+  cooldownMs = 0,
 }) {
   initializeOperatorKeyState(state);
+  for (const [key, until] of Object.entries(state.listingCooldowns ?? {})) {
+    if (!(Number(until) > nowMs)) delete state.listingCooldowns[key];
+  }
   const ingestedThroughMs = Number.isFinite(Number(ingestedThroughSec)) && ingestedThroughSec != null
     ? Number(ingestedThroughSec) * 1000
     : null;
@@ -373,10 +571,23 @@ export function pruneReservations(state, {
         && ingestedThroughMs > createdAt + legacyMaxAgeMs;
     }
     if (!prunable) continue;
+    recordListingCooldown(state, reservation, { nowMs, ttlMs, cooldownMs });
     delete state.reservations[nonce];
     removed++;
   }
   return removed;
+}
+
+function recordListingCooldown(state, reservation, { nowMs, ttlMs, cooldownMs }) {
+  if (!(cooldownMs > 0) || isReleasedReservation(reservation)) return;
+  const renter = normalizeRenter(reservation.renter);
+  const token = normalizeTokenIndex(reservation.tokenIndex);
+  if (!renter || token === null) return;
+  const until = reservationHoldEndsAt(reservation, ttlMs) + cooldownMs;
+  if (until <= nowMs) return;
+  state.listingCooldowns ??= {};
+  const key = listingCooldownKey(renter, token);
+  if (!(Number(state.listingCooldowns[key]) >= until)) state.listingCooldowns[key] = until;
 }
 
 /** Default reservation store: next to the job state file, one per market. */
@@ -398,10 +609,13 @@ export function loadReservationStore(state, file, { read = readFileSync, exists 
   initializeOperatorKeyState(state);
   const embedded = state.reservations;
   let stored = {};
+  let cooldowns = {};
   if (exists(file)) {
     const parsed = JSON.parse(read(file, "utf8"));
     stored = parsed?.reservations ?? {};
+    cooldowns = parsed?.listingCooldowns ?? {};
   }
+  state.listingCooldowns = { ...cooldowns };
   const merged = { ...stored };
   let migrated = 0;
   for (const [nonce, reservation] of Object.entries(embedded)) {
@@ -419,8 +633,14 @@ export function loadReservationStore(state, file, { read = readFileSync, exists 
   return { migrated };
 }
 
+/** listingCooldowns is written only when non-empty (idle store keeps its shape). */
 export function saveReservationStore(state, file, { write = writeJsonAtomic } = {}) {
-  write(file, { version: 1, reservations: state.reservations ?? {} });
+  const cooldowns = state.listingCooldowns ?? {};
+  write(file, {
+    version: 1,
+    reservations: state.reservations ?? {},
+    ...(Object.keys(cooldowns).length ? { listingCooldowns: cooldowns } : {}),
+  });
 }
 
 const HARDENING_CONTAINERS = ["retiredJobs", "ingestRetry", "pendingTxs", "txNonceHints"];
@@ -439,7 +659,8 @@ const HARDENING_CONTAINERS = ["retiredJobs", "ingestRetry", "pendingTxs", "txNon
  * state file keeps exactly its pre-hardening shape.
  */
 export function stateForDisk(state) {
-  const { reservations = {}, ...rest } = state;
+  // listingCooldowns lives in the reservation store only.
+  const { reservations = {}, listingCooldowns: _cooldowns, ...rest } = state;
   for (const key of HARDENING_CONTAINERS) {
     if (rest[key] && typeof rest[key] === "object" && !Object.keys(rest[key]).length) delete rest[key];
   }

@@ -7,10 +7,19 @@ import {
   admitReservation,
   holdAttestationSlot,
   isLiveReservation,
+  isReleasedReservation,
+  normalizeRenter,
+  parseWei,
+  quoteFundingWei,
+  releaseReservation,
+  renterBalanceAdmission,
 } from "./renter-pod-reservations.mjs";
 
 export const RESERVE_PATH = "/v1/operator-reservations";
 export const ATTEST_PATH = "/v1/operator-reservations/attest";
+export const RELEASE_PATH = "/v1/operator-reservations/release";
+
+const ROUTES = new Set([RESERVE_PATH, ATTEST_PATH, RELEASE_PATH]);
 
 export function authorizedReservationRequest(header, token) {
   const prefix = "Bearer ";
@@ -29,36 +38,61 @@ async function readBody(request) {
   return JSON.parse(body || "{}");
 }
 
-function writeJson(response, status, body) {
+function writeJson(response, status, body, { retryAfterSec } = {}) {
+  const retryAfter = retryAfterSec ?? (status === 503 ? 60 : undefined);
   response.writeHead(status, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
-    ...(status === 503 ? { "Retry-After": "60" } : {}),
+    ...(retryAfter !== undefined ? { "Retry-After": String(retryAfter) } : {}),
   });
   response.end(JSON.stringify(body));
 }
 
 /**
- * HTTP handler for the quote API's operator reservation and keeper
- * attestation calls. Status contract with the web lane:
+ * HTTP handler for the quote API's operator reservation, keeper attestation
+ * and checkout release calls. Status contract with the web lane:
  *   401 bad token, 404 unknown route, 400 malformed/mismatched request,
- *   403 renter not allowlisted, 429 reservation or lease cap reached,
- *   503 worker stale or halted (heartbeat/ingest older than the limit).
- * Every 429 body is { error, code, scope }: code LEASE_CAP | RESERVATION_CAP,
- * scope one of RefusalScope (reservation | renter | lease | market; see
- * renter-pod-reservations.mjs). The renter address stays in the alert only.
+ *   403 renter not allowlisted (no code) or, with REQUIRE_RENTER_BALANCE,
+ *       { error, code: INSUFFICIENT_BALANCE, scope: "renter", requiredWei },
+ *   429 reservation or lease cap reached,
+ *   503 worker stale or halted (heartbeat/ingest older than the limit), or
+ *       { error, code: BALANCE_UNAVAILABLE } when the renter's balance could
+ *       not be read (fails closed, never admits).
+ * Every 429 body is { error, code, scope }: code LEASE_CAP | RESERVATION_CAP |
+ * LISTING_COOLDOWN, scope one of RefusalScope (reservation | renter | lease |
+ * market; see renter-pod-reservations.mjs). Scope "lease" refusals from the
+ * single-checkout lock (RESERVATION_CAP) and the per-listing cooldown
+ * (LISTING_COOLDOWN) carry a Retry-After header: the seconds until the other
+ * renter's checkout stops holding / the cooldown ends. The renter address
+ * stays in the alert only.
  *
- * Request bodies: reserve {market, factory, nonce, renter, tokenIndex?};
- * attest {market, factory, quote} where quote.tokenIndex is REQUIRED.
+ * Request bodies:
+ *   reserve {market, factory, nonce, renter, tokenIndex?, fundingWei?}
+ *     tokenIndex is optional but the quote API sends it: then the reserve
+ *     answers LEASE_CAP early, the single-checkout lock, the listing cooldown
+ *     and the per-listing cap apply, and the per-renter lease cap dedupes by
+ *     listing. fundingWei (decimal string: setupGasWei + hubGasWei +
+ *     operatingGasWei of the quote being priced) makes the reserve refuse an
+ *     underfunded wallet before an operator is spent; the attest re-checks.
+ *   attest {market, factory, quote}: quote.tokenIndex is REQUIRED, and with
+ *     REQUIRE_RENTER_BALANCE the renter's balance must cover the quote's
+ *     setupGasWei + hubGasWei + operatingGasWei (authoritative: these are the
+ *     totals the keeper signs). An INSUFFICIENT_BALANCE refusal releases an
+ *     unattested reservation so it holds nothing.
+ *   release {market, factory, nonce, renter} -> 200 { released: boolean }.
+ *     The renter closed or cancelled checkout: the reservation stops blocking
+ *     the listing and its renter's open-checkout count, and never starts a
+ *     cooldown. Idempotent (unknown / already released -> released: false);
+ *     answered even while the worker is stale or halted.
+ *
  * LEASE_CAP is decided at attest, counting active leases plus DISTINCT
  * listings with a keeper-attested quote still inside its deadline, so repeat
  * or unauthenticated quote requests cannot fill it. The attest holds its slot
  * synchronously before any await, so concurrent attests cannot overrun the
- * cap. tokenIndex on reserve is optional but the quote API sends it: then the
- * reserve answers LEASE_CAP early, the per-listing cap
- * (MAX_RESERVATIONS_PER_LISTING) applies and the per-renter lease cap
- * (MAX_ACTIVE_LEASES_PER_RENTER) dedupes by listing.
+ * cap. The reserve reads the balance BEFORE admission, and admission plus the
+ * reservation itself run with no await in between, so concurrent reserves
+ * cannot both pass the single-checkout lock.
  *
  * Reservations are persisted with saveReservations() (small separate file,
  * atomic) BEFORE the operator address is returned, so a crash can never hand
@@ -80,10 +114,34 @@ export function createReservationHandler({
   walletFactory,
   // Worker: market.listings(tokenIndex).owner is non-zero.
   listingExists = async () => true,
+  // Worker: provider.getBalance(renter) on the configured RPC. Required while
+  // policy.requireRenterBalance is on (never silently skipped).
+  renterBalance,
 }) {
+  if (policy.requireRenterBalance && typeof renterBalance !== "function") {
+    throw new Error("REQUIRE_RENTER_BALANCE is on but no renter balance reader was provided");
+  }
+
+  /** Balance gate verdict; an RPC failure fails CLOSED (503). */
+  async function checkRenterBalance(renter, requiredWei) {
+    let balanceWei;
+    try {
+      balanceWei = BigInt(await renterBalance(renter));
+    } catch (error) {
+      log(`renter balance check failed: ${error instanceof Error ? error.message : error}`);
+      return {
+        ok: false,
+        status: 503,
+        code: "BALANCE_UNAVAILABLE",
+        error: "could not check this wallet's balance right now; try again shortly",
+      };
+    }
+    return renterBalanceAdmission({ renter, balanceWei, requiredWei });
+  }
+
   return async function handleReservationRequest(request, response) {
     try {
-      if (request.method !== "POST" || (request.url !== RESERVE_PATH && request.url !== ATTEST_PATH)) {
+      if (request.method !== "POST" || !ROUTES.has(request.url)) {
         writeJson(response, 404, { error: "not found" });
         return;
       }
@@ -91,10 +149,12 @@ export function createReservationHandler({
         writeJson(response, 401, { error: "unauthorized" });
         return;
       }
-      const status = health();
-      if (!status.ok) {
-        writeJson(response, 503, { error: "lease worker is not accepting new leases right now", reason: status.reason });
-        return;
+      if (request.url !== RELEASE_PATH) {
+        const status = health();
+        if (!status.ok) {
+          writeJson(response, 503, { error: "lease worker is not accepting new leases right now", reason: status.reason });
+          return;
+        }
       }
       const body = await readBody(request);
       if (
@@ -107,7 +167,7 @@ export function createReservationHandler({
 
       const refuse = (admission) => {
         const scope = admission.details?.scope;
-        if (admission.code) {
+        if (admission.code && LeaseAlertCode[admission.code]) {
           alert(
             LeaseAlertCode[admission.code],
             { ...(admission.details ?? {}), market: String(market).slice(0, 10) },
@@ -118,14 +178,46 @@ export function createReservationHandler({
             }
           );
         }
-        writeJson(response, admission.status, {
-          error: admission.error,
-          ...(admission.code ? { code: admission.code } : {}),
-          ...(admission.status === 429 && scope ? { scope } : {}),
-        });
+        writeJson(
+          response,
+          admission.status,
+          {
+            error: admission.error,
+            ...(admission.code ? { code: admission.code } : {}),
+            ...(admission.code && scope ? { scope } : {}),
+            ...(admission.body ?? {}),
+          },
+          { retryAfterSec: admission.retryAfterSec }
+        );
       };
 
+      if (request.url === RELEASE_PATH) {
+        const result = releaseReservation(state, { nonce: body.nonce, renter: body.renter, nowMs: now() });
+        if (!result.ok) {
+          writeJson(response, result.status, { error: result.error });
+          return;
+        }
+        if (result.released) saveReservations();
+        writeJson(response, 200, { released: result.released });
+        return;
+      }
+
       if (request.url === RESERVE_PATH) {
+        // Balance first (async), then admission + reserve with no await in
+        // between (see above).
+        const renter = normalizeRenter(body.renter);
+        if (policy.requireRenterBalance && renter && body.fundingWei !== undefined && body.fundingWei !== null) {
+          const requiredWei = parseWei(body.fundingWei);
+          if (requiredWei === null) {
+            writeJson(response, 400, { error: "invalid fundingWei" });
+            return;
+          }
+          const verdict = await checkRenterBalance(renter, requiredWei);
+          if (!verdict.ok) {
+            refuse(verdict);
+            return;
+          }
+        }
         const nowMs = now();
         const admission = admitReservation(state, {
           renter: body.renter,
@@ -180,7 +272,27 @@ export function createReservationHandler({
           writeJson(response, 400, { error: "unknown listing" });
           return;
         }
+        if (policy.requireRenterBalance) {
+          const requiredWei = quoteFundingWei(quote);
+          if (requiredWei === null) {
+            writeJson(response, 400, { error: "quote setupGasWei, hubGasWei and operatingGasWei are required" });
+            return;
+          }
+          const verdict = await checkRenterBalance(admission.renter, requiredWei);
+          if (!verdict.ok) {
+            if (verdict.code === "INSUFFICIENT_BALANCE" && !reservation.attestedDigest && !isReleasedReservation(reservation)) {
+              // Nothing was signed: this reservation must not keep holding the
+              // listing (or start a cooldown) for an unfunded wallet.
+              reservation.releasedAt = now();
+              reservation.releaseReason = "insufficient-balance";
+              saveReservations();
+            }
+            refuse(verdict);
+            return;
+          }
+        }
         const digest = await quoteDigest(quote);
+        if (isReleasedReservation(reservation)) throw new Error("operator reservation was released during attestation");
         bindOperatorReservationQuote(state, nonce, quote.operator, digest);
         const deadline = Number(quote.deadline);
         if (Number.isSafeInteger(deadline) && deadline > 0) reservation.quoteDeadline = deadline;

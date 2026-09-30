@@ -12,7 +12,8 @@
  *     (OPERATOR_TX_PRICING=eip1559 default: maxFeePerGas), the 10% unused-gas
  *     charge, and the exit reserve (EXIT_RESERVE_ACTIONS) with its stop and
  *     resume triggers (THR-03);
- *   - the reservation caps, the 429 scopes and the allowlist parsing rules.
+ *   - the reservation caps, the 429 scopes, the open-rental (Sybil) guards and
+ *     the release route, and the allowlist parsing rules.
  *
  * `node renter-pod-lease-policy.mjs` prints leasePolicySnapshot() as JSON; the committed
  * renter-pod-lease-policy.json is that output (a test fails when they drift). Web and ops
@@ -202,15 +203,50 @@ export function leasePolicySnapshot() {
       maxReservationsPerRenter: HARDENING_DEFAULTS.MAX_RESERVATIONS_PER_RENTER,
       maxReservationsPerListing: HARDENING_DEFAULTS.MAX_RESERVATIONS_PER_LISTING,
       reservationTtlSec: HARDENING_DEFAULTS.RESERVATION_TTL_SEC,
-      reserveBody: "{ market, factory, nonce, renter, tokenIndex }  (tokenIndex optional but should be sent)",
-      attestBody: "{ market, factory, quote }  (quote.renter and quote.tokenIndex required)",
-      refusal429Body: "{ error, code: LEASE_CAP | RESERVATION_CAP, scope }",
+      reserveBody:
+        "{ market, factory, nonce, renter, tokenIndex, fundingWei }  (tokenIndex optional but should be sent; "
+        + "fundingWei optional decimal string = setupGasWei + hubGasWei + operatingGasWei of the priced quote, should be sent)",
+      attestBody:
+        "{ market, factory, quote }  (quote.renter and quote.tokenIndex required; with requireRenterBalance "
+        + "quote.setupGasWei, hubGasWei and operatingGasWei are required)",
+      releasePath: "/v1/operator-reservations/release",
+      releaseBody: "{ market, factory, nonce, renter }  -> 200 { released: boolean }; idempotent; answered even while the worker is stale or halted",
+      releaseRule:
+        "send when the renter closes or cancels checkout or the wallet rejects the tx: the reservation stops blocking "
+        + "the listing and the renter's open-checkout count and never starts a cooldown; an attested quote still counts "
+        + "toward the lease caps until its deadline (it can still be submitted)",
+      refusal429Body: "{ error, code: LEASE_CAP | RESERVATION_CAP | LISTING_COOLDOWN, scope }",
       refusalScopes: {
-        [RefusalScope.RESERVATION]: "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts",
+        [RefusalScope.RESERVATION]:
+          "RESERVATION_CAP: this wallet has maxReservationsPerRenter open checkouts, or started "
+          + "maxReservationAttemptsPerRenter reservations within reservationTtlSec",
         [RefusalScope.RENTER]: "RESERVATION_CAP: this wallet holds maxActiveLeasesPerRenter leases (active + in checkout)",
-        [RefusalScope.LEASE]: "RESERVATION_CAP: this listing has maxReservationsPerListing open checkouts",
+        [RefusalScope.LEASE]:
+          "RESERVATION_CAP: another renter holds this listing's open checkout (listingSingleCheckout) or the listing has "
+          + "maxReservationsPerListing open checkouts; LISTING_COOLDOWN: this wallet's last checkout for this listing expired "
+          + "unused less than listingReserveCooldownSec ago",
         [RefusalScope.MARKET]: "LEASE_CAP: market at maxActiveLeases; RESERVATION_CAP: maxLiveReservations checkouts in flight",
       },
+      retryAfterRule:
+        "scope lease refusals from listingSingleCheckout and LISTING_COOLDOWN carry a Retry-After header (seconds until "
+        + "the other checkout stops holding / the cooldown ends); every 503 carries Retry-After: 60",
+      // Open-rental (Sybil quote-spam) guards, all on by default.
+      requireRenterBalance: HARDENING_DEFAULTS.REQUIRE_RENTER_BALANCE,
+      renterBalanceRule:
+        "attest: renter ETH balance (latest block) >= quote setupGasWei + hubGasWei + operatingGasWei; reserve: >= fundingWei "
+        + "when sent. RPC failure fails closed (503 BALANCE_UNAVAILABLE). An INSUFFICIENT_BALANCE attest releases the "
+        + "unattested reservation.",
+      insufficientBalanceBody: "403 { error, code: INSUFFICIENT_BALANCE, scope: renter, requiredWei }",
+      balanceUnavailableBody: "503 { error, code: BALANCE_UNAVAILABLE }",
+      listingSingleCheckout: HARDENING_DEFAULTS.LISTING_SINGLE_CHECKOUT,
+      listingSingleCheckoutRule:
+        "at reserve (tokenIndex sent): refused when ANOTHER renter holds an open checkout for the listing: not released, and "
+        + "unattested inside reservationTtlSec or attested with its quote deadline ahead; the same renter may re-quote",
+      listingReserveCooldownSec: HARDENING_DEFAULTS.LISTING_RESERVE_COOLDOWN_SEC,
+      listingReserveCooldownRule:
+        "at reserve (tokenIndex sent): after one of this renter's checkouts for the listing stopped holding (TTL / quote "
+        + "deadline) without a pod and without a release, the renter cannot reserve that listing for listingReserveCooldownSec",
+      maxReservationAttemptsPerRenter: HARDENING_DEFAULTS.MAX_RESERVATION_ATTEMPTS_PER_RENTER,
     },
     renterAllowlist: {
       rules: [

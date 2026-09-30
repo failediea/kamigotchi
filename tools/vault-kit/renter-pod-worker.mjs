@@ -32,7 +32,10 @@
  *   state file), WORKER_HALT_FILE (default HALT next to the state file; while
  *   it exists the reservation server answers 503), MAX_RESERVATIONS_PER_LISTING,
  *   LOG_CHUNK_BLOCKS, LOG_CHUNKS_PER_TICK, OPERATOR_TX_PRICING (eip1559|legacy),
- *   RETIRED_JOB_RETENTION_DAYS.
+ *   RETIRED_JOB_RETENTION_DAYS, ALLOW_OPEN_RENTALS.
+ * Open-rental (Sybil quote-spam) guards, all on by default:
+ *   REQUIRE_RENTER_BALANCE, LISTING_SINGLE_CHECKOUT,
+ *   LISTING_RESERVE_COOLDOWN_SEC, MAX_RESERVATION_ATTEMPTS_PER_RENTER.
  * Lease safety (THR-02/03/10; defaults in renter-pod-config.mjs):
  *   PREFS_FLOOR, PREFS_FLOOR_HP_LOW_MIN, PREFS_FLOOR_FARM_INTERVAL_MAX_SEC,
  *   PREFS_FLOOR_SAFETY_MARGIN_MIN, PREFS_FLOOR_FEED_PERCENT_MIN,
@@ -329,6 +332,9 @@ function startReservationServer() {
       saveReservations,
       alert: leaseAlert,
       listingExists: async (tokenIndex) => (await market.listings(tokenIndex)).owner !== ZeroAddress,
+      // REQUIRE_RENTER_BALANCE: read on this worker's RPC (with its timeout);
+      // a failure refuses the request (503), never admits it.
+      renterBalance: (renter) => provider.getBalance(renter),
     })
   );
   server.requestTimeout = 5_000;
@@ -971,6 +977,7 @@ function pruneExpiredReservations() {
     ttlMs: HARDENING.reservationTtlMs,
     ingestedThroughSec: state.ingestedThroughSec,
     protectedNonces: protectedReservationNonces(state),
+    cooldownMs: HARDENING.listingReserveCooldownMs,
   });
   if (removed) saveReservations();
   // Superseded pods that finished returning are kept for the retention window
@@ -1061,21 +1068,31 @@ console.log(
     + `operatorTxPricing=${HARDENING.operatorTxPricing}, `
     + `maxActiveLeasesPerRenter=${HARDENING.maxActiveLeasesPerRenter}`
 );
+console.log(
+  `open-rental guards: requireRenterBalance=${HARDENING.requireRenterBalance ? "on" : "off"}, `
+    + `listingSingleCheckout=${HARDENING.listingSingleCheckout ? "on" : "off"}, `
+    + `listingReserveCooldownSec=${HARDENING.listingReserveCooldownMs / 1000 || "off"}, `
+    + `maxReservationAttemptsPerRenter=${HARDENING.maxReservationAttemptsPerRenter}`
+);
 if (!HARDENING.renterAllowlist) {
   const acknowledged = /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_OPEN_RENTALS ?? "").trim());
-  const banner = "!".repeat(78);
-  for (const line of [
-    banner,
-    "WARNING: RENTER_ALLOWLIST is NOT SET - this worker runs OPEN RENTALS.",
-    "The keeper attests quotes for ANY renter the quote API sends (403 private-beta is off).",
-    "The soft launch requires RENTER_ALLOWLIST=0x..,0x.. (the same list as the web's",
-    "LEASE_RENTER_ALLOWLIST) in this .env, then a restart.",
-    acknowledged
-      ? "ALLOW_OPEN_RENTALS is set: open rentals were chosen explicitly."
-      : "ALLOW_OPEN_RENTALS is not set: open rentals were NOT acknowledged.",
-    banner,
-  ]) {
-    console.warn(line);
+  if (acknowledged) {
+    // The intended public launch: one plain line, no alarm.
+    console.log("open rentals: ALLOW_OPEN_RENTALS is set and RENTER_ALLOWLIST is empty (public launch)");
+  } else {
+    const banner = "!".repeat(78);
+    for (const line of [
+      banner,
+      "WARNING: RENTER_ALLOWLIST is NOT SET - this worker runs OPEN RENTALS.",
+      "The keeper attests quotes for ANY renter the quote API sends.",
+      "For a public launch set ALLOW_OPEN_RENTALS=true in this .env to confirm it;",
+      "to restrict renters set RENTER_ALLOWLIST=0x..,0x.. (the same list as the web's",
+      "LEASE_RENTER_ALLOWLIST). Then restart.",
+      "ALLOW_OPEN_RENTALS is not set: open rentals were NOT acknowledged.",
+      banner,
+    ]) {
+      console.warn(line);
+    }
   }
 }
 const FLOOR = HARDENING.prefsFloor;
