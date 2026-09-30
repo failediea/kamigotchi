@@ -22,10 +22,24 @@
 #   C1  any listing on the market has factory stage in {1,2,4,5,6,7,8}, or is leased
 #       and ending, even if the worker has not ingested it yet;
 #   C2  any leased listing (renter != 0) has no non-returned job in the worker state;
-#   R1  a reservation bound to a signed quote (attestedDigest set) may still be turned
+#   R1  a quote bound to a keeper signature (attestedDigest set) may still be turned
 #       into a create tx: its quoteDeadline (seconds, recorded at attest) is in the
-#       future, or it is younger than GATE_INFLIGHT_SEC (default RESERVATION_TTL_SEC
-#       + 900 s = 2100 s, the attest window plus the quote lifetime);
+#       future, or (legacy entries without one) it is younger than GATE_INFLIGHT_SEC
+#       (default RESERVATION_TTL_SEC + 900 s = 2100 s). Where the keys live:
+#         R1-legacy  reservations embedded in the state file (the pre-hardening worker,
+#                    which may not have made them durable): always REFUSE;
+#         R1-store   the quote key store of the patched worker, <state>.reservations.json
+#                    (snapshot) + <state>.reservations.journal (append-only), replayed
+#                    exactly like renter-pod-quote-store.mjs readQuoteStore() (torn last
+#                    line ignored, a journal older than its snapshot ignored, a journal
+#                    ahead of its snapshot merged). Every key is fsync'd before its quote
+#                    is signed and the store is reloaded at start, so for a FORWARD
+#                    restart (the market dir runs code with renter-pod-quote-store.mjs)
+#                    in-flight quotes are reported, not refused: an open market always
+#                    has some. With --for-rollback they REFUSE, unless
+#                    --target-reads-store (the rollback target has that module too): a
+#                    pre-change worker never reads the store, so it must not take over
+#                    before HALT + drain (deploy-worker-patch.sh --rollback <ts> --drain);
 #   T1  the worker state records a transaction still in flight (tx tracker keys
 #       txs / pendingTxs / inflightTxs with a pending-like status). Entries with a hash
 #       are resolved over RPC first: mined or unknown to the node (dropped) do not
@@ -38,16 +52,21 @@
 # RPC: the market's worker .env YOMINET_RPC (the node the worker sends through; the
 # value is never printed), else YOMINET_RPC_PUBLIC, else the public Yominet RPC.
 #
-# Usage: lease-transition-gate.sh [--market musu|vipp]... (default both)
+# Usage: lease-transition-gate.sh [--market musu|vipp]... [--for-rollback [--target-reads-store]]
+#        (default both markets, forward restart)
 { # one block: safe to pipe into `bash -s`
 set -euo pipefail
 
 MARKETS_ARG=""
+FOR_ROLLBACK=0
+TARGET_READS_STORE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --market) MARKETS_ARG="$MARKETS_ARG ${2:?}"; shift ;;
+    --for-rollback) FOR_ROLLBACK=1 ;;
+    --target-reads-store) TARGET_READS_STORE=1 ;;
     --dry-run) ;; # always read-only
-    -h|--help) sed -n '2,46p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,56p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -83,11 +102,12 @@ u32word() { printf '%064x' "$1"; }
 lc() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
 addr_word() { printf '0x%s' "$(word "$1" "$2" | cut -c25-64)"; }
 market_addr() { if [ "$1" = musu ]; then printf '%s' "$MUSU_MARKET"; else printf '%s' "$VIPP_MARKET"; fi; }
-# .env value the way the worker loader reads it: first non-empty KEY= line wins,
-# trimmed, one pair of matching surrounding quotes stripped. Never printed.
+# .env value the way the worker loader reads it (renter-pod-config.mjs parseEnvText +
+# loadEnvFile): optional "export ", LAST KEY= line wins, trimmed, one pair of matching
+# surrounding quotes stripped; an empty last value means unset. Never printed.
 env_value() { # dir KEY
   [ -r "$1/.env" ] || return 0
-  tr -d '\r' < "$1/.env" | sed -nE "s/^$2=(.+)\$/\\1/p" | head -1 \
+  tr -d '\r' < "$1/.env" | sed -nE "s/^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=(.*)\$/\\2/p" | tail -1 \
     | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
 }
 state_file_for() {
@@ -112,6 +132,61 @@ tx_status() { # hash -> mined | dropped | inflight | unknown (over the market's 
   if ! result_is_null "$raw"; then echo mined; return; fi
   raw=$(rpc_raw eth_getTransactionByHash "[\"$1\"]") || { echo unknown; return; }
   if result_is_null "$raw"; then echo dropped; else echo inflight; fi
+}
+
+# R1: a snapshot (or state file) + journal records -> "entries inflight replayed stale ahead".
+# Mirrors renter-pod-quote-store.mjs readQuoteStore() + mergeReservationEntry(): a
+# journal with an older generation than its snapshot is ignored (already folded in),
+# an equal one is replayed last-put-wins, a newer one (or one without a snapshot) is
+# merged so no keeper binding is lost; a record that is neither put nor del, an
+# unknown header or two operators for one nonce is an error (-> UNDECIDED).
+R1_JQ='
+def mergeEntry($a; $b):
+  if $a == null then $b elif $b == null then $a
+  elif (($a.operator // "" | tostring | ascii_downcase) != ($b.operator // "" | tostring | ascii_downcase)) then error("two operators for one nonce")
+  else ($a + $b)
+    | (if (($a.attestedDigest // "") != "") and (($b.attestedDigest // "") == "") then .attestedDigest = $a.attestedDigest else . end)
+    | ([$a.quoteDeadline, $b.quoteDeadline] | map((tonumber? // 0)) | map(select(. > 0))) as $d
+    | (if ($d | length) > 0 then .quoteDeadline = ($d | max) else . end)
+  end;
+($snap[0] // null) as $s
+| (if $s == null then {}
+   elif ($s | type) != "object" then error("snapshot is not an object")
+   elif $isState then ($s.reservations // {})
+   elif ($s | has("reservations")) then $s.reservations
+   else $s end) as $base0
+| (if ($base0 | type) != "object" then error("no reservations map") else ($base0 | with_entries(.key |= ascii_downcase)) end) as $base
+| (if ($s | type) == "object" and (($s.generation | type) == "number") and $s.generation >= 0 then $s.generation else 0 end) as $sg
+| (if ($j | length) == 0 then {res: $base, replayed: 0, stale: 0, ahead: 0}
+   else ($j[0]) as $h
+   | (if ($h | type) != "object" or $h.journal != 1 or (($h.generation | type) != "number") then error("unknown journal header") else . end)
+   | if $s != null and $h.generation < $sg then {res: $base, replayed: 0, stale: 1, ahead: 0}
+     else (if $s == null then (($j | length) > 1) else ($h.generation > $sg) end) as $ahead
+     | {res: (reduce $j[1:][] as $r ($base;
+           if ($r | type) == "object" and ($r.put | type) == "string" and ($r.r | type) == "object" then
+             ($r.put | ascii_downcase) as $k | .[$k] = (if $ahead then mergeEntry(.[$k]; $r.r) else $r.r end)
+           elif ($r | type) == "object" and ($r.del | type) == "string" then del(.[$r.del | ascii_downcase])
+           else error("journal record is not a put or del") end)),
+        replayed: (($j | length) - 1), stale: 0, ahead: (if $ahead then 1 else 0 end)}
+     end
+   end)
+| . as $o
+| ([ $o.res | to_entries[] | .value | select(type == "object")
+     | select((.attestedDigest // "") != "")
+     | select((((.quoteDeadline // 0) | tonumber) > $now)
+              or ((($now * 1000) - ((.createdAt // 0) | tonumber)) < ($win * 1000))) ] | length) as $c
+| "\($o.res | length) \($c) \($o.replayed) \($o.stale) \($o.ahead)"
+'
+r1_replay() { # snapshot_path journal_path is_state -> "entries inflight replayed stale ahead"
+  # journal_path must hold COMPLETE lines only (see complete_lines)
+  jq -rn --argjson now "$NOW" --argjson win "$win" --argjson isState "$3" \
+    --slurpfile snap "$1" --slurpfile j "$2" "$R1_JQ"
+}
+complete_lines() { # file -> every newline-terminated line (a torn last append is dropped)
+  local n
+  n=$(wc -l < "$1")
+  [ "$n" -gt 0 ] || return 0
+  head -n "$n" "$1"
 }
 
 command -v jq >/dev/null || { log "jq missing"; exit 1; }
@@ -204,27 +279,63 @@ for m in $MARKETS; do
   done
   log "[$m] $n listing(s) checked on chain"
 
-  # --- R1: bound reservations (legacy: inside the state file; patched worker: *reservations*.json) ---
-  inflight=0
-  for rf in STATE "$(dirname "$sf")"/*reservations*.json; do
-    if [ "$rf" = STATE ]; then rjson=$STATE_JSON; else [ -e "$rf" ] || continue; rjson=$(cat "$rf" 2>/dev/null) || { undecided "[$m] cannot read $rf"; continue; }; fi
-    # in flight = bound AND (quoteDeadline still ahead OR created inside the window)
-    c=$(jq -e --argjson now "$NOW" --argjson win "$win" '
-      (if has("reservations") then .reservations else . end) as $r
-      | if ($r|type) == "object" then
-          [ $r | to_entries[] | .value | select(type == "object")
-            | select((.attestedDigest // "") != "")
-            | select((((.quoteDeadline // 0) | tonumber) > $now)
-                     or ((($now * 1000) - ((.createdAt // 0) | tonumber)) < ($win * 1000))) ] | length
-        else 0 end' <<<"$rjson" 2>/dev/null) || c=""
-    if ! [[ "$c" =~ ^[0-9]+$ ]]; then
-      undecided "[$m] R1 cannot parse reservations in $( [ "$rf" = STATE ] && echo "the state file" || basename "$rf")"
+  # --- R1: signed quotes that can still become pods ---
+  # R1-legacy: reservations embedded in the state file (pre-hardening worker)
+  leg=$(r1_replay <(printf '%s' "$STATE_JSON") /dev/null true 2>/dev/null) || leg=""
+  if ! [[ "$leg" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+    undecided "[$m] R1 cannot parse reservations in the state file"
+  else
+    read -r _ c _ _ _ <<<"$leg"
+    [ "$c" = 0 ] || refuse "[$m] R1-legacy $c reservation(s) in the state file bound to a signed quote whose quoteDeadline is ahead or created in the last ${win}s (checkout in flight)"
+  fi
+  # R1-store: the quote key store (snapshot + journal), exactly as the worker replays it
+  sdir=$(dirname "$sf")
+  scfg=$(env_value "$dir" RESERVATION_STATE_FILE)
+  if [ -n "$scfg" ]; then case "$scfg" in /*) ;; *) scfg="$dir/$scfg" ;; esac; fi
+  stems=""
+  if [ -n "${LAUNCH_OPS_TEST_STORE_JSON+x}${LAUNCH_OPS_TEST_JOURNAL_TEXT+x}" ]; then
+    stems="@test" # test hook only (tests/run-tests.sh); never set in production
+  else
+    for f in "$sdir"/*reservations*.json "$sdir"/*reservations*.journal ${scfg:+"$scfg"}; do
+      [ -e "$f" ] || continue
+      stem=$(sed -E 's/\.([jJ][sS][oO][nN]|journal)$//' <<<"$f")
+      case " $stems " in *" $stem "*) ;; *) stems="$stems $stem" ;; esac
+    done
+  fi
+  code_reads_store=0
+  [ -f "$dir/renter-pod-quote-store.mjs" ] && code_reads_store=1
+  [ -z "${LAUNCH_OPS_TEST_CODE_READS_STORE:-}" ] || code_reads_store=$LAUNCH_OPS_TEST_CODE_READS_STORE # test hook only
+  store_inflight=0
+  for stem in $stems; do
+    if [ "$stem" = "@test" ]; then
+      sname="test-store"
+      out=$(r1_replay <(printf '%s' "${LAUNCH_OPS_TEST_STORE_JSON:-}") \
+        <(t=${LAUNCH_OPS_TEST_JOURNAL_TEXT:-}; n=$(printf '%s' "$t" | wc -l); [ "$n" = 0 ] || printf '%s' "$t" | head -n "$n") false 2>/dev/null) || out=""
+    else
+      sname=$(basename "$stem")
+      snapf=/dev/null; [ -e "$stem.json" ] && snapf="$stem.json"
+      if [ -e "$stem.journal" ]; then
+        out=$(r1_replay "$snapf" <(complete_lines "$stem.journal") false 2>/dev/null) || out=""
+      else
+        out=$(r1_replay "$snapf" /dev/null false 2>/dev/null) || out=""
+      fi
+    fi
+    if ! [[ "$out" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+      undecided "[$m] R1 cannot parse reservations in the quote store $sname (snapshot/journal)"
       continue
     fi
-    inflight=$((inflight + c))
+    read -r se sc sr sst sah <<<"$out"
+    log "[$m] R1 store $sname: entries=$se inflight=$sc journalRecords=$sr staleJournal=$sst journalAhead=$sah"
+    store_inflight=$((store_inflight + sc))
   done
-  if [ "$inflight" -gt 0 ]; then
-    refuse "[$m] R1 $inflight reservation(s) bound to a signed quote whose quoteDeadline is ahead or created in the last ${win}s (checkout in flight)"
+  if [ "$store_inflight" -gt 0 ]; then
+    if [ "$FOR_ROLLBACK" = 1 ] && [ "$TARGET_READS_STORE" != 1 ]; then
+      refuse "[$m] R1-store $store_inflight signed quote(s) in the quote key store can still become pods and the rollback target does not read that store: HALT + drain first (deploy-worker-patch.sh --rollback <ts> --drain)"
+    elif [ "$FOR_ROLLBACK" != 1 ] && [ "$code_reads_store" != 1 ]; then
+      refuse "[$m] R1-store $store_inflight signed quote(s) in a quote store that the running code does not load (no renter-pod-quote-store.mjs in $dir)"
+    else
+      log "ok [$m] R1-store $store_inflight signed quote(s) in flight; their keys are durable in the store and the $([ "$FOR_ROLLBACK" = 1 ] && echo "rollback target" || echo "restarted worker") reloads it"
+    fi
   fi
 
   # --- T1: tx tracker (patched worker); a record with a hash is resolved over RPC ---

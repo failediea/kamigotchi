@@ -20,6 +20,14 @@
 #              ending past the 2-day grace) and operator gas below the exit reserve
 #              (stages 3-5, and stage 0 while the listing is not re-leased: the
 #              custody return is operator-signed with allowPull=false)
+#   quote-store the patched worker's quote key store (<state>.reservations.json +
+#              .journal: operator keys of quotes in flight): snapshot + journal bytes
+#              > QUOTE_STORE_MAX_MB or heartbeat liveReservations > QUOTE_STORE_MAX_LIVE
+#              (QUOTE_STORE_SIZE), free space on its filesystem < QUOTE_STORE_MIN_FREE_MB
+#              (QUOTE_STORE_DISK: a full disk makes every quote 503), a key file (store,
+#              journal, state file) not mode 600 (QUOTE_STORE_MODE), and the worker's
+#              "operator key store write failed" (KEY_STORE_UNAVAILABLE) / "quote key
+#              store compaction|delete failed" (QUOTE_STORE_COMPACT) journal lines
 #   ingress    lease-musu / lease-vipp answer something other than 404
 #   tls        certificate expires in < TLS_MIN_DAYS days
 #   host       disk use > DISK_MAX_PCT, MemAvailable < MEM_MIN_MB
@@ -50,7 +58,7 @@ while [ $# -gt 0 ]; do
     --apply) MODE="apply" ;;
     --self-test) SELF_TEST=1 ;;
     --notify-failure) FAILED_UNIT="${2:?--notify-failure needs a unit name}"; shift ;;
-    -h|--help) sed -n '2,40p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,48p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -100,11 +108,17 @@ TLS_MIN_DAYS="${TLS_MIN_DAYS:-14}"
 DISK_MAX_PCT="${DISK_MAX_PCT:-85}"
 MEM_MIN_MB="${MEM_MIN_MB:-100}"
 SELF_GAP_SEC="${SELF_GAP_SEC:-1800}"
+# quote key store bounds (OPERATOR-KEY-CUSTODY.md section 7: a 50-IP x 1 h burst peaks at
+# ~9,200 live keys and ~12 MB; the worker bound is < 13,000 keys, snapshot ~5.5 MB)
+QUOTE_STORE_MAX_MB="${QUOTE_STORE_MAX_MB:-32}"
+QUOTE_STORE_MAX_LIVE="${QUOTE_STORE_MAX_LIVE:-15000}"
+QUOTE_STORE_MIN_FREE_MB="${QUOTE_STORE_MIN_FREE_MB:-256}"
 NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
 
 for knob in RPC_TIMEOUT_SEC ERR_THRESHOLD COOLDOWN_SECS HEARTBEAT_STALE_SEC TICK_FAIL_RUNS JOB_ERROR_RUNS \
     KEEPER_MIN_WEI FEE_FLOAT_MIN_CLAIMS PREPARING_MAX_SEC EXPIRED_UNENDED_MAX_SEC EXIT_RESERVE_ACTIONS \
-    OPERATOR_ACTION_GAS_FLOOR TLS_MIN_DAYS DISK_MAX_PCT MEM_MIN_MB SELF_GAP_SEC; do
+    OPERATOR_ACTION_GAS_FLOOR TLS_MIN_DAYS DISK_MAX_PCT MEM_MIN_MB SELF_GAP_SEC \
+    QUOTE_STORE_MAX_MB QUOTE_STORE_MAX_LIVE QUOTE_STORE_MIN_FREE_MB; do
   [[ "${!knob}" =~ ^[0-9]+$ ]] || { echo "worker-alerts-v2: $knob must be a non-negative integer without quotes (got '${!knob}')" >&2; exit 2; }
 done
 case "$OPERATOR_TX_PRICING" in eip1559|legacy) ;; *) echo "worker-alerts-v2: OPERATOR_TX_PRICING must be eip1559 or legacy" >&2; exit 2 ;; esac
@@ -244,7 +258,7 @@ done
 # Per-lease codes are keyed per (unit, code, token): a DEAD_KAMI for token B within
 # the cooldown of one for token A is a NEW condition and is pushed. Other codes (and
 # per-lease lines without token=) keep one key per (unit, code).
-PER_LEASE_CODES="${PER_LEASE_CODES:-DEAD_KAMI ESCROW_LOW EXIT_RESERVE_STOP STAGE_STUCK TX_TIMEOUT}"
+PER_LEASE_CODES="${PER_LEASE_CODES:-DEAD_KAMI ESCROW_LOW EXIT_RESERVE_STOP STAGE_STUCK TX_TIMEOUT OPERATOR_MISMATCH}"
 lease_alert_scan() { # unit lines -> one notify per distinct [LEASE-ALERT] code (per token for per-lease codes)
   local unit="$1" la codes code lines toks tok tlines cnt last prio key
   la=$(grep -F '[LEASE-ALERT]' <<<"$2" || true)
@@ -308,6 +322,19 @@ for s in $LEGACY_UNITS $V16_UNITS; do
   # structured [LEASE-ALERT] lines: any line alerts, one push per code
   lease_alert_scan "$s" "$lines"
 
+  # quote key store failures (patched worker): a failed fsync'd append means that
+  # quote was answered 503 KEY_STORE_UNAVAILABLE (no address, no signature)
+  ks=$(grep -F 'operator key store write failed' <<<"$lines" || true)
+  if [ -n "$ks" ]; then
+    notify "keystore-$s" "quote keys not durable: $s" \
+      "[LEASE-ALERT] KEY_STORE_UNAVAILABLE unit=$s lines=$(grep -c . <<<"$ks") quotes are refused with 503 until the store is writable (disk full? file mode/owner?). Last: $(tail -1 <<<"$ks" | cut -c1-160)" high
+  fi
+  kc=$(grep -E 'quote key store (compaction|delete) failed' <<<"$lines" || true)
+  if [ -n "$kc" ]; then
+    notify "keycompact-$s" "quote key store maintenance failing: $s" \
+      "[LEASE-ALERT] QUOTE_STORE_COMPACT unit=$s lines=$(grep -c . <<<"$kc") (the journal keeps every key; it grows until compaction works). Last: $(tail -1 <<<"$kc" | cut -c1-160)"
+  fi
+
   # wedge messages the baseline grep never matched (VPS-2 / THR-06)
   stuck=$(grep -E "$STUCK_PATTERN" <<<"$lines" | grep -vF '[LEASE-ALERT]' || true)
   if [ -n "$stuck" ]; then
@@ -364,6 +391,16 @@ state_file_for() { # market dir -> absolute state file path (reads only WORKER_S
     v=$(grep -E '^WORKER_STATE_FILE=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^ +| +$//g' || true)
   fi
   [ -n "$v" ] || v="$dir/renter-pod-worker-state.json"
+  case "$v" in /*) ;; *) v="$dir/$v" ;; esac
+  printf '%s' "$v"
+}
+store_file_for() { # market dir, state file -> quote key store snapshot (RESERVATION_STATE_FILE or the default)
+  local dir="$1" sf="$2" v=""
+  if [ -r "$dir/.env" ]; then
+    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?RESERVATION_STATE_FILE[[:space:]]*=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '\r' \
+      | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
+  fi
+  [ -n "$v" ] || v="$(dirname "$sf")/$(basename "$sf" .json).reservations.json"
   case "$v" in /*) ;; *) v="$dir/$v" ;; esac
   printf '%s' "$v"
 }
@@ -443,6 +480,41 @@ for m in $V16_MARKETS; do
       fi
     fi
   fi
+
+  # quote key store: size, free space, key-file modes (never reads the contents)
+  store=$(store_file_for "$dir" "$sf")
+  journal="$(dirname "$store")/$(basename "$store" | sed -E 's/\.[jJ][sS][oO][nN]$//').journal"
+  qbytes=0; qdetail=""
+  for f in "$store" "$journal"; do
+    [ -f "$f" ] || continue
+    b=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    qbytes=$((qbytes + b)); qdetail="$qdetail $(basename "$f")=${b}B"
+  done
+  live=""
+  [ -r "$hb" ] && live=$(hb_field "$hb" liveReservations)
+  [[ "$live" =~ ^[0-9]+$ ]] || live=""
+  log "quote store $m: bytes=$qbytes${qdetail:+ (${qdetail# })} liveReservations=${live:-?}"
+  if [ "$qbytes" -gt $((QUOTE_STORE_MAX_MB * 1048576)) ] || { [ -n "$live" ] && [ "$live" -gt "$QUOTE_STORE_MAX_LIVE" ]; }; then
+    notify "qstore-size-$m" "quote key store large ($m)" \
+      "[LEASE-ALERT] QUOTE_STORE_SIZE market=$m bytes=$qbytes limitMB=$QUOTE_STORE_MAX_MB liveReservations=${live:-?} limitLive=$QUOTE_STORE_MAX_LIVE (a quote burst beyond the web limits, or pruning stuck: is ingest advancing?)" high
+  fi
+  qdir=$(dirname "$store")
+  if [ -d "$qdir" ]; then
+    free_mb=$(df -Pk "$qdir" 2>/dev/null | awk 'NR==2{print int($4/1024)}')
+    if [[ "$free_mb" =~ ^[0-9]+$ ]] && [ "$free_mb" -lt "$QUOTE_STORE_MIN_FREE_MB" ]; then
+      notify "qstore-disk-$m" "quote key store disk low ($m)" \
+        "[LEASE-ALERT] QUOTE_STORE_DISK market=$m freeMB=$free_mb min=$QUOTE_STORE_MIN_FREE_MB: when an fsync'd append fails every quote answers 503 KEY_STORE_UNAVAILABLE" high
+    fi
+  fi
+  for f in "$store" "$journal" "$sf"; do
+    [ -f "$f" ] || continue
+    mode=$(stat -c %a "$f" 2>/dev/null || echo 0)
+    [[ "$mode" =~ ^[0-7]+$ ]] || continue
+    if [ $(( 8#$mode & 8#077 )) -ne 0 ]; then
+      notify "qstore-mode-$m-$(basename "$f")" "key file readable by others ($m)" \
+        "[LEASE-ALERT] QUOTE_STORE_MODE market=$m file=$(basename "$f") mode=$mode (holds operator keys: chmod 600)" high
+    fi
+  done
 
   [ -r "$sf" ] && [ "$HAVE_JQ" = 1 ] || continue
   # job.error that persists across runs (VPS-2). Only tokenIndex + error text leave the file.

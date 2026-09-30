@@ -61,6 +61,8 @@ case "$1" in
       if [ "${FAKE_WORKER_HB:-0}" = 1 ]; then
         printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 0, "liveReservations": 0, "tickMs": 5}\n' "$(date +%s)" > "$d/heartbeat.json"
       fi
+      # what the started worker does on its own (e.g. sign a quote), once per start
+      [ -z "${FAKE_ON_START:-}" ] || bash -c "$FAKE_ON_START"
     fi ;;
   *) exit 0 ;;
 esac
@@ -119,8 +121,9 @@ EOF
 # The fixture carries a fake operator key to prove it is never printed. The field
 # name is spliced in at runtime so the repo's staged-secrets hook does not flag it.
 sed -i 's/"__OPKEY__"/"operator''Key"/' "$K/vault-kit-v16-musu/renter-pod-worker-state.json"
+chmod 600 "$K/vault-kit-v16-musu/renter-pod-worker-state.json"
 printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 1, "liveReservations": 0, "tickMs": 900}\n' $((NOW - 900)) > "$K/vault-kit-v16-musu/heartbeat.json"
-echo '{"lastBlock":1,"jobs":{},"reservations":{}}' > "$K/vault-kit-v16-vipp/renter-pod-worker-state.json"
+echo '{"lastBlock":1,"jobs":{},"reservations":{}}' > "$K/vault-kit-v16-vipp/renter-pod-worker-state.json" && chmod 600 "$K/vault-kit-v16-vipp/renter-pod-worker-state.json"
 printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 0, "liveReservations": 0, "tickMs": 700}\n' "$NOW" > "$K/vault-kit-v16-vipp/heartbeat.json"
 cat > "$T/journal/kami-renter-pod-v16-musu" <<'EOF'
 2026-09-29T08:00:00+00:00 host kami-renter-pod-v16-musu[1]: [LEASE-ALERT] DEAD_KAMI token=999 kami=123 state=DEAD
@@ -214,14 +217,53 @@ rc=0; OPERATOR_ACTION_GAS_FLOOR='"1700000"' "$OPS/alerts/worker-alerts-v2.sh" --
 expect_rc "$rc" 2 "a quoted numeric knob is a clear startup error"
 expect_grep "$T/run7.out" "OPERATOR_ACTION_GAS_FLOOR must be a non-negative integer" "the malformed knob is named"
 
+
+echo "== alerts v2: quote key store (size, disk, key-file mode) + new worker alert codes"
+QK="$T/qkami"; QD="$QK/vault-kit-v16-vipp"; mkdir -p "$QD"
+echo '{"lastBlock":1,"jobs":{}}' > "$QD/renter-pod-worker-state.json"; chmod 600 "$QD/renter-pod-worker-state.json"
+printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 0, "liveReservations": 20000, "tickMs": 5}\n' "$NOW" > "$QD/heartbeat.json"
+printf '{"version":1,"generation":1,"reservations":{}}' > "$QD/renter-pod-worker-state.reservations.json"; chmod 600 "$QD/renter-pod-worker-state.reservations.json"
+printf '{"journal":1,"generation":1}\n' > "$QD/renter-pod-worker-state.reservations.journal"; chmod 644 "$QD/renter-pod-worker-state.reservations.journal"
+cat > "$T/journal/kami-renter-pod-v16-vipp-q" <<'JEOF'
+2026-09-29T09:00:00+00:00 host w[1]: operator key store write failed: ENOSPC: no space left on device, write
+2026-09-29T09:00:01+00:00 host w[1]: quote key store compaction failed (will retry): ENOSPC
+2026-09-29T09:00:02+00:00 host w[1]: [LEASE-ALERT] OPERATOR_MISMATCH token=77 nonce=0x00000000000000 event=0xev:1 attempts=1 reason=missing pod=0xp operator=0xo
+2026-09-29T09:00:03+00:00 host w[1]: [LEASE-ALERT] OPERATOR_MISMATCH token=78 nonce=0x00000000000000 event=0xev:2 attempts=1 reason=mismatch pod=0xp operator=0xo
+JEOF
+cp "$T/journal/kami-renter-pod-v16-vipp" "$T/journal-vipp.bak"; cp "$T/journal/kami-renter-pod-v16-vipp-q" "$T/journal/kami-renter-pod-v16-vipp"
+QA_ENV=(env KAMI_ROOT="$QK" V16_MARKETS=vipp LEGACY_UNITS="" OPS_UNITS="" ALERT_STATE_DIR="$T/qstate" ALERT_PERSIST_DIR="$T/qpersist")
+rc=0; "${QA_ENV[@]}" "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/qa1.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "alerts dry-run with a quote store exits 0"
+expect_grep "$T/qa1.out" "quote store vipp: bytes=" "store size logged (bytes only)"
+expect_grep "$T/qa1.out" "WOULD ALERT [qstore-size-vipp]" "liveReservations above QUOTE_STORE_MAX_LIVE -> QUOTE_STORE_SIZE"
+expect_grep "$T/qa1.out" "WOULD ALERT [qstore-mode-vipp-renter-pod-worker-state.reservations.journal]" "a key file readable by others -> QUOTE_STORE_MODE"
+expect_nogrep "$T/qa1.out" "qstore-mode-vipp-renter-pod-worker-state.json" "mode-600 state file not flagged"
+expect_nogrep "$T/qa1.out" "WOULD ALERT [qstore-disk-vipp]" "enough free space -> no QUOTE_STORE_DISK"
+expect_grep "$T/qa1.out" "WOULD ALERT [keystore-kami-renter-pod-v16-vipp]" "'operator key store write failed' -> KEY_STORE_UNAVAILABLE"
+expect_grep "$T/qa1.out" "KEY_STORE_UNAVAILABLE unit=kami-renter-pod-v16-vipp lines=1" "KEY_STORE_UNAVAILABLE carries the line count"
+expect_grep "$T/qa1.out" "WOULD ALERT [keycompact-kami-renter-pod-v16-vipp]" "compaction failure -> QUOTE_STORE_COMPACT"
+expect_grep "$T/qa1.out" "WOULD ALERT [la-kami-renter-pod-v16-vipp-OPERATOR_MISMATCH-77]" "OPERATOR_MISMATCH keyed per token (77)"
+expect_grep "$T/qa1.out" "WOULD ALERT [la-kami-renter-pod-v16-vipp-OPERATOR_MISMATCH-78]" "OPERATOR_MISMATCH keyed per token (78)"
+printf '{"ts": %s, "lastBlock": 1, "lastTickOk": true, "activeJobs": 0, "liveReservations": 12, "tickMs": 5}\n' "$NOW" > "$QD/heartbeat.json"
+chmod 600 "$QD/renter-pod-worker-state.reservations.journal"
+rc=0; QUOTE_STORE_MAX_MB=0 QUOTE_STORE_MIN_FREE_MB=999999999 "${QA_ENV[@]}" "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/qa2.out" 2>&1 || rc=$?
+expect_grep "$T/qa2.out" "QUOTE_STORE_SIZE market=vipp bytes=" "store bytes above QUOTE_STORE_MAX_MB -> QUOTE_STORE_SIZE"
+expect_grep "$T/qa2.out" "WOULD ALERT [qstore-disk-vipp]" "free space below QUOTE_STORE_MIN_FREE_MB -> QUOTE_STORE_DISK"
+expect_nogrep "$T/qa2.out" "qstore-mode-" "all key files 600 -> no QUOTE_STORE_MODE"
+rc=0; QUOTE_STORE_MAX_MB='"32"' "${QA_ENV[@]}" "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/qa3.out" 2>&1 || rc=$?
+expect_rc "$rc" 2 "a quoted QUOTE_STORE_MAX_MB is a clear startup error"
+cp "$T/journal-vipp.bak" "$T/journal/kami-renter-pod-v16-vipp"
+
 # run a state-reading script with a fixture: locally (jq), else over ssh (read-only), else skip
+RS_ENV=() # extra NAME=value test-hook env for run_state
 run_state() { # out script state_json args...
-  local out="$1" script="$2" json="$3"; shift 3
+  local out="$1" script="$2" json="$3" pre="" kv; shift 3
   if [ "$HAVE_JQ" = 1 ]; then
-    LAUNCH_OPS_TEST_STATE_JSON="$json" "$OPS/$script" "$@" > "$out" 2>&1
+    env LAUNCH_OPS_TEST_STATE_JSON="$json" "${RS_ENV[@]}" "$OPS/$script" "$@" > "$out" 2>&1
   elif [ -n "$REMOTE" ]; then
+    for kv in "${RS_ENV[@]}"; do pre="$pre ${kv%%=*}=$(printf '%q' "${kv#*=}")"; done
     ssh -o BatchMode=yes -o ConnectTimeout=20 "$REMOTE" \
-      "LAUNCH_OPS_TEST_STATE_JSON=$(printf '%q' "$json") bash -s -- $*" < "$OPS/$script" > "$out" 2>&1
+      "LAUNCH_OPS_TEST_STATE_JSON=$(printf '%q' "$json")$pre bash -s -- $*" < "$OPS/$script" > "$out" 2>&1
   else
     return 99
   fi
@@ -292,7 +334,7 @@ QDPAST=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":
 rc=0; run_state "$T/gate14.out" lease-transition-gate.sh "$QDPAST" --market vipp || rc=$?
 if [ "$rc" = 99 ]; then skip "gate R1 expired quoteDeadline (needs jq or LAUNCH_OPS_TEST_REMOTE)"
 else [ "$rc" = 0 ] && ok "old bound reservation whose quoteDeadline passed -> SAFE" || bad "gate exit $rc (want 0)"; fi
-MID=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab"}}}' 6 $((NOW - 2000)))
+MID=$(printf '{"lastBlock":1,"jobs":{},"reservations":{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab"}}}' 6 $(( $(date +%s) - 2000 ))) # fresh clock: the suite may have run for minutes since NOW
 rc=0; run_state "$T/gate15.out" lease-transition-gate.sh "$MID" --market vipp || rc=$?
 if [ "$rc" = 99 ]; then skip "gate R1 default window (needs jq or LAUNCH_OPS_TEST_REMOTE)"
 else
@@ -321,6 +363,65 @@ else
     expect_grep "$T/gate16.out" "is mined: not in flight" "mined tracked tx resolved over RPC"
     expect_grep "$T/gate16.out" "is dropped: not in flight" "unknown tracked tx resolved as dropped"
   fi
+fi
+# R1-store: the quote key store (snapshot + journal) replayed like readQuoteStore(); the
+# fixtures travel in test-hook env vars, so this also runs read-only over ssh
+N1=0x$(printf '%064d' 11); N2=0x$(printf '%064d' 12); N3=0x$(printf '%064d' 13)
+QOP=0x00000000000000000000000000000000000000c1
+qentry() { printf '{"operator":"%s","renter":"0xr","createdAt":%s000,"attestedDigest":"0xab","quoteDeadline":%s}' "$QOP" "$NOW" "$1"; }
+qsnap() { printf '{"version":1,"generation":%s,"reservations":{%s}}' "$1" "$2"; }
+QHDR='{"journal":1,"generation":1}'
+STORE_EMPTY=$(qsnap 1 "")
+J_LIVE="$QHDR"$'\n'"{\"put\":\"$N1\",\"r\":$(qentry $((NOW + 600)))}"$'\n'
+J_DEL="$J_LIVE{\"del\":\"$N1\"}"$'\n'
+J_TORN="$QHDR"$'\n'"{\"put\":\"$N2\",\"r\":$(qentry $((NOW + 600)))"
+J_STALE='{"journal":1,"generation":2}'$'\n'"{\"put\":\"$N3\",\"r\":$(qentry $((NOW + 600)))}"$'\n'
+S10=$(qsnap 1 "\"$N1\":$(qentry $((NOW + 900)))")
+UNSIGNED=$(qentry $((NOW - 3000)) | sed 's/"attestedDigest":"0xab",//')
+J10="$QHDR"$'\n'"{\"put\":\"$N1\",\"r\":$UNSIGNED}"$'\n'
+J11='{"journal":1,"generation":2}'$'\n'"{\"put\":\"$N1\",\"r\":$UNSIGNED}"$'\n'
+J_BAD="$QHDR"$'\n''{"put":"0x1","r":{"operator":"0x1"'$'\n''{"del":"0x2"}'$'\n'
+gate_store() { # out json_or_- journal gate-args... (hooks: code reads the store)
+  local out="$1" sj="$2" jt="$3"; shift 3
+  RS_ENV=(LAUNCH_OPS_TEST_CODE_READS_STORE="${CODE_READS:-1}" LAUNCH_OPS_TEST_JOURNAL_TEXT="$jt")
+  [ "$sj" = - ] || RS_ENV+=(LAUNCH_OPS_TEST_STORE_JSON="$sj")
+  local rc=0; run_state "$out" lease-transition-gate.sh "$EMPTY" "$@" || rc=$?
+  RS_ENV=()
+  return "$rc"
+}
+rc=0; gate_store "$T/gs1.out" "$STORE_EMPTY" "$J_LIVE" --market vipp || rc=$?
+if [ "$rc" = 99 ]; then skip "gate R1-store (needs jq or LAUNCH_OPS_TEST_REMOTE)"
+else
+  expect_rc "$rc" 0 "forward restart with a live signed quote in the durable store -> SAFE (keys reload)"
+  expect_grep "$T/gs1.out" "R1 store test-store: entries=1 inflight=1 journalRecords=1 staleJournal=0 journalAhead=0" "journal replayed over the snapshot"
+  expect_grep "$T/gs1.out" "ok [vipp] R1-store 1 signed quote(s) in flight" "in-flight store quotes reported"
+  rc=0; gate_store "$T/gs2.out" "$STORE_EMPTY" "$J_LIVE" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 3 "rollback onto a pre-change target with a live store quote -> REFUSE"
+  expect_grep "$T/gs2.out" "R1-store 1 signed quote(s) in the quote key store can still become pods" "R1-store refusal names HALT + drain"
+  expect_grep "$T/gs2.out" "--drain" "refusal points at --drain"
+  rc=0; gate_store "$T/gs3.out" "$STORE_EMPTY" "$J_LIVE" --market vipp --for-rollback --target-reads-store || rc=$?
+  expect_rc "$rc" 0 "rollback onto a target that reads the store -> SAFE"
+  rc=0; CODE_READS=0 gate_store "$T/gs4.out" "$STORE_EMPTY" "$J_LIVE" --market vipp || rc=$?
+  expect_rc "$rc" 3 "live store quote while the running code does not load the store -> REFUSE"
+  rc=0; gate_store "$T/gs5.out" - "$J_LIVE" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 3 "journal without a snapshot (e.g. snapshot moved away) still counts"
+  expect_grep "$T/gs5.out" "entries=1 inflight=1 journalRecords=1 staleJournal=0 journalAhead=1" "journal with no snapshot is merged (journalAhead)"
+  rc=0; gate_store "$T/gs6.out" "$STORE_EMPTY" "$J_DEL" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 0 "put then del (claimed or pruned key) -> nothing in flight"
+  expect_grep "$T/gs6.out" "entries=0 inflight=0 journalRecords=2" "del replayed"
+  rc=0; gate_store "$T/gs7.out" "$STORE_EMPTY" "$J_TORN" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 0 "torn last journal line (never acknowledged) is ignored"
+  expect_grep "$T/gs7.out" "entries=0 inflight=0 journalRecords=0" "torn tail dropped, header kept"
+  rc=0; gate_store "$T/gs8.out" "$(qsnap 3 "")" "$J_STALE" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 0 "journal older than its snapshot (crash mid-compaction) is ignored"
+  expect_grep "$T/gs8.out" "staleJournal=1" "stale journal reported"
+  rc=0; gate_store "$T/gs9.out" "$STORE_EMPTY" "$J_BAD" --market vipp || rc=$?
+  expect_rc "$rc" 1 "a broken COMPLETE journal line -> UNDECIDED, never 0 found"
+  expect_grep "$T/gs9.out" "R1 cannot parse reservations in the quote store test-store" "store parse failure named"
+  rc=0; gate_store "$T/gs10.out" "$S10" "$J10" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 0 "same-generation journal replaces the entry exactly (last put wins)"
+  rc=0; gate_store "$T/gs11.out" "$S10" "$J11" --market vipp --for-rollback || rc=$?
+  expect_rc "$rc" 3 "journal AHEAD of its snapshot merges: a keeper binding and the later deadline are never lost"
 fi
 if [ "$HAVE_JQ" = 1 ]; then
   printf '{"0x%064d":{"operator":"0x1","createdAt":%s000,"attestedDigest":"0xab"}}\n' 2 "$NOW" \
@@ -591,11 +692,43 @@ echo "// new code" > "$STG/code/renter-pod-worker.mjs"
 echo "// new module" > "$STG/code/renter-pod-tx.mjs"
 ALLOW1=0x00000000000000000000000000000000000000b7
 ALLOW2=0x00000000000000000000000000000000000000A2
+# The worker tree under test (quote-store module, config parser) for the store/guard tests
+WREF="${LAUNCH_OPS_TEST_WORKER_REF:-launch/worker-hardening}"
+TOP=$(git -C "$OPS" rev-parse --show-toplevel 2>/dev/null || true)
+WSTAGE=""
+if [ -n "$TOP" ] && git -C "$TOP" rev-parse --verify -q "$WREF^{commit}" >/dev/null \
+    && bash "$OPS/deploy-worker-patch.sh" --ref "$WREF" --local-stage "$T/wstage" > "$T/wstage.out" 2>&1 \
+    && [ -f "$T/wstage/code/renter-pod-quote-store.mjs" ]; then
+  WSTAGE="$T/wstage/code"
+fi
+if [ -n "$WSTAGE" ] && grep -qs "R1 store test-store" "$T/gs1.out"; then
+  echo "== gate R1-store replay (jq) == the worker's own readQuoteStore() ($WREF)"
+  P_OUT=(gs1 gs5 gs6 gs7 gs8 gs10 gs11)
+  P_SNAP=("$STORE_EMPTY" - "$STORE_EMPTY" "$STORE_EMPTY" "$(qsnap 3 "")" "$S10" "$S10")
+  P_J=("$J_LIVE" "$J_LIVE" "$J_DEL" "$J_TORN" "$J_STALE" "$J10" "$J11")
+  pmis=""
+  for i in "${!P_OUT[@]}"; do
+    pd="$T/parity-$i"; mkdir -p "$pd"
+    [ "${P_SNAP[$i]}" = - ] || printf '%s' "${P_SNAP[$i]}" > "$pd/s.reservations.json"
+    printf '%s' "${P_J[$i]}" > "$pd/s.reservations.journal"
+    want=$(cd "$WSTAGE" && NOW="$NOW" "$NODE" --input-type=module -e '
+      const { readQuoteStore } = await import("./renter-pod-quote-store.mjs");
+      const r = readQuoteStore(process.argv[1]).reservations;
+      const now = Number(process.env.NOW);
+      const c = Object.values(r).filter((e) => e && e.attestedDigest
+        && (Number(e.quoteDeadline || 0) > now || now * 1000 - Number(e.createdAt || 0) < 2100 * 1000)).length;
+      console.log(`entries=${Object.keys(r).length} inflight=${c}`);' "$pd/s.reservations.json" 2>&1)
+    grep -qF "R1 store test-store: $want " "$T/${P_OUT[$i]}.out" || pmis="$pmis [${P_OUT[$i]}: worker $want; gate $(grep -o 'entries=[0-9]* inflight=[0-9]*' "$T/${P_OUT[$i]}.out" | head -1)]"
+  done
+  if [ -z "$pmis" ]; then ok "gate replay equals readQuoteStore on 7 store fixtures (torn tail, stale/ahead journal, del, no snapshot)"; else bad "gate replay differs from readQuoteStore:$pmis"; fi
+else
+  skip "gate/readQuoteStore parity (needs the gate store tests and git ref $WREF)"
+fi
 reset_market() { # pendingTxs_json state_reservations_json [env_body]
   local pend="${1:-}" res="${2:-}" envb="${3-}"
   [ -n "$pend" ] || pend='{}'
   [ -n "$res" ] || res='{}'
-  [ $# -ge 3 ] || envb="SOME_SETTING=1"$'\n'"RENTER_ALLOWLIST=$ALLOW1,$ALLOW2"
+  [ $# -ge 3 ] || envb="SOME_SETTING=1"$'\n'"ALLOW_OPEN_RENTALS=true"
   rm -rf "$MD"; mkdir -p "$MD"
   printf '%s\n' "$envb" > "$MD/.env"; chmod 600 "$MD/.env"
   echo "// old code" > "$MD/renter-pod-worker.mjs"
@@ -607,7 +740,7 @@ reset_market() { # pendingTxs_json state_reservations_json [env_body]
   : > "$T/systemctl.log"
 }
 REMOTE_ENV=(env KAMI_ROOT="$RK" NODE_BIN="$NODE" YOMINET_RPC_PUBLIC="$FAKE_RPC" SYSTEMCTL_LOG="$T/systemctl.log"
-  FAKE_MARKET_DIR="$MD" PENDING_POLL_SEC=1 VERIFY_POLL_SEC=1)
+  FAKE_MARKET_DIR="$MD" PENDING_POLL_SEC=1 VERIFY_POLL_SEC=1 DRAIN_POLL_SEC=1)
 install_args() { echo "--action install --market vipp --staging $STG --backup-dir $T/rk/backups/$1/vault-kit-v16-vipp --verify-sec 1 --require-heartbeat 1 --verify-halt 1 --pending-wait 2"; }
 pending() { printf '{"7":{"hash":"%s","nonce":3,"from":"0x1","label":"endLease","sentAt":1}}' "$1"; }
 
@@ -620,50 +753,159 @@ check "[ ! -e '$MD/HALT' ]" "HALT removed after a passing verify"
 check "[ -f '$T/rk/backups/ok/vault-kit-v16-vipp/renter-pod-worker.mjs' ] && [ ! -e '$T/rk/backups/ok/vault-kit-v16-vipp/.env' ]" "backup holds code files, not .env"
 check "[ \"\$(stat -c %a '$T/rk/backups/ok/vault-kit-v16-vipp/state-snapshot/renter-pod-worker-state.json')\" = 600 ]" "state snapshot is mode 600"
 expect_count "$MD/.env" "MAX_ACTIVE_LEASES_PER_RENTER=2" 1 "install appends MAX_ACTIVE_LEASES_PER_RENTER=2 when absent"
-check "grep -q '^RENTER_ALLOWLIST=' '$MD/.env' && grep -q '^SOME_SETTING=1\$' '$MD/.env' && [ \"\$(stat -c %a '$MD/.env')\" = 600 ]" ".env keeps its lines and mode 600"
-expect_grep "$T/d1.out" "launch guards [vipp]: allowlist=2 renter(s) openRentals=refused" "install logs the launch guards (count only)"
-expect_nogrep "$T/d1.out" "$ALLOW1" "allowlist addresses are never printed"
+check "grep -q '^ALLOW_OPEN_RENTALS=true\$' '$MD/.env' && grep -q '^SOME_SETTING=1\$' '$MD/.env' && [ \"\$(stat -c %a '$MD/.env')\" = 600 ]" ".env keeps its lines and mode 600"
+expect_grep "$T/d1.out" "launch guards [vipp]: rentals=open openAck=env" "install logs the launch guards (open rentals, acknowledged in .env)"
+expect_count "$MD/.env" "ALLOW_OPEN_RENTALS=" 1 "an .env that already acknowledges open rentals gets no second line"
 ls "$MD" | grep -q 'launch-guard-tmp' && bad "env tmp file left behind" || ok "atomic .env append leaves no tmp file"
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args ok2) > "$T/d1b.out" 2>&1 || rc=$?
 expect_count "$MD/.env" "MAX_ACTIVE_LEASES_PER_RENTER=" 1 "re-install does not append the knob twice"
+# the backup now also carries the journal of the quote key store (it holds keys)
+printf '{"journal":1,"generation":1}\n' > "$MD/renter-pod-worker-state.reservations.journal"; chmod 600 "$MD/renter-pod-worker-state.reservations.journal"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args ok3) > "$T/d1c.out" 2>&1 || rc=$?
+check "[ \"\$(stat -c %a '$T/rk/backups/ok3/vault-kit-v16-vipp/state-snapshot/renter-pod-worker-state.reservations.journal' 2>/dev/null)\" = 600 ]" "backup state snapshot includes the store journal (mode 600)"
 
-echo "== worker deploy: launch guards (allowlist fails closed, knobs parse like the worker)"
+echo "== worker deploy: launch guards (open launch; allowlist optional; knobs parse like the worker)"
 guards() { asroot "${REMOTE_ENV[@]}" bash "$OPS/deploy/remote-install-worker-code.sh" --action guards --market vipp "$@"; }
 reset_market "" "" "SOME_SETTING=1"
 rc=0; guards > "$T/g1.out" 2>&1 || rc=$?
-expect_rc "$rc" 8 "no RENTER_ALLOWLIST -> guards refuse (exit 8)"
-expect_grep "$T/g1.out" "RENTER_ALLOWLIST is empty or missing" "refusal explains the allowlist"
+expect_rc "$rc" 8 "no allowlist and open rentals not acknowledged -> guards refuse (exit 8)"
+expect_grep "$T/g1.out" "open rentals are not acknowledged" "refusal explains how to open rentals"
+expect_grep "$T/g1.out" "run the deploy with ALLOW_OPEN_RENTALS=true" "refusal names ALLOW_OPEN_RENTALS=true"
 rc=0; guards --allow-open-rentals 1 > "$T/g2.out" 2>&1 || rc=$?
-expect_rc "$rc" 0 "ALLOW_OPEN_RENTALS=true lets an open .env through"
-expect_grep "$T/g2.out" "WARNING RENTER_ALLOWLIST is empty or missing and ALLOW_OPEN_RENTALS=true" "open rentals are loudly warned"
+expect_rc "$rc" 0 "ALLOW_OPEN_RENTALS=true on the deploy lets an allowlist-less .env through"
+expect_grep "$T/g2.out" "acknowledged by this deploy (ALLOW_OPEN_RENTALS=true); install writes ALLOW_OPEN_RENTALS=true" "deploy-only acknowledgement is announced"
+expect_grep "$T/g2.out" "rentals=open openAck=deploy" "summary shows open rentals"
+check "! grep -q ALLOW_OPEN_RENTALS '$MD/.env'" "the guards action (read-only) writes nothing"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 ALLOW_OPEN_RENTALS=true bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args openack) > "$T/g2b.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "install with a deploy-only acknowledgement succeeds"
+expect_count "$MD/.env" "ALLOW_OPEN_RENTALS=true" 1 "install writes ALLOW_OPEN_RENTALS=true into .env once"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 ALLOW_OPEN_RENTALS=true bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args openack2) > "$T/g2c.out" 2>&1 || rc=$?
+expect_count "$MD/.env" "ALLOW_OPEN_RENTALS=" 1 "a re-install finds it in .env and appends nothing"
+reset_market "" "" "SOME_SETTING=1"
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args refused) > "$T/g3.out" 2>&1 || rc=$?
-expect_rc "$rc" 8 "install without an allowlist refuses (exit 8)"
+expect_rc "$rc" 8 "install without an acknowledgement refuses (exit 8)"
 expect_grep "$MD/renter-pod-worker.mjs" "old code" "refused install changed no code"
 check "[ ! -e '$T/rk/backups/refused' ] && ! grep -q MAX_ACTIVE_LEASES_PER_RENTER '$MD/.env' && ! grep -q restart '$T/systemctl.log'" "refused install: no backup, no .env write, no restart"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1,$ALLOW2"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args allow) > "$T/g3b.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "the optional allowlist still works (no acknowledgement needed)"
+expect_grep "$T/g3b.out" "rentals=allowlist(2) openAck=none" "allowlist mode logged by count"
+expect_nogrep "$T/g3b.out" "$ALLOW1" "allowlist addresses are never printed"
+check "! grep -q ALLOW_OPEN_RENTALS '$MD/.env'" "allowlisted install does not acknowledge open rentals"
+reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"ALLOW_OPEN_RENTALS=true"
+rc=0; guards > "$T/g3c.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "allowlist + ALLOW_OPEN_RENTALS=true is allowed"
+expect_grep "$T/g3c.out" "WARNING ALLOW_OPEN_RENTALS=true but" "but loudly warned that the allowlist wins"
 reset_market "" "" "RENTER_ALLOWLIST=\"$ALLOW1, $ALLOW2 ,$ALLOW1\""$'\n'"MAX_ACTIVE_LEASES=\"5\""
 rc=0; guards > "$T/g4.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "quoted, spaced, duplicated allowlist parses like the worker"
-expect_grep "$T/g4.out" "allowlist=2 renter(s)" "entries lowercased + de-duplicated"
+expect_grep "$T/g4.out" "rentals=allowlist(2)" "entries lowercased + de-duplicated"
 expect_grep "$T/g4.out" "MAX_ACTIVE_LEASES=5" "quoted numeric knob accepted (the loader strips quotes)"
 reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1,0xnotanaddress"
 rc=0; guards > "$T/g5.out" 2>&1 || rc=$?
 expect_rc "$rc" 8 "an invalid allowlist entry refuses (the worker would not start)"
 expect_grep "$T/g5.out" "RENTER_ALLOWLIST entry 2 is not a 0x+40-hex address" "invalid entry named by position"
 expect_nogrep "$T/g5.out" "notanaddress" "invalid entry value not printed"
+reset_market "" "" "RENTER_ALLOWLIST=\"$ALLOW1"
+rc=0; guards --allow-open-rentals 1 > "$T/g5a.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "an unmatched quote is not stripped (worker: invalid entry) -> refuse"
 reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"export RENTER_ALLOWLIST="
 rc=0; guards > "$T/g5b.out" 2>&1 || rc=$?
-expect_rc "$rc" 8 "a later empty RENTER_ALLOWLIST line wins (worker loader is last-line-wins) -> refuse"
+expect_rc "$rc" 8 "a later empty RENTER_ALLOWLIST line wins (worker loader is last-line-wins) -> open, unacknowledged -> refuse"
 reset_market "" "" "RENTER_ALLOWLIST="$'\n'"RENTER_ALLOWLIST=$ALLOW1"
 rc=0; guards > "$T/g5c.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "a later valid RENTER_ALLOWLIST line wins over an earlier empty one"
-reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=two"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=two"
 rc=0; guards > "$T/g6.out" 2>&1 || rc=$?
 expect_rc "$rc" 8 "a malformed numeric knob refuses before the restart"
-expect_grep "$T/g6.out" "MAX_ACTIVE_LEASES_PER_RENTER is not an integer >= 1" "malformed knob named"
-reset_market "" "" "RENTER_ALLOWLIST=$ALLOW1"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=3"
+expect_grep "$T/g6.out" "MAX_ACTIVE_LEASES_PER_RENTER must be an integer >= 1" "malformed knob named"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"MAX_LIVE_RESERVATIONS=abc"$'\n'"MAX_RESERVATIONS_PER_RENTER=2"$'\n'"LISTING_RESERVE_COOLDOWN_SEC=600"
+rc=0; guards > "$T/g6b.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "retired quote-capacity knobs (even malformed) never refuse: the worker ignores them"
+expect_grep "$T/g6b.out" "ignored retired settings" "retired knobs listed as ignored"
+expect_grep "$T/g6b.out" "retired=MAX_LIVE_RESERVATIONS,MAX_RESERVATIONS_PER_RENTER,LISTING_RESERVE_COOLDOWN_SEC" "retired knobs named"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"RESERVATION_TTL_SEC=600"
+rc=0; guards > "$T/g6c.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "RESERVATION_TTL_SEC below the 900 s quote deadline refuses (worker CONFIG_ERROR)"
+expect_grep "$T/g6c.out" "RESERVATION_TTL_SEC must be an integer >= 900" "TTL floor named"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"TICK_WATCHDOG_SEC=100"
+rc=0; guards > "$T/g6d.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "TICK_WATCHDOG_SEC not above TX_WAIT_TIMEOUT_MS refuses"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"REQUIRE_RENTER_BALANCE=off"
+rc=0; guards > "$T/g6e.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "REQUIRE_RENTER_BALANCE=off is allowed"
+expect_grep "$T/g6e.out" "WARNING REQUIRE_RENTER_BALANCE=off" "but warned"
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"MAX_ACTIVE_LEASES_PER_RENTER=3"
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args keep3) > "$T/g7.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "install with an explicit per-renter cap succeeds"
 check "grep -q '^MAX_ACTIVE_LEASES_PER_RENTER=3\$' '$MD/.env' && ! grep -q 'MAX_ACTIVE_LEASES_PER_RENTER=2' '$MD/.env'" "an explicit MAX_ACTIVE_LEASES_PER_RENTER is kept"
+# install re-checks with the STAGED worker's own parser: a ConfigError refuses, key named only
+mkdir -p "$T/rk/staging-cfg/code"; cp "$STG/code/"* "$T/rk/staging-cfg/code/"
+cat > "$T/rk/staging-cfg/code/renter-pod-config.mjs" <<'CFG'
+export function parseEnvText(t) { const o = {}; for (const l of t.split(/\n/)) { const m = l.match(/^([A-Z_]+)=(.*)$/); if (m) o[m[1]] = m[2]; } return o; }
+export function hardeningConfigFromEnv(env) { if (env.SECRETISH_KNOB) { const e = new Error("SECRETISH_KNOB bad: " + env.SECRETISH_KNOB); e.key = "SECRETISH_KNOB"; throw e; } return {}; }
+CFG
+reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"SECRETISH_KNOB=value-never-printed"
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" --action install --market vipp --staging "$T/rk/staging-cfg" \
+  --backup-dir "$T/rk/backups/cfg/vault-kit-v16-vipp" --verify-sec 1 > "$T/g8.out" 2>&1 || rc=$?
+expect_rc "$rc" 8 "install refuses when the staged worker config parser rejects the .env"
+expect_grep "$T/g8.out" "CONFIG_ERROR key=SECRETISH_KNOB" "the staged parser's key is named"
+expect_nogrep "$T/g8.out" "value-never-printed" "the value is never printed"
+check "[ ! -e '$T/rk/backups/cfg' ] && grep -q 'old code' '$MD/renter-pod-worker.mjs'" "nothing backed up or copied"
+if [ -n "$WSTAGE" ]; then
+  echo "== worker deploy: guard verdicts == the worker's hardeningConfigFromEnv ($WREF)"
+  mismatch=""
+  while IFS= read -r vec; do
+    [ -n "$vec" ] || continue
+    reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"$(printf '%b' "$vec")"
+    grc=0; guards > "$T/gp.out" 2>&1 || grc=$?
+    wv=$(cd "$WSTAGE" && ENV_FILE="$MD/.env" "$NODE" --input-type=module -e '
+      import { readFileSync } from "node:fs";
+      const c = await import("./renter-pod-config.mjs");
+      const env = {}; for (const [k, v] of Object.entries(c.parseEnvText(readFileSync(process.env.ENV_FILE, "utf8")))) if (v !== "") env[k] = v;
+      try { c.hardeningConfigFromEnv(env); console.log("ok"); } catch (e) { console.log("error " + e.key); }' 2>&1)
+    gv=ok; [ "$grc" = 0 ] || gv=error
+    [ "${wv%% *}" = "$gv" ] || mismatch="$mismatch [$vec: guard=$gv worker=$wv]"
+  done <<'VEC'
+MAX_ACTIVE_LEASES=20\nMAX_ACTIVE_LEASES_PER_RENTER=2\nRESERVATION_TTL_SEC=1200
+RESERVATION_TTL_SEC=899
+RESERVATION_TTL_SEC=900
+MAX_ACTIVE_LEASES=0x10
+MAX_ACTIVE_LEASES=1e3
+MAX_ACTIVE_LEASES="7"
+MAX_ACTIVE_LEASES=-1
+TICK_WATCHDOG_SEC=120
+TICK_WATCHDOG_SEC=121
+TX_WAIT_TIMEOUT_MS=600000
+LOG_CHUNK_BLOCKS=99
+LOG_CHUNK_BLOCKS=1000000
+LOG_CHUNKS_PER_TICK=1001
+EXIT_RESUME_HEADROOM_ACTIONS=0
+STRATEGY_RESTART_MIN_INTERVAL_SEC=-5
+OPERATOR_TX_PRICING=fast
+OPERATOR_TX_PRICING=LEGACY
+REQUIRE_RENTER_BALANCE=maybe
+PREFS_CADENCE_GUARD=off
+PREFS_FLOOR_HP_LOW_MIN=95
+PREFS_FLOOR=off\nPREFS_FLOOR_HP_LOW_MIN=95
+PREFS_FLOOR_FORCE_HP_FEED=perhaps
+MAX_LIVE_RESERVATIONS=abc
+RENTER_ALLOWLIST=,
+RENTER_ALLOWLIST=0x00000000000000000000000000000000000000c1 0x00000000000000000000000000000000000000c2
+KAMIBOTS_RETRY_MAX_SEC=0
+VEC
+  if [ -z "$mismatch" ]; then ok "launch guard and worker parser agree on 26 .env vectors"; else bad "guard/worker verdicts differ:$mismatch"; fi
+  # and with the REAL staged parser, install accepts a clean open-launch .env
+  mkdir -p "$T/rk/staging-real/code"; cp "$STG/code/"* "$T/rk/staging-real/code/"
+  cp "$WSTAGE/renter-pod-config.mjs" "$WSTAGE/kamibots-rental-config.mjs" "$T/rk/staging-real/code/"
+  reset_market "" "" "ALLOW_OPEN_RENTALS=true"$'\n'"MAX_ACTIVE_LEASES=5"
+  rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=1 bash "$OPS/deploy/remote-install-worker-code.sh" --action install --market vipp --staging "$T/rk/staging-real" \
+    --backup-dir "$T/rk/backups/real/vault-kit-v16-vipp" --verify-sec 1 > "$T/g9.out" 2>&1 || rc=$?
+  expect_rc "$rc" 0 "install with the real staged config parser succeeds"
+  expect_grep "$T/g9.out" "the staged worker config parser accepts" "the staged parser ran"
+else
+  skip "guard/worker parser parity + real staged parser (needs git ref $WREF)"
+fi
 
 reset_market "$(pending "$H_DROPPED")"
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args fail) > "$T/d2.out" 2>&1 || rc=$?
@@ -716,6 +958,107 @@ reset_market "" '{"0xabc":{"operator":"0x000000000000000000000000000000000000000
 rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 bash "$OPS/deploy/remote-install-worker-code.sh" $(install_args conflict) > "$T/d6.out" 2>&1 || rc=$?
 expect_rc "$rc" 6 "reservation conflict blocks the auto-rollback (exit 6)"
 expect_grep "$MD/renter-pod-worker.mjs" "new code" "patched code kept on a merge conflict"
+
+
+if [ -z "$WSTAGE" ]; then
+  skip "quote key store rollback/drain tests (need the worker's renter-pod-quote-store.mjs from git ref $WREF)"
+else
+echo "== worker deploy: rollback onto a pre-change worker needs HALT + drain (quote key store, $WREF)"
+LIVE_N=0x$(printf '%064d' 21); OLD_N=0x$(printf '%064d' 22); UNS_N=0x$(printf '%064d' 23)
+qe() { # deadline attested(1|0) -> store entry with a fake key (never printed)
+  printf '{"operator":"0x00000000000000000000000000000000000000c1","__OPKEY__":"0xSHOULD_NEVER_BE_PRINTED","renter":"0xr","createdAt":%s000%s,"quoteDeadline":%s}' \
+    "$NOW" "$([ "$2" = 1 ] && echo ',"attestedDigest":"0xab"')" "$1" | sed 's/"__OPKEY__"/"operator''Key"/'
+}
+BK="$T/rk/backups/pre/vault-kit-v16-vipp"
+patched_market() { # journal lines...: the running code is the patched worker (store module present)
+  reset_market
+  cp "$WSTAGE/renter-pod-quote-store.mjs" "$WSTAGE/renter-pod-liveness.mjs" "$MD/"
+  echo "// new code" > "$MD/renter-pod-worker.mjs"
+  printf '{"version":1,"generation":1,"reservations":{}}\n' > "$MD/renter-pod-worker-state.reservations.json"
+  { echo '{"journal":1,"generation":1}'; local l; for l in "$@"; do echo "$l"; done; } > "$MD/renter-pod-worker-state.reservations.journal"
+  chmod 600 "$MD"/renter-pod-worker-state.reservations.*
+  # the pre-change backup: old code only (no store module) + the state it had signed
+  rm -rf "$T/rk/backups/pre"; mkdir -p "$BK/state-snapshot"
+  echo "// old code" > "$BK/renter-pod-worker.mjs"
+  printf '{"lastBlock":1,"jobs":{},"reservations":{"%s":%s}}\n' "$OLD_N" "$(qe $((NOW + 600)) 1)" > "$BK/state-snapshot/renter-pod-worker-state.json"
+}
+rb() { asroot "${REMOTE_ENV[@]}" bash "$OPS/deploy/remote-install-worker-code.sh" --action "$1" --market vipp --backup-dir "$BK" --verify-sec 1 "${@:2}"; }
+state_nonces() { "$NODE" -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const r = s.reservations || {};
+  console.log(Object.keys(r).sort().map((n) => n.slice(-2) + (r[n].operatorKey ? "k" : "-")).join(","));' "$1"; }
+
+patched_market "{\"put\":\"$LIVE_N\",\"r\":$(qe $((NOW + 600)) 1)}"
+rc=0; rb rollback > "$T/r1.out" 2>&1 || rc=$?
+expect_rc "$rc" 10 "rollback onto a pre-change worker while a quote only the new store knows is live -> refused (exit 10)"
+expect_grep "$T/r1.out" "rollback refused: 1 quote(s) signed by the current worker can still become pods" "refusal counts it"
+expect_grep "$T/r1.out" "HALT + drain first" "refusal says HALT + drain"
+expect_grep "$T/r1.out" "journal=yes reader=worker-module" "the store was read with the worker's own readQuoteStore (journal included)"
+expect_nogrep "$T/systemctl.log" "stop" "refused before anything was stopped"
+check "grep -q 'new code' '$MD/renter-pod-worker.mjs' && [ ! -e '$MD/HALT' ]" "code and HALT untouched"
+rc=0; rb rollback --force > "$T/r1f.out" 2>&1 || rc=$?
+expect_rc "$rc" 10 "--force does not skip the drain rule"
+rc=0; rb drain --drain-wait 0 > "$T/r2.out" 2>&1 || rc=$?
+expect_rc "$rc" 10 "drain while the quote is live -> not drained yet (exit 10)"
+check "[ -e '$MD/HALT' ] && [ -e '$MD/.HALT.launch-ops' ]" "drain created HALT, marked as created by launch-ops"
+expect_grep "$T/r2.out" "HALT kept" "HALT is kept when the drain times out"
+# time passes: the new quote's deadline is behind us; the old worker's own quote (in the
+# backup state) is still live, and one unsigned key remains. The worker was killed, so
+# the snapshot is empty and every entry is only in the journal.
+printf '{"journal":1,"generation":1}\n{"put":"%s","r":%s}\n{"put":"%s","r":%s}\n{"put":"%s","r":%s}\n' \
+  "$LIVE_N" "$(qe $((NOW - 1000)) 1)" "$OLD_N" "$(qe $((NOW + 600)) 1)" "$UNS_N" "$(qe $((NOW + 600)) 0)" > "$MD/renter-pod-worker-state.reservations.journal"
+: > "$T/systemctl.log"
+rc=0; rb rollback > "$T/r3.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "rollback proceeds once no NEW quote can become a pod (the old worker's own quote does not block)"
+expect_grep "$T/r3.out" "live=1 newLive=0" "baseline quote counted as live but not new"
+expect_grep "$T/r3.out" "compacted renter-pod-worker-state.reservations.json: entries=3" "journal folded into the snapshot by the worker CLI (worker stopped)"
+check "grep -q 'stop kami-renter-pod-v16-vipp' '$T/systemctl.log'" "unit stopped before the compaction"
+check "[ \"\$(state_nonces '$MD/renter-pod-worker-state.json')\" = '21k,22k,23k' ]" "every store key (journal-only included) merged into the state file the old worker reads"
+check "ls '$MD' | grep -q 'reservations.json.rolled-back-' && ls '$MD' | grep -q 'reservations.journal.rolled-back-' && [ ! -e '$MD/renter-pod-worker-state.reservations.journal' ]" "snapshot AND journal moved aside"
+check "[ \"\$(stat -c %a \"\$(ls -d '$MD'/renter-pod-worker-state.reservations.journal.rolled-back-* | head -1)\")\" = 600 ]" "moved journal keeps mode 600"
+check "[ ! -e '$MD/HALT' ] && [ ! -e '$MD/.HALT.launch-ops' ]" "the drain HALT is removed once the rollback verified"
+check "grep -q 'old code' '$MD/renter-pod-worker.mjs' && [ ! -e '$MD/renter-pod-quote-store.mjs' ]" "old code restored, store module removed"
+cat "$T"/r1.out "$T"/r2.out "$T"/r3.out > "$T/r.out"
+expect_nogrep "$T/r.out" "SHOULD_NEVER_BE_PRINTED" "no operator key printed by store status, drain, compaction or merge"
+
+patched_market "{\"put\":\"$LIVE_N\",\"r\":$(qe $((NOW - 500)) 1)}"
+rc=0; rb drain --drain-wait 5 > "$T/r4.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "drain returns once every signed quote is past quoteDeadline + margin"
+expect_grep "$T/r4.out" "DRAINED" "drain reports DRAINED"
+rc=0; ROLLBACK_DRAIN_MARGIN_SEC=900 rb drain --drain-wait 0 > "$T/r4m.out" 2>&1 || rc=$?
+expect_rc "$rc" 10 "the drain margin covers block-time skew (deadline 500 s ago < 900 s margin -> still live)"
+
+patched_market "{\"put\":\"$LIVE_N\",\"r\":$(qe $((NOW + 600)) 1)}"
+cp "$WSTAGE/renter-pod-quote-store.mjs" "$BK/"
+: > "$T/systemctl.log"
+rc=0; rb rollback > "$T/r5.out" 2>&1 || rc=$?
+expect_rc "$rc" 0 "rollback onto a target that has the store module is not blocked by live quotes"
+expect_grep "$T/r5.out" "reads this store itself; left in place" "store left in place for that target"
+check "[ -e '$MD/renter-pod-worker-state.reservations.json' ] && [ \"\$(state_nonces '$MD/renter-pod-worker-state.json')\" = '' ]" "no merge into the state file, store kept"
+
+echo "== worker deploy: auto-rollback never hands live new-store quotes to the pre-change worker"
+reset_market
+rm -f "$MD/renter-pod-worker-state.reservations.json"
+mkdir -p "$T/rk/staging-store/code"; cp "$STG/code/"* "$WSTAGE/renter-pod-quote-store.mjs" "$WSTAGE/renter-pod-liveness.mjs" "$T/rk/staging-store/code/"
+cat > "$T/sign-quote.sh" <<SIGN
+f="$MD/renter-pod-worker-state.reservations.journal"
+[ -s "\$f" ] || echo '{"journal":1,"generation":1}' > "\$f"
+echo '{"put":"$LIVE_N","r":$(qe $((NOW + 600)) 1)}' >> "\$f"
+chmod 600 "\$f"
+SIGN
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 FAKE_ON_START="bash $T/sign-quote.sh" bash "$OPS/deploy/remote-install-worker-code.sh" --action install --market vipp \
+  --staging "$T/rk/staging-store" --backup-dir "$T/rk/backups/nohalt/vault-kit-v16-vipp" --verify-sec 1 --require-heartbeat 1 --verify-halt 0 --pending-wait 2 > "$T/r6.out" 2>&1 || rc=$?
+expect_rc "$rc" 10 "VERIFY_HALT=0 + the patched worker signed a quote -> auto-rollback blocked (exit 10)"
+expect_grep "$T/r6.out" "reason=quotes-not-drained live=1" "blocked for the drain"
+check "grep -q 'new code' '$MD/renter-pod-worker.mjs' && [ -e '$MD/renter-pod-quote-store.mjs' ]" "the patched code (which has the keys) runs again"
+check "[ -e '$MD/HALT' ] && [ -e '$MD/.HALT.launch-ops' ]" "HALT created so nothing new is signed while the quote drains"
+check "[ \"\$(state_nonces '$MD/renter-pod-worker-state.json')\" = '' ]" "nothing merged for the pre-change worker"
+reset_market
+rm -f "$MD/renter-pod-worker-state.reservations.json"
+: > "$T/sign-quote.sh" # under the verify HALT the patched worker signs nothing
+rc=0; asroot "${REMOTE_ENV[@]}" FAKE_WORKER_HB=0 FAKE_ON_START="bash $T/sign-quote.sh" bash "$OPS/deploy/remote-install-worker-code.sh" --action install --market vipp \
+  --staging "$T/rk/staging-store" --backup-dir "$T/rk/backups/halt/vault-kit-v16-vipp" --verify-sec 1 --require-heartbeat 1 --verify-halt 1 --pending-wait 2 > "$T/r7.out" 2>&1 || rc=$?
+expect_rc "$rc" 4 "with the verify HALT nothing new is signed: auto-rollback completes (exit 4)"
+check "grep -q 'old code' '$MD/renter-pod-worker.mjs' && [ ! -e '$MD/HALT' ]" "old code back, HALT removed"
+fi
 
 echo "== worker deploy: the on-box test run is memory-guarded and needs no root"
 rc=0; env NODE_BIN="$NODE" bash "$OPS/deploy/remote-install-worker-code.sh" --action test --staging "$T/nostage" --min-mem-mb 99999999 > "$T/tm1.out" 2>&1 || rc=$?
@@ -836,6 +1179,12 @@ expect_nogrep "$T/c.out" "SECRET_MARKER" "file contents never printed"
 expect_nogrep "$T/c.out" "${K1#0x}" "private keys never printed"
 expect_nogrep "$T/c.out" "${K2#0x}" "private keys never printed (2)"
 fi
+
+echo "== launch wording: an open public launch (no soft-launch / beta wording anywhere)"
+WPAT="soft""[ -]?launch|private""[ -]?beta"
+hits=$(grep -rliE "$WPAT" "$OPS" --exclude=run-tests.sh 2>/dev/null || true)
+if [ -z "$hits" ]; then ok "no soft-launch / private-beta wording in tools/launch-ops"; else bad "soft-launch / private-beta wording in: $hits"; fi
+if cat "$T"/*.out 2>/dev/null | grep -qiE "$WPAT"; then bad "a script printed soft-launch / private-beta wording"; else ok "no script output uses soft-launch / private-beta wording"; fi
 
 echo
 echo "launch-ops tests: $PASS passed, $FAIL failed, $SKIP skipped (jq local=$HAVE_JQ node=${NODE:+yes} remote=${REMOTE:-none})"

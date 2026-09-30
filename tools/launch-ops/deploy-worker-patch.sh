@@ -5,8 +5,9 @@
 # the VPS: /root/kamigotchi on the VPS is not a git checkout.
 #
 #   deploy-worker-patch.sh --ref <sha|branch>                 dry-run (read-only)
-#   deploy-worker-patch.sh --ref <sha|branch> --apply         install
-#   deploy-worker-patch.sh --rollback <TS> [--markets "vipp"] [--force]
+#   ALLOW_OPEN_RENTALS=true deploy-worker-patch.sh --ref <sha|branch> --apply
+#                                                             install (open rentals)
+#   deploy-worker-patch.sh --rollback <TS> [--drain] [--markets "vipp"] [--force]
 #                                                             restore code from a backup
 #   deploy-worker-patch.sh --ref <sha|branch> --local-stage DIR
 #                             build the staging tree (code/ + full/) locally and stop
@@ -17,11 +18,14 @@
 #      (renter-pod-*.mjs, kamibots-rental-config*.mjs, *.env.example)
 #   2. refuse if tools/vault-kit/package.json dependencies differ from the VPS copy
 #      (no npm install on the box) unless --allow-dep-change
-#   2b. launch guards per market .env (read-only, counts only): refuse unless
-#      RENTER_ALLOWLIST is non-empty and valid (soft launch fails CLOSED), or the
-#      deploy runs with ALLOW_OPEN_RENTALS=true (or --allow-open-rentals); numeric
-#      worker knobs must parse. The install appends MAX_ACTIVE_LEASES_PER_RENTER=2
-#      to .env when absent (the only .env write a deploy makes)
+#   2b. launch guards per market .env (read-only, counts and key names only). The
+#      launch is OPEN: RENTER_ALLOWLIST is optional and off by default, and a .env
+#      without one needs open rentals acknowledged (ALLOW_OPEN_RENTALS=true in the
+#      .env, or this deploy run with ALLOW_OPEN_RENTALS=true / --allow-open-rentals,
+#      which the install writes into .env). Every worker knob the .env sets must parse
+#      the way the worker parses it; retired quote-capacity knobs are listed as ignored.
+#      The install re-checks with the staged worker's own config parser, and appends
+#      MAX_ACTIVE_LEASES_PER_RENTER=2 when absent (the only other .env write)
 #   3. mid-transition gate (lease-transition-gate.sh, read-only) for all markets
 #   4. test the staged tree: code/ (what gets installed) and full/ (the whole
 #      tools/vault-kit tree of the ref, so tests that read test-fixtures/ work).
@@ -35,25 +39,31 @@
 #   5. per market, ONE AT A TIME (default order: musu, the market with 0 jobs, then vipp),
 #      skipping a market whose file plan has no NEW/CHANGED runtime file (*.test.mjs and
 #      *.env.example alone do not count; idempotent re-run):
-#      re-run the gate for that market; back up the code files + a state snapshot to
+#      re-run the gate for that market; back up the code files + a state snapshot
+#      (state file, quote store snapshot + journal) to
 #      /root/launch-ops-backups/worker-<TS>/vault-kit-v16-<m>/ (.env is not copied);
-#      copy code files only (.env*, state, reservations, heartbeat, keys, node_modules
+#      copy code files only (.env*, state, quote store, heartbeat, keys, node_modules
 #      untouched); create HALT for the verify window (VERIFY_HALT=1, only if absent; the
 #      patched worker answers 503 to new quotes, so nothing is signed while the install
 #      can still roll back); restart the unit; verify for VERIFY_SEC (120): unit active,
 #      port 8791/8792 bound, heartbeat.json fresh (ts >= restart and <= 120 s old), no
 #      [LEASE-ALERT] line, no auto-restart; then remove HALT. On failure: auto-rollback
-#      (waits for pendingTxs, merges the reservation store back into the state file,
-#      restores the code; see deploy/remote-install-worker-code.sh), exit non-zero
-#      (the next market is not touched)
+#      (waits for pendingTxs, compacts the quote store, refuses while quotes the patched
+#      worker signed can still become pods, merges the store back into the state file
+#      for a pre-change target, restores the code; see deploy/remote-install-worker-code.sh),
+#      exit non-zero (the next market is not touched)
 #
 # Dry-run does steps 1-3 (with the launch guards) plus a per-file diff against the
 # live copies, and says where the tests would run. It writes nothing locally except
 # a temp dir, and nothing on the VPS.
-# Rollback: --rollback <TS> first runs the transition gate per market (refuses unless
-# --force), then restores code files from the backup of that run (heartbeat not
-# required, since older code does not write one), with the same pendingTxs wait and
-# reservation merge as the auto-rollback.
+# Rollback: --rollback <TS> restores code files from the backup of that run (heartbeat
+# not required, since older code does not write one), with the same pendingTxs wait,
+# store compaction and merge as the auto-rollback. A pre-change target (its backup has
+# no renter-pod-quote-store.mjs) never reads the quote store, so it must not take over
+# while a quote the current worker signed can still become a pod: --drain first creates
+# HALT and waits (up to ROLLBACK_DRAIN_WAIT_SEC, 1500) until every such quote is past
+# its deadline. Then the transition gate runs per market (--for-rollback; refuses unless
+# --force), then the rollback. The drain rule is never skipped, not even by --force.
 {
 set -euo pipefail
 
@@ -68,6 +78,8 @@ VERIFY_SEC="${VERIFY_SEC:-120}"
 VERIFY_HALT="${VERIFY_HALT:-1}"
 ROLLBACK_PENDING_WAIT_SEC="${ROLLBACK_PENDING_WAIT_SEC:-300}"
 FORCE=0
+DRAIN=0
+ROLLBACK_DRAIN_WAIT_SEC="${ROLLBACK_DRAIN_WAIT_SEC:-1500}"
 LOCAL_STAGE=""
 TEST_WHERE="${DEPLOY_TESTS:-auto}"
 TEST_MIN_MEM_MB="${TEST_MIN_MEM_MB:-300}"
@@ -85,14 +97,16 @@ while [ $# -gt 0 ]; do
     --tests) TEST_WHERE="${2:?}"; shift ;;
     --no-require-heartbeat) REQUIRE_HEARTBEAT=0 ;;
     --force) FORCE=1 ;;
+    --drain) DRAIN=1 ;;
     --local-stage) LOCAL_STAGE="${2:?}"; shift ;;
-    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,66p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 case "$TEST_WHERE" in auto|box|local) ;; *) echo "--tests auto|box|local" >&2; exit 2 ;; esac
 [[ "$TEST_MIN_MEM_MB" =~ ^[0-9]+$ ]] || { echo "TEST_MIN_MEM_MB must be a number" >&2; exit 2; }
+[[ "$ROLLBACK_DRAIN_WAIT_SEC" =~ ^[0-9]+$ ]] || { echo "ROLLBACK_DRAIN_WAIT_SEC must be a number" >&2; exit 2; }
 case "$ALLOW_OPEN_RENTALS" in true|1) AOR=1 ;; *) AOR=0 ;; esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,26 +118,48 @@ die() { log "ERROR: $*" >&2; exit 1; }
 for m in $MARKETS; do case "$m" in musu|vipp) ;; *) die "bad market $m" ;; esac; done
 
 remote() { "${SSH[@]}" "bash -s -- $*"; } # stdin = script
-gate() { # markets...
+gate() { # [--for-rollback [--target-reads-store]] markets...
   local args="" m rc=0
+  while [ "${1:-}" = --for-rollback ] || [ "${1:-}" = --target-reads-store ]; do args="$args $1"; shift; done
   for m in "$@"; do args="$args --market $m"; done
   remote "$args" < "$HERE/lease-transition-gate.sh" || rc=$?
   return "$rc"
 }
 
 if [ "$MODE" = rollback ]; then
+  [[ "$ROLLBACK_TS" =~ ^[0-9A-Za-z]+$ ]] || die "--rollback <TS>: the backup timestamp (e.g. 20260929T120000Z)"
   log "ROLLBACK code from backup worker-$ROLLBACK_TS for [$MARKETS] on $HOST"
   force_arg=""; [ "$FORCE" = 1 ] && force_arg="--force"
   for m in $MARKETS; do
-    # The pre-hardening worker has no tx tracker and re-derives every action; the
-    # gate (J1-J3, C1-C2, R1, T1) refuses while a lease is mid-transition.
-    rc=0; gate "$m" || rc=$?
-    if [ "$rc" != 0 ]; then
-      [ "$FORCE" = 1 ] || die "gate refused rollback of $m (exit $rc). Wait until it prints SAFE, or pass --force."
-      log "WARN: gate refused (exit $rc) but --force given; rolling back $m anyway"
+    bdir="/root/launch-ops-backups/worker-$ROLLBACK_TS/vault-kit-v16-$m"
+    "${SSH[@]}" "test -d $bdir" || die "no backup $bdir on $HOST"
+    # Does the rollback target read the quote key store itself (renter-pod-quote-store.mjs)?
+    reads=0; "${SSH[@]}" "test -f $bdir/renter-pod-quote-store.mjs" && reads=1
+    if [ "$reads" = 1 ]; then
+      log "== $m: the rollback target reads the quote key store itself; no drain needed"
+    elif [ "$DRAIN" = 1 ]; then
+      log "== $m: HALT + drain (the pre-change target never reads the quote key store)"
+      rc=0; remote "--action drain --market $m --backup-dir $bdir --drain-wait $ROLLBACK_DRAIN_WAIT_SEC" \
+        < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
+      [ "$rc" = 0 ] || die "drain of $m not finished (exit $rc): HALT stays; re-run the same --rollback ... --drain command"
     fi
-    remote "--action rollback --market $m --backup-dir /root/launch-ops-backups/worker-$ROLLBACK_TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --pending-wait $ROLLBACK_PENDING_WAIT_SEC $force_arg" \
-      < "$HERE/deploy/remote-install-worker-code.sh" || die "rollback of $m failed; see output above"
+    # The pre-hardening worker has no tx tracker and re-derives every action; the
+    # gate (J1-J5, C1-C2, R1, T1) refuses while a lease is mid-transition, and R1
+    # refuses while a quote only the current worker can serve is still live.
+    gargs="--for-rollback"; [ "$reads" = 0 ] || gargs="$gargs --target-reads-store"
+    rc=0; gate $gargs "$m" || rc=$?
+    if [ "$rc" != 0 ]; then
+      [ "$FORCE" = 1 ] || die "gate refused rollback of $m (exit $rc). Wait until it prints SAFE (an R1-store refusal needs --drain), or pass --force."
+      log "WARN: gate refused (exit $rc) but --force given; rolling back $m anyway (the quote drain rule is still enforced on the box)"
+    fi
+    rc=0
+    remote "--action rollback --market $m --backup-dir $bdir --verify-sec $VERIFY_SEC --pending-wait $ROLLBACK_PENDING_WAIT_SEC $force_arg" \
+      < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
+    case "$rc" in
+      0) ;;
+      10) die "rollback of $m refused: quotes the current worker signed can still become pods. Re-run with --drain (HALT + wait for their deadlines)." ;;
+      *) die "rollback of $m failed (exit $rc); see output above" ;;
+    esac
   done
   log "rollback complete"
   exit 0
@@ -205,11 +241,11 @@ if [ -z "$TODO" ]; then
   exit 0
 fi
 
-# 2b. launch guards (read-only; counts only, never values)
+# 2b. launch guards (read-only; counts and key names only, never values)
 log "launch guards (read-only; ALLOW_OPEN_RENTALS=$([ "$AOR" = 1 ] && echo true || echo false)):"
 for m in $TODO; do
   rc=0; remote "--action guards --market $m --allow-open-rentals $AOR" < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
-  [ "$rc" = 0 ] || die "launch guards refused $m (exit $rc): fix the market .env (see above) or, to open rentals on purpose, re-run with ALLOW_OPEN_RENTALS=true. Nothing was changed."
+  [ "$rc" = 0 ] || die "launch guards refused $m (exit $rc): fix the market .env (see above). For the open public launch re-run with ALLOW_OPEN_RENTALS=true. Nothing was changed."
 done
 
 # 3. gate
@@ -267,10 +303,10 @@ for m in $TODO; do
   rc=0
   remote "--action install --market $m --staging $STAGE --backup-dir /root/launch-ops-backups/worker-$TS/vault-kit-v16-$m --verify-sec $VERIFY_SEC --require-heartbeat $REQUIRE_HEARTBEAT --verify-halt $VERIFY_HALT --pending-wait $ROLLBACK_PENDING_WAIT_SEC --allow-open-rentals $AOR" \
     < "$HERE/deploy/remote-install-worker-code.sh" || rc=$?
-  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back, 5/6 = auto-rollback blocked: the patched code runs again with HALT kept, 8 = launch guards refused, nothing changed). Not continuing."
+  [ "$rc" = 0 ] || die "$m install failed (exit $rc; 4 = verify failed and auto-rolled back, 5/6/10 = auto-rollback blocked: the patched code runs again with HALT kept, 8 = launch guards refused, nothing changed). Not continuing."
   log "== $m now runs $SHA"
 done
-log "deployed $SHA to [$TODO]. Rollback: $0 --rollback $TS --markets \"$TODO\""
+log "deployed $SHA to [$TODO]. Rollback: $0 --rollback $TS --drain --markets \"$TODO\" (--drain: HALT + wait out the quotes this worker signed when the target predates the quote key store)"
 log "backups under /root/launch-ops-backups/worker-$TS hold code files + state snapshots (operator keys, mode 600). Once stable, prune:"
 log "  ssh $HOST 'bash -s -- --prune-days 14 --apply' < $HERE/cleanup-secret-backups.sh"
 exit 0
