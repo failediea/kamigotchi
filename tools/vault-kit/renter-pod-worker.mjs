@@ -102,6 +102,7 @@ import {
 import { loadWorkerState } from "./renter-pod-state.mjs";
 import { runWorkerTick, txKeyForJob } from "./renter-pod-tick.mjs";
 import { createTxTracker } from "./renter-pod-tx.mjs";
+import { advanceDailySettlement, executeSettlement, SETTLEMENT_TX_KEY } from "./renter-pod-settlement.mjs";
 import {
   buildKamibotsStartBody,
   normalizeKamibotsPrefs,
@@ -197,6 +198,11 @@ const rpcRequest = new FetchRequest(RPC);
 rpcRequest.timeout = HARDENING.fetchTimeoutMs;
 const provider = new JsonRpcProvider(rpcRequest);
 const keeper = new Wallet(KEEPER_KEY, provider);
+let settlementSigner = keeper;
+if (process.env.SETTLER_PRIVATE_KEY) {
+  try { settlementSigner = new Wallet(process.env.SETTLER_PRIVATE_KEY, provider); }
+  catch { await holdOnConfigError({ key: "SETTLER_PRIVATE_KEY", message: "SETTLER_PRIVATE_KEY must be a valid private key" }); }
+}
 const world = new Contract(
   WORLD,
   ["function components() view returns (address)", "function systems() view returns (address)"],
@@ -211,6 +217,13 @@ const market = new Contract(
     "function endLease(uint32)",
     "function clearReturned(uint32)",
     "function confirmReturnedToPool(uint32)",
+    "function settler() view returns (address)",
+    "function lastSettleAt() view returns (uint64)",
+    "function settleCooldown() view returns (uint64)",
+    "function numListings() view returns (uint256)",
+    "function settlementInProgress() view returns (bool)",
+    "function settleBatch(uint256)",
+    "function settle()",
   ],
   provider
 );
@@ -1052,6 +1065,35 @@ function writeHeartbeat({ tickMs, lastTickOk }) {
 // never pin the same job behind a slow prefix).
 let tickSequence = Math.floor(Math.random() * 1_000_000);
 
+let settlementBatchSupported;
+async function settleDaily() {
+  await advanceDailySettlement({
+    state,
+    pending: async () => {
+      if (await txs.pendingFor(SETTLEMENT_TX_KEY)) return true;
+      // Do not place routine accounting behind an unresolved keeper action.
+      return Object.values(state.pendingTxs ?? {}).some((tx) => String(tx.from).toLowerCase() === settlementSigner.address.toLowerCase());
+    },
+    read: async () => {
+      if (settlementBatchSupported === undefined) {
+        const code = await provider.getCode(MARKET);
+        if (!code || code === "0x") throw new Error("market bytecode unavailable");
+        // Positive selector identification, never an RPC/revert fallback.
+        const selector = market.interface.getFunction("settleBatch").selector.slice(2);
+        settlementBatchSupported = code.toLowerCase().includes(`63${selector}`);
+      }
+      const [block, lastSettleAt, cooldown, count, settler, inProgress] = await Promise.all([
+        provider.getBlock("latest"), market.lastSettleAt(), market.settleCooldown(), market.numListings(), market.settler(),
+        settlementBatchSupported ? market.settlementInProgress() : false,
+      ]);
+      if (!block) throw new Error("settlement block unavailable");
+      if (process.env.SETTLER_PRIVATE_KEY && settler.toLowerCase() !== settlementSigner.address.toLowerCase()) throw new Error("SETTLER_PRIVATE_KEY does not match the market settler");
+      return { nowSec: Number(block.timestamp), lastSettleAt: Number(lastSettleAt), cooldownSec: Number(cooldown), listingCount: Number(count), isSettler: settler.toLowerCase() === settlementSigner.address.toLowerCase(), inProgress, batchSupported: settlementBatchSupported };
+    },
+    send: (plan) => executeSettlement({ contract: market, signer: settlementSigner, tracker: txs, plan }),
+  });
+}
+
 async function tick() {
   const result = await runWorkerTick({
     state,
@@ -1068,6 +1110,18 @@ async function tick() {
     startOffset: tickSequence++,
     ingestHealth,
   });
+  if (result.ingestOk) {
+    try {
+      await settleDaily();
+      if (state.settlement) state.settlement.error = null;
+    } catch (error) {
+      state.settlement ??= {};
+      state.settlement.error = String(error?.shortMessage || error?.message || "settlement failed").slice(0, 160);
+      leaseAlert(LeaseAlertCode.STAGE_STUCK, { phase: "daily-settlement", err: state.settlement.error }, { key: "daily-settlement" });
+    }
+    save();
+    watchdog.progress();
+  }
   // Only a tick that ran to completion refreshes the heartbeat.
   writeHeartbeat({ tickMs: result.tickMs, lastTickOk: result.ingestOk });
 }
