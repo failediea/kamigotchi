@@ -71,6 +71,7 @@ function harness({
   persistHook,
   signHook,
   startMs = T0,
+  allocationLimits,
 } = {}) {
   const state = { jobs, reservations: {}, ingestRetry };
   const events = [];
@@ -114,6 +115,7 @@ function harness({
       balanceReads.push(who);
       return renterBalance(who);
     },
+    allocationLimits,
   });
   const call = (path, body, { auth = `Bearer ${TOKEN}`, method, onHead } = {}) => {
     const payload = path === ATTEST_PATH && body?.quote ? { ...body, quote: { ...GAS, ...body.quote } } : body;
@@ -158,6 +160,39 @@ function harness({
     },
   };
 }
+
+test("allocation ceiling still permits attestation, idempotent retries, and release", async () => {
+  const h = harness({ allocationLimits: { maxKeys: 1 } });
+  try {
+    const first = await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 });
+    assert.equal(first.status, 201);
+    const key = h.state.reservations[nonce(1)].operatorKey;
+    const blocked = await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(2), tokenIndex: 8 });
+    assert.equal(blocked.status, 503);
+    assert.equal(blocked.body.code, "KEY_STORE_CAPACITY");
+    assert.equal(h.state.reservations[nonce(1)].operatorKey, key);
+    assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), tokenIndex: 7 })).status, 201);
+    assert.equal((await h.call(ATTEST_PATH, { quote: { nonce: nonce(1), renter: renter(1), operator: first.body.operator, tokenIndex: 7, deadline: h.deadline() } })).status, 200);
+    assert.equal((await h.call(RELEASE_PATH, { nonce: nonce(1), renter: renter(1) })).status, 200);
+    assert.equal(h.state.reservations[nonce(1)].operatorKey, key, "release cannot delete an already signed key for space");
+  } finally { h.close(); }
+});
+
+test("concurrent work is bounded while release stays available and slots recover", async () => {
+  let completeBalance, entered;
+  const balance = new Promise((resolve) => { completeBalance = resolve; });
+  const started = new Promise((resolve) => { entered = resolve; });
+  const h = harness({ allocationLimits: { maxConcurrent: 1 }, renterBalance: async () => { entered(); return balance; } });
+  const first = h.call(RESERVE_PATH, { nonce: nonce(1), renter: renter(1), fundingWei: '1' });
+  await started;
+  const rejected = await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(2) });
+  assert.equal(rejected.status, 503);
+  assert.equal(rejected.body.code, 'KEY_STORE_BUSY');
+  assert.equal((await h.call(RELEASE_PATH, { nonce: nonce(3), renter: renter(3) })).status, 200);
+  completeBalance(RICH);
+  assert.equal((await first).status, 201);
+  assert.equal((await h.call(RESERVE_PATH, { nonce: nonce(2), renter: renter(2) })).status, 201);
+});
 
 test("reserve: 201 with a fresh random operator that is on disk BEFORE the answer; a retry returns the same one", async () => {
   const h = harness({ store: "disk" });

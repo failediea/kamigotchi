@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { ALLOCATION_LIMITS, allocationLimit, createAllocationLimiter } from "./renter-pod-allocation-limits.mjs";
 import { LeaseAlertCode } from "./renter-pod-alerts.mjs";
 import { bindOperatorReservationQuote, reserveRandomOperator } from "./renter-pod-keys.mjs";
 import {
@@ -58,7 +59,9 @@ function writeJson(response, status, body, { retryAfterSec } = {}) {
  * QUOTES HOLD NO CAPACITY (renter-pod-reservations.mjs): every quote gets a
  * fresh random operator key, which is made durable (persist -> quote store
  * append + fsync) BEFORE the operator address or the keeper signature is
- * returned, but nothing counts those keys. The only caps are on-chain leases.
+ * returned. Quotes do not reserve a lease or lock a listing. Separate
+ * infrastructure ceilings refuse new allocations during overload; existing
+ * signed keys are never evicted to make room.
  *
  * Status contract with the web lane:
  *   401 bad token, 404 unknown route, 400 malformed/mismatched request,
@@ -72,7 +75,9 @@ function writeJson(response, status, body, { retryAfterSec } = {}) {
  *       { error, code: BALANCE_UNAVAILABLE } when the renter's balance could
  *       not be read (fails closed, never admits), or
  *       { error, code: KEY_STORE_UNAVAILABLE } when the operator key could not
- *       be made durable (nothing is returned for that quote).
+ *       be made durable (nothing is returned for that quote), or
+ *       KEY_STORE_CAPACITY / KEY_ALLOCATION_RATE / KEY_STORE_BUSY when bounded
+ *       infrastructure resources are full (no key is evicted).
  *       Every 503 carries Retry-After: 60.
  *
  * Request bodies:
@@ -116,11 +121,16 @@ export function createReservationHandler({
   // Worker: provider.getBalance(renter) on the configured RPC. Required while
   // policy.requireRenterBalance is on (never silently skipped).
   renterBalance,
+  allocationLimits = ALLOCATION_LIMITS,
 }) {
   if (typeof persist !== "function") throw new Error("a durable persist(nonces) is required");
   if (policy.requireRenterBalance && typeof renterBalance !== "function") {
     throw new Error("REQUIRE_RENTER_BALANCE is on but no renter balance reader was provided");
   }
+  const limits = Object.fromEntries(Object.entries(ALLOCATION_LIMITS).map(([name, fallback]) =>
+    [name, allocationLimit(allocationLimits?.[name], fallback, name)]));
+  const admitAllocation = createAllocationLimiter({ ...limits, now });
+  let inFlight = 0;
 
   /** Balance gate verdict; an RPC failure fails CLOSED (503). */
   async function checkRenterBalance(renter, requiredWei) {
@@ -154,7 +164,7 @@ export function createReservationHandler({
     }
   }
 
-  return async function handleReservationRequest(request, response) {
+  async function handleReservationRequest(request, response) {
     try {
       if (request.method !== "POST" || !ROUTES.has(request.url)) {
         writeJson(response, 404, { error: "not found" });
@@ -267,6 +277,11 @@ export function createReservationHandler({
         if (current === "") {
           // Idempotent retry of the same quote: already durable.
           writeJson(response, 201, { operator: storedReservation(state, nonce).operator });
+          return;
+        }
+        const allocationError = admitAllocation(state.reservations);
+        if (allocationError) {
+          writeJson(response, 503, { code: allocationError, error: "New quote capacity is temporarily unavailable; existing leases and signed quotes remain protected." });
           return;
         }
         const reservation = reserveRandomOperator(state, nonce, {
@@ -394,5 +409,17 @@ export function createReservationHandler({
       log(`operator reservation failed: ${error instanceof Error ? error.message : error}`);
       if (!response.headersSent) writeJson(response, 400, { error: "operator reservation failed" });
     }
+  }
+  return async (request, response) => {
+    // Bounds slow authenticated RPC work in this process. Release remains
+    // available under load so cleanup cannot be starved by quote traffic.
+    const counted = request.url !== RELEASE_PATH && authorizedReservationRequest(request.headers.authorization, token);
+    if (counted && inFlight >= limits.maxConcurrent) {
+      writeJson(response, 503, { code: "KEY_STORE_BUSY", error: "Quote service is busy; try again shortly." });
+      return;
+    }
+    if (counted) inFlight++;
+    try { await handleReservationRequest(request, response); }
+    finally { if (counted) inFlight--; }
   };
 }
