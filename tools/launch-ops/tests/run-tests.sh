@@ -118,10 +118,12 @@ ZERO=0x0000000000000000000000000000000000000000
 [ -n "$NODE" ] || { echo 'node is required for the deterministic RPC fixture' >&2; exit 2; }
 start_fake_rpc
 export YOMINET_RPC_PUBLIC="$FAKE_RPC"
+FIXTURE_MINED_TX=0x$(w 100)
 cat > "$T/rpc.json" <<EOF
 {"eth_getBalance":"0x1","eth_getTransactionByHash":null,"eth_getTransactionReceipt":null,
+ "eth_getTransactionReceipt:$FIXTURE_MINED_TX":{"blockNumber":"0x80","status":"0x1"},
  "eth_gasPrice":"0x2625a0","eth_maxPriorityFeePerGas":"0x0",
- "eth_getCode":"0x6000","eth_blockNumber":"0x100","eth_getBlockByNumber":{"transactions":[],"baseFeePerGas":"0x2625a0"},
+ "eth_getCode":"0x6000","eth_blockNumber":"0x100","eth_getBlockByNumber":{"transactions":["$FIXTURE_MINED_TX"],"baseFeePerGas":"0x2625a0"},
  "eth_call":"0x$(printf '%0896d' 0)",
  "eth_call:0x4a34d4847d8e2958e4017353e71fab7afb85bd23:0x90af04c1":"0x$(w 2)"}
 EOF
@@ -368,20 +370,7 @@ else
   expect_grep "$T/gate15.out" "inflightWindow=2100s" "default window is RESERVATION_TTL_SEC + 900"
 fi
 # T1 resolves tracked hashes over RPC: a mined or unknown (dropped) hash is not in flight
-REAL_TX=""
-tip=$(curl -s -m 15 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-  "$YOMINET_RPC_PUBLIC" | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')
-if [ -n "$tip" ]; then
-  for back in $(seq 0 30); do
-    REAL_TX=$(curl -s -m 15 -X POST -H 'content-type: application/json' \
-      --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$(printf '0x%x' $(( $((tip)) - back - 5 )))\",false]}" \
-      "$YOMINET_RPC_PUBLIC" | grep -oE '"transactions":\["0x[0-9a-fA-F]{64}' | grep -oE '0x[0-9a-fA-F]{64}' || true)
-    [ -z "$REAL_TX" ] || break
-  done
-fi
-if [ -z "$REAL_TX" ]; then skip "gate T1 live-transaction sample (fixture has no mined transactions; pending/mined/dropped are exercised below)"
-else
-  RESOLVED=$(printf '{"lastBlock":1,"jobs":{},"reservations":{},"pendingTxs":{"7":{"hash":"%s","nonce":3,"from":"0x1","label":"endLease","sentAt":1},"8":{"hash":"0x%s","nonce":4,"from":"0x1","label":"stopHarvest","sentAt":1}}}' "$REAL_TX" "$(printf 'd%.0s' $(seq 1 64))")
+  RESOLVED=$(printf '{"lastBlock":1,"jobs":{},"reservations":{},"pendingTxs":{"7":{"hash":"%s","nonce":3,"from":"0x1","label":"endLease","sentAt":1},"8":{"hash":"0x%s","nonce":4,"from":"0x1","label":"stopHarvest","sentAt":1}}}' "$FIXTURE_MINED_TX" "$(printf 'd%.0s' $(seq 1 64))")
   rc=0; run_state "$T/gate16.out" lease-transition-gate.sh "$RESOLVED" --market vipp || rc=$?
   if [ "$rc" = 99 ]; then skip "gate T1 RPC resolution (needs jq or LAUNCH_OPS_TEST_REMOTE)"
   else
@@ -389,7 +378,6 @@ else
     expect_grep "$T/gate16.out" "is mined: not in flight" "mined tracked tx resolved over RPC"
     expect_grep "$T/gate16.out" "is dropped: not in flight" "unknown tracked tx resolved as dropped"
   fi
-fi
 # R1-store: the quote key store (snapshot + journal) replayed like readQuoteStore(); the
 # fixtures travel in test-hook env vars, so this also runs read-only over ssh
 N1=0x$(printf '%064d' 11); N2=0x$(printf '%064d' 12); N3=0x$(printf '%064d' 13)

@@ -9,8 +9,8 @@
  *       at the billed maxFeePerGas it is below -> EXIT_RESERVE_STOP + harvest stop.
  *   #22 stage 3 ACTIVE, healthy escrow, pullGas needed. The node ACCEPTS the
  *       pullGas but answers eth_sendRawTransaction after the client timeout,
- *       then keeps it pending (and getTransactionByHash flakes to null) for a
- *       few seconds -> exactly ONE pullGas ever reaches the node.
+ *       then keeps it pending (and getTransactionByHash flakes to null) until
+ *       the worker rebroadcasts the SAME hash -> exactly ONE pullGas is accepted.
  *   #23 stage 2, Kami at the hub. The factory request flips to another pod
  *       between processJob's read and the keeper send -> routePreparedKami is
  *       never sent (keeper preflight).
@@ -98,7 +98,8 @@ function scenario() {
 function mockChain(kamis) {
   const sent = [];
   const receipts = new Map();
-  const pending = new Map(); // hash -> { minesAt, apply }
+  const pending = new Map(); // hash -> { rebroadcasts, releaseReply, apply }
+  const rebroadcasts = [];
   const logRanges = [];
   // Like a real node: "pending" nonce counts mempool txs, "latest" only mined.
   const accepted = new Map();
@@ -110,7 +111,9 @@ function mockChain(kamis) {
 
   function mine() {
     for (const [hash, entry] of pending) {
-      if (Date.now() < entry.minesAt) continue;
+      // A fixed five-second mempool window races a niced/loaded worker. Mine
+      // only after observing the retry this test actually needs to exercise.
+      if (entry.rebroadcasts === 0) continue;
       pending.delete(hash);
       entry.apply();
       receipts.set(hash, entry.receipt);
@@ -198,35 +201,45 @@ function mockChain(kamis) {
     };
   }
 
-  /** Returns { hash, delayMs } - delayMs > 0 answers after the client timeout. */
+  /** The first pullGas reply stays blocked until a same-hash retry is observed. */
   function sendRaw(raw) {
     const tx = Transaction.from(raw);
     const hash = tx.hash;
-    if (receipts.has(hash) || pending.has(hash)) return { hash, delayMs: 0 }; // rebroadcast: idempotent
+    if (receipts.has(hash)) return { hash }; // already mined: idempotent
+    if (pending.has(hash)) {
+      const entry = pending.get(hash);
+      entry.rebroadcasts++;
+      rebroadcasts.push(hash);
+      entry.releaseReply();
+      return { hash }; // accepted bytes are identical; never another nonce
+    }
     const to = String(tx.to).toLowerCase();
     const from = tx.from.toLowerCase();
     sent.push({ hash, to, from, data: tx.data, selector: tx.data.slice(0, 10), type: tx.type, nonce: tx.nonce });
     bump(accepted, from);
     const kami = byOperator[from];
     if (to === FACTORY && tx.data.startsWith(selector("pullGas"))) {
-      // Accepted, but the answer arrives after FETCH_TIMEOUT_MS and the tx sits
-      // in the mempool (invisible to getTransactionByHash) for 5 s.
+      // Withhold this reply until the worker times out and rebroadcasts. This
+      // proves the timeout path without assuming host scheduling or wall time.
       const [, amount] = factoryIface.decodeFunctionData("pullGas", tx.data);
+      let releaseReply;
+      const responseReady = new Promise((resolve) => { releaseReply = resolve; });
       pending.set(hash, {
         from,
-        minesAt: Date.now() + 5_000,
+        rebroadcasts: 0,
+        releaseReply,
         receipt: receiptFor(tx),
         apply: () => {
           kami.balance += amount;
           kami.gasBudget -= amount;
         },
       });
-      return { hash, delayMs: 3_000 };
+      return { hash, responseReady };
     }
     if (to === HARVEST_STOP) byOperator[from].kamiState = "RESTING";
     receipts.set(hash, receiptFor(tx));
     bump(mined, from);
-    return { hash, delayMs: 0 };
+    return { hash };
   }
 
   async function handle({ id, method, params }) {
@@ -259,8 +272,8 @@ function mockChain(kamis) {
         return ok(toBeHex((params[1] === "pending" ? accepted : mined).get(from) ?? 0));
       }
       case "eth_sendRawTransaction": {
-        const { hash, delayMs } = sendRaw(params[0]);
-        if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const { hash, responseReady } = sendRaw(params[0]);
+        if (responseReady) await responseReady;
         return ok(hash);
       }
       case "eth_getTransactionReceipt":
@@ -288,7 +301,8 @@ function mockChain(kamis) {
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify(result));
   });
-  return { server, sent, logRanges };
+  const releaseReplies = () => { for (const entry of pending.values()) entry.releaseReply(); };
+  return { server, sent, logRanges, rebroadcasts, releaseReplies };
 }
 
 function mockKamibots() {
@@ -388,7 +402,7 @@ test("real worker: billed-fee exit reserve, no duplicate pullGas across a broadc
   child.stderr.on("data", (chunk) => (output += chunk));
   const pulls = () => chain.sent.filter((tx) => tx.to === FACTORY && tx.selector === selector("pullGas"));
   try {
-    // #22 progresses only after its single pullGas is mined (~5 s) and cleared.
+    // #22 progresses only after the SAME pullGas was retried, mined and cleared.
     await waitFor(
       () => kamibots.starts.some((body) => body.kamiId === 22),
       45_000,
@@ -403,6 +417,7 @@ test("real worker: billed-fee exit reserve, no duplicate pullGas across a broadc
     // invisible; the worker waited (rebroadcasting the same bytes) instead of
     // sending a second pullGas under a new nonce.
     assert.equal(pulls().length, 1, `exactly one pullGas reached the node; sent: ${JSON.stringify(pulls())}`);
+    assert.ok(chain.rebroadcasts.includes(pulls()[0].hash), "same signed hash was retried before mining");
     assert.match(output, /\[LEASE-ALERT\] TX_TIMEOUT job=22:.* label=pullGas .*state=unseen-rebroadcast/);
     assert.equal(state.pendingTxs?.["22:" + jobs[22].nonce], undefined, "cleared once mined");
     assert.equal(pulls()[0].type, 2, "default pricing keeps ethers' EIP-1559 txs");
@@ -435,6 +450,7 @@ test("real worker: billed-fee exit reserve, no duplicate pullGas across a broadc
   } finally {
     child.kill("SIGTERM");
     await childExit;
+    chain.releaseReplies(); // also unblock the server when a preceding assertion fails
     await new Promise((resolve) => chain.server.close(resolve));
     await new Promise((resolve) => kamibots.server.close(resolve));
     rmSync(dir, { recursive: true, force: true });
