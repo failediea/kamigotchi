@@ -1,0 +1,27 @@
+[Unit]
+Description=Authenticated Kamistats lease-history refresh
+After=network-online.target
+Wants=network-online.target
+OnFailure=kami-lease-ops-onfailure@%n.service
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+LoadCredential=event-sync-token:/etc/kami-lease-ops/event-sync-token
+ExecStart=/opt/kami-lease/runtime/node-v22.23.4/bin/node /opt/kami-lease-ops/indexer/lease-event-sync.mjs --apply
+TimeoutStartSec=300
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=256M
+CPUQuota=25%

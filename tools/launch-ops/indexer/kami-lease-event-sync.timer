@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh confirmed lease history without public-GET backfills
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=kami-lease-event-sync.service
+
+[Install]
+WantedBy=timers.target
