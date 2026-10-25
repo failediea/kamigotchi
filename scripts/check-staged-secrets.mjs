@@ -1,11 +1,23 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const repo = dirname(dirname(fileURLToPath(import.meta.url)));
-const git = ["--git-dir", join(repo, ".git"), "--work-tree", repo];
-const names = execFileSync("git", [...git, "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], {
+const args = process.argv.slice(2);
+const repo = process.env.SECRET_SCAN_REPO || dirname(dirname(fileURLToPath(import.meta.url)));
+// A linked worktree has a .git FILE. Let Git resolve its own index/object store.
+const git = ["-C", repo];
+let base;
+if (args.length) {
+  if (args.length !== 2 || args[0] !== "--base" || args[1].startsWith("-")) {
+    throw new Error("Usage: check-staged-secrets.mjs [--base <revision>]");
+  }
+  base = execFileSync("git", [...git, "rev-parse", "--verify", `${args[1]}^{commit}`], {
+    encoding: "utf8",
+  }).trim();
+}
+const range = base ? [`${base}...HEAD`] : ["--cached"];
+const names = execFileSync("git", [...git, "diff", ...range, "--name-only", "--diff-filter=ACMR", "-z"], {
   encoding: "utf8",
 }).split("\0").filter(Boolean);
 
@@ -23,15 +35,12 @@ for (const name of names) {
     violations.push(`${name}: secret-bearing filename`);
     continue;
   }
-  let content;
-  try {
-    content = execFileSync("git", [...git, "show", `:${name}`], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-    });
-  } catch {
-    continue;
-  }
+  // Fail closed on unreadable/oversized content; silently skipping it would
+  // let a failed scan masquerade as a clean release.
+  const content = execFileSync("git", [...git, "show", base ? `HEAD:${name}` : `:${name}`], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
   let liveEnvValue = false;
   for (const match of content.matchAll(envAssignment)) {
     const value = match[1].replace(/^['"]|['"]$/g, "").trim();
@@ -52,4 +61,4 @@ if (violations.length) {
   process.exit(1);
 }
 
-console.log(`Secret scan passed (${names.length} staged files).`);
+console.log(`Secret scan passed (${names.length} ${base ? "release" : "staged"} files).`);
