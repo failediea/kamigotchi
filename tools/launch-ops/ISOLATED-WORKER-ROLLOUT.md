@@ -95,9 +95,19 @@ verified through a healthy RPC. Those operational items remain open.
 
 ## Rollback: state must move forward, never back
 
-- Before the migrated worker has run, leaving it stopped and moving only the
-  new `90-isolated-worker.conf` aside can restore the original unit. Preserve
-  the new directory and receipt for inspection. Do not delete old files.
+- Before the migrated worker has run or answered any quote, keep it stopped
+  and keep quotes halted. Securely archive both the new
+  `90-isolated-worker.conf` and `/etc/kami-lease/<stack>.env` outside their
+  active paths. Preserve root ownership and mode 0600 on the archived env;
+  it contains credentials. Do not print it or discard the isolated state,
+  migration receipt, or original files.
+- The env file is also a migration marker: alerts, gas sponsorship and the
+  transition gate prefer it whenever it is readable, independently of the
+  service drop-in. Removing only the drop-in would leave those readers on a
+  stale state copy. Run `systemctl daemon-reload`, inspect the restored unit,
+  and verify every reader resolves the original environment, state and
+  heartbeat paths before starting the old service or lifting HALT. Do not
+  run a gas sponsor in apply mode just to verify its configuration.
 - **After it has run or answered any quote, the old state snapshot is stale.**
   Do not simply remove the drop-in and start the old service. Keep HALT, stop
   the new worker, resolve pending transactions, and drain signed quotes through
