@@ -19,7 +19,7 @@ for NODE in $(node -e 'console.log(JSON.parse(require("fs").readFileSync("pods.j
   OP_KEY=$(NODE_IDX=$NODE node -e 'const p=JSON.parse(require("fs").readFileSync("pods.json")).pods.find(x=>x.node==process.env.NODE_IDX);console.log(p.operatorKey)')
   REG_KEY=$(node -e 'const{Wallet}=require("ethers");console.log(Wallet.createRandom().privateKey)')
   echo "=== registering pod $NODE (fresh REG wallet, operator from pods.json) ==="
-  REG_PRIVATE_KEY="$REG_KEY" OPERATOR_PRIVATE_KEY="$OP_KEY" CREDS_FILE="$CREDS" \
+  REG_PRIVATE_KEY="${REG_KEY}" OPERATOR_PRIVATE_KEY="${OP_KEY}" CREDS_FILE="$CREDS" \
     node kamibots-onboard.mjs register
   chmod 600 "$CREDS" 2>/dev/null || true
   echo "pod $NODE done -> $CREDS"
