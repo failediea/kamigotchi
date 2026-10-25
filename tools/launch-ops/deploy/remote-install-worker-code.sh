@@ -118,7 +118,7 @@ for v in DRAIN_WAIT_SEC DRAIN_MARGIN_SEC DRAIN_POLL_SEC; do
 done
 
 KAMI_ROOT="${KAMI_ROOT:-/root/kamigotchi/tools}"
-NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
+NODE_BIN="${NODE_BIN:-/opt/kami-lease/runtime/node-v22.23.4/bin/node}"
 NODE_MODULES="${NODE_MODULES:-$KAMI_ROOT/vault-kit/node_modules}"
 RPC="${YOMINET_RPC_PUBLIC:-https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz}"
 RPC_SRC="public default"
@@ -172,6 +172,8 @@ case "$MARKET" in musu) PORT=8791 ;; vipp) PORT=8792 ;; *) die "--market musu|vi
 DIR="$KAMI_ROOT/vault-kit-v16-$MARKET"
 UNIT="kami-renter-pod-v16-$MARKET"
 [ -d "$DIR" ] || die "$DIR missing"
+live_dir=$(systemctl show "$UNIT" --property=WorkingDirectory --value 2>/dev/null || true)
+case "$live_dir" in /opt/kami-lease/releases/*) die "isolated immutable release: do not use the legacy in-place deploy/rollback path; follow ISOLATED-WORKER-ROLLOUT.md" ;; esac
 
 env_value() { # KEY -> value as the worker's .env loader reads it (renter-pod-config.mjs
   # parseEnvText + loadEnvFile: optional "export ", LAST line wins, trimmed, one pair of

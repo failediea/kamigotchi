@@ -278,7 +278,7 @@ local_tests() {
   ver() { python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])'; }
   lv=$(ver < "$nm/ethers/package.json")
   rv=$("${SSH[@]}" "cat $REMOTE_ROOT/vault-kit/node_modules/ethers/package.json" | ver) || rv="unknown"
-  log "off-box tests: node $("$node" -v) here (the VPS runs v20.20.0), ethers $lv here / $rv on the VPS"
+  log "off-box tests: node $("$node" -v) here (verify the VPS running executable separately), ethers $lv here / $rv on the VPS"
   [ "$lv" = "$rv" ] || [ "$ALLOW_DEP_CHANGE" = 1 ] || die "ethers differs (here $lv, VPS $rv): off-box tests would not prove the box. Use --tests box, or --allow-dep-change"
   NODE_BIN="$node" NODE_MODULES="$nm" bash "$HERE/deploy/remote-install-worker-code.sh" --action test --staging "$WORK/stage" --min-mem-mb 0 \
     || die "tests failed off-box; nothing live changed"

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Local tests for tools/launch-ops. Needs bash, curl, awk, node; jq only for the
 # transition-gate state tests. systemctl / journalctl / ss / id / ntfy are shimmed.
-# Chain reads go either to the public Yominet RPC (read-only eth_call /
-# eth_getBalance / eth_getCode only) or to tests/fake-rpc.mjs on 127.0.0.1, which
+# Chain reads use deterministic tests/fake-rpc.mjs fixtures on 127.0.0.1, which
 # never accepts a transaction. Nothing is signed or sent: the --apply runs of the
 # keeper/sponsor use a placeholder key file and a fake ethers dir, and the tests
 # assert eth_sendRawTransaction / eth_chainId were never called.
@@ -99,6 +98,8 @@ asroot() { PATH="$T/rootbin:$PATH" "$@"; }
 
 # ---- fake RPC ----
 start_fake_rpc() {
+  if [ -n "$RPC_PID" ]; then kill "$RPC_PID" 2>/dev/null || true; fi
+  rm -f "$T/rpc.port"
   echo '{}' > "$T/rpc.json"
   : > "$T/rpc.log"
   FAKE_RPC_CONFIG="$T/rpc.json" FAKE_RPC_LOG="$T/rpc.log" FAKE_RPC_PORT_FILE="$T/rpc.port" "$NODE" "$HERE/fake-rpc.mjs" &
@@ -110,6 +111,20 @@ start_fake_rpc() {
 w() { printf '%064x' "$1"; }                                  # uint word
 aw() { local a=${1#0x}; printf '%064s' "$a" | tr ' ' 0; }      # address word
 ZERO=0x0000000000000000000000000000000000000000
+
+# Regression tests must not depend on today's public-chain balances, listing
+# counts, or RPC availability. Live evidence is a SEPARATE read-only command:
+# capture-market-baseline.mjs. The Oct25 upstream outage exposed this coupling.
+[ -n "$NODE" ] || { echo 'node is required for the deterministic RPC fixture' >&2; exit 2; }
+start_fake_rpc
+export YOMINET_RPC_PUBLIC="$FAKE_RPC"
+cat > "$T/rpc.json" <<EOF
+{"eth_getBalance":"0x1","eth_getTransactionByHash":null,"eth_getTransactionReceipt":null,
+ "eth_gasPrice":"0x2625a0","eth_maxPriorityFeePerGas":"0x0",
+ "eth_getCode":"0x6000","eth_blockNumber":"0x100","eth_getBlockByNumber":{"transactions":[],"baseFeePerGas":"0x2625a0"},
+ "eth_call":"0x$(printf '%0896d' 0)",
+ "eth_call:0x4a34d4847d8e2958e4017353e71fab7afb85bd23:0x90af04c1":"0x$(w 2)"}
+EOF
 
 # ---- fixtures ----
 K="$T/tools"
@@ -216,6 +231,17 @@ expect_count "$NTFY_LOG" "Title: DEAD_KAMI on" $((c0 + 1)) "neither token re-sen
 rc=0; OPERATOR_ACTION_GAS_FLOOR='"1700000"' "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/run7.out" 2>&1 || rc=$?
 expect_rc "$rc" 2 "a quoted numeric knob is a clear startup error"
 expect_grep "$T/run7.out" "OPERATOR_ACTION_GAS_FLOOR must be a non-negative integer" "the malformed knob is named"
+
+echo "== isolated state layout and legacy semantic monitoring"
+ISO_ENV="$T/isolated-env"; ISO_STATE="$T/isolated-state"
+mkdir -p "$ISO_ENV" "$ISO_STATE"
+printf 'export WORKER_STATE_FILE="%s/state.json"\n' "$ISO_STATE" > "$ISO_ENV/v16-musu.env"
+printf '{"lastBlock":1,"jobs":{}}\n' > "$ISO_STATE/state.json"; chmod 600 "$ISO_STATE/state.json"
+printf '{"ts":%s,"lastBlock":1,"lastTickOk":true,"activeJobs":0,"liveReservations":0,"tickMs":1}\n' "$(date +%s)" > "$ISO_STATE/heartbeat.json"
+printf '[LEASE-ALERT] DEAD_KAMI token=16218 phase=legacy-return reason=DEAD\n' > "$T/journal/kami-lease-bot-v13-musu"
+KAMI_WORKER_ENV_DIR="$ISO_ENV" "$OPS/alerts/worker-alerts-v2.sh" --dry-run > "$T/isolated.out" 2>&1
+expect_nogrep "$T/isolated.out" 'worker heartbeat STALE: kami-renter-pod-v16-musu' 'isolated quoted state path takes precedence over stale original state'
+expect_grep "$T/isolated.out" 'DEAD_KAMI on kami-lease-bot-v13-musu' 'v13 semantic DEAD alert is monitored by default'
 
 
 echo "== alerts v2: quote key store (size, disk, key-file mode) + new worker alert codes"
@@ -344,16 +370,16 @@ fi
 # T1 resolves tracked hashes over RPC: a mined or unknown (dropped) hash is not in flight
 REAL_TX=""
 tip=$(curl -s -m 15 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-  https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')
+  "$YOMINET_RPC_PUBLIC" | sed -nE 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/p')
 if [ -n "$tip" ]; then
   for back in $(seq 0 30); do
     REAL_TX=$(curl -s -m 15 -X POST -H 'content-type: application/json' \
       --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$(printf '0x%x' $(( $((tip)) - back - 5 )))\",false]}" \
-      https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz | grep -oE '"transactions":\["0x[0-9a-fA-F]{64}' | grep -oE '0x[0-9a-fA-F]{64}' || true)
+      "$YOMINET_RPC_PUBLIC" | grep -oE '"transactions":\["0x[0-9a-fA-F]{64}' | grep -oE '0x[0-9a-fA-F]{64}' || true)
     [ -z "$REAL_TX" ] || break
   done
 fi
-if [ -z "$REAL_TX" ]; then skip "gate T1 RPC resolution (no recent mined tx found on the public RPC)"
+if [ -z "$REAL_TX" ]; then skip "gate T1 live-transaction sample (fixture has no mined transactions; pending/mined/dropped are exercised below)"
 else
   RESOLVED=$(printf '{"lastBlock":1,"jobs":{},"reservations":{},"pendingTxs":{"7":{"hash":"%s","nonce":3,"from":"0x1","label":"endLease","sentAt":1},"8":{"hash":"0x%s","nonce":4,"from":"0x1","label":"stopHarvest","sentAt":1}}}' "$REAL_TX" "$(printf 'd%.0s' $(seq 1 64))")
   rc=0; run_state "$T/gate16.out" lease-transition-gate.sh "$RESOLVED" --market vipp || rc=$?
@@ -437,7 +463,7 @@ else
   skip "gate truncated reservations file (needs local jq)"
 fi
 
-echo "== gas sponsor (real RPC, state fixture) + expiry keeper"
+echo "== gas sponsor (deterministic RPC, state fixture) + expiry keeper"
 J999='{"lastBlock":1,"jobs":{"999":{"tokenIndex":999,"operator":"0x0000000000000000000000000000000000000001","pod":"0x0000000000000000000000000000000000000002","returned":false,"__OPKEY__":"0xSHOULD_NEVER_BE_PRINTED"}}}'
 J999=${J999/__OPKEY__/operator''Key}
 rc=0; LAUNCH_OPS_TEST_STATE_JSON="$J999" "$OPS/keeper/lease-gas-sponsor.sh" --dry-run > "$T/sponsor.out" 2>&1 || rc=$?
@@ -451,7 +477,7 @@ rc=0; SPONSOR_KEY_FILE="" "$OPS/keeper/lease-gas-sponsor.sh" --apply > "$T/spons
 rc=0; "$OPS/keeper/lease-expiry-keeper.sh" --dry-run > "$T/keeper.out" 2>&1 || rc=$?
 expect_rc "$rc" 0 "keeper dry-run exit 0"
 expect_grep "$T/keeper.out" "[dry-run] no transactions sent" "keeper dry-run sends nothing"
-expect_grep "$T/keeper.out" "listings=2" "keeper enumerated the VIPP listings on chain"
+expect_grep "$T/keeper.out" "listings=2" "keeper enumerated the two fixture VIPP listings"
 rc=0; "$OPS/keeper/lease-expiry-keeper.sh" --apply > "$T/keeper-apply.out" 2>&1 || rc=$?
 [ "$rc" != 0 ] && ok "keeper --apply without key file refuses" || bad "keeper --apply ran without a key"
 

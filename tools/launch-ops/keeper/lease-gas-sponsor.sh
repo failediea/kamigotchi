@@ -93,7 +93,7 @@ TX_WAIT_TIMEOUT_MS="${TX_WAIT_TIMEOUT_MS:-120000}"
 SIGNER_RPC_TIMEOUT_MS="${SIGNER_RPC_TIMEOUT_MS:-20000}"
 SPONSOR_KEY_FILE="${SPONSOR_KEY_FILE:-}"
 SPONSOR_ADDRESS="${SPONSOR_ADDRESS:-}"
-NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
+NODE_BIN="${NODE_BIN:-/opt/kami-lease/runtime/node-v22.23.4/bin/node}"
 ETHERS_NODE_PATH="${ETHERS_NODE_PATH:-/root/kamigotchi/tools/vault-kit/node_modules}"
 PERSIST_DIR="${ALERT_PERSIST_DIR:-/var/lib/kami-lease-ops}"
 LEDGER="$PERSIST_DIR/sponsor-ledger.tsv"
@@ -157,9 +157,11 @@ lc() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
 market_dir() { printf '%s/vault-kit-v16-%s' "$KAMI_ROOT" "$1"; }
 market_addr() { if [ "$1" = musu ]; then printf '%s' "$MUSU_MARKET"; else printf '%s' "$VIPP_MARKET"; fi; }
 state_file_for() {
-  local dir="$1" v=""
-  if [ -r "$dir/.env" ]; then
-    v=$(grep -E '^WORKER_STATE_FILE=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^ +| +$//g' || true)
+  local dir="$1" v="" stack="${1##*/}" ef
+  ef="${KAMI_WORKER_ENV_DIR:-/etc/kami-lease}/${stack#vault-kit-}.env"
+  [ -r "$ef" ] || ef="$dir/.env"
+  if [ -r "$ef" ]; then
+    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?WORKER_STATE_FILE[[:space:]]*=' "$ef" | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
   fi
   [ -n "$v" ] || v="$dir/renter-pod-worker-state.json"
   case "$v" in /*) ;; *) v="$dir/$v" ;; esac

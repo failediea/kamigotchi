@@ -50,7 +50,7 @@ V16_MARKETS="${V16_MARKETS:-musu vipp}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/launch-ops-backups}"
 STAGING_ROOT="${STAGING_ROOT:-/root/launch-ops-staging}"
-NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
+NODE_BIN="${NODE_BIN:-/opt/kami-lease/runtime/node-v22.23.4/bin/node}"
 ETHERS_NODE_PATH="${ETHERS_NODE_PATH:-/root/kamigotchi/tools/vault-kit/node_modules}"
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }

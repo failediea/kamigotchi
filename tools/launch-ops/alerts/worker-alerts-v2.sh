@@ -76,7 +76,7 @@ fi
 RPC="${YOMINET_RPC_PUBLIC:-https://jsonrpc-yominet-1.anvil.asia-southeast.initia.xyz}"
 RPC_TIMEOUT_SEC="${RPC_TIMEOUT_SEC:-15}"
 KAMI_ROOT="${KAMI_ROOT:-/root/kamigotchi/tools}"
-LEGACY_UNITS="${LEGACY_UNITS-kami-renter-pod-v15-musu kami-renter-pod-v15-vipp}" # empty = none
+LEGACY_UNITS="${LEGACY_UNITS-kami-renter-pod-v15-musu kami-renter-pod-v15-vipp kami-lease-bot-v13-musu kami-lease-bot-v13-vipp}" # empty = none
 V16_MARKETS="${V16_MARKETS:-musu vipp}"
 INFRA_UNITS="${INFRA_UNITS-caddy}"
 SELF_TIMER="${SELF_TIMER:-kami-worker-alerts.timer}"
@@ -356,7 +356,7 @@ hb_field() { # file key -> first scalar value for "key"
   tr -d '\n' < "$1" | sed -nE "s/.*\"$2\"[[:space:]]*:[[:space:]]*([-0-9.]+|true|false|null).*/\\1/p"
 }
 # Worker-state reads use jq, else node (the box has node for the workers).
-NODE_BIN="${NODE_BIN:-/root/.nvm/versions/node/v20.20.0/bin/node}"
+NODE_BIN="${NODE_BIN:-/opt/kami-lease/runtime/node-v22.23.4/bin/node}"
 [ -x "$NODE_BIN" ] || NODE_BIN=$(command -v node 2>/dev/null || true)
 HAVE_JQ=1
 if ! command -v jq >/dev/null 2>&1 && [ -z "$NODE_BIN" ]; then
@@ -385,19 +385,26 @@ state_jobs() { # state_file errors|all -> TSV per non-returned job (errors: toke
 }
 
 # ---- heartbeat / state per v16 worker ---------------------------------------------------------
+worker_env_for() {
+  local dir="$1" stack="${1##*/}" candidate
+  candidate="${KAMI_WORKER_ENV_DIR:-/etc/kami-lease}/${stack#vault-kit-}.env"
+  if [ -r "$candidate" ]; then printf '%s' "$candidate"; else printf '%s/.env' "$dir"; fi
+}
 state_file_for() { # market dir -> absolute state file path (reads only WORKER_STATE_FILE from .env)
-  local dir="$1" v=""
-  if [ -r "$dir/.env" ]; then
-    v=$(grep -E '^WORKER_STATE_FILE=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^ +| +$//g' || true)
+  local dir="$1" v="" ef
+  ef=$(worker_env_for "$dir")
+  if [ -r "$ef" ]; then
+    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?WORKER_STATE_FILE[[:space:]]*=' "$ef" | tail -1 | cut -d= -f2- | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
   fi
   [ -n "$v" ] || v="$dir/renter-pod-worker-state.json"
   case "$v" in /*) ;; *) v="$dir/$v" ;; esac
   printf '%s' "$v"
 }
 store_file_for() { # market dir, state file -> quote key store snapshot (RESERVATION_STATE_FILE or the default)
-  local dir="$1" sf="$2" v=""
-  if [ -r "$dir/.env" ]; then
-    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?RESERVATION_STATE_FILE[[:space:]]*=' "$dir/.env" | tail -1 | cut -d= -f2- | tr -d '\r' \
+  local dir="$1" sf="$2" v="" ef
+  ef=$(worker_env_for "$dir")
+  if [ -r "$ef" ]; then
+    v=$(grep -E '^[[:space:]]*(export[[:space:]]+)?RESERVATION_STATE_FILE[[:space:]]*=' "$ef" | tail -1 | cut -d= -f2- | tr -d '\r' \
       | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)
   fi
   [ -n "$v" ] || v="$(dirname "$sf")/$(basename "$sf" .json).reservations.json"

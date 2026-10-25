@@ -106,8 +106,11 @@ market_addr() { if [ "$1" = musu ]; then printf '%s' "$MUSU_MARKET"; else printf
 # loadEnvFile): optional "export ", LAST KEY= line wins, trimmed, one pair of matching
 # surrounding quotes stripped; an empty last value means unset. Never printed.
 env_value() { # dir KEY
-  [ -r "$1/.env" ] || return 0
-  tr -d '\r' < "$1/.env" | sed -nE "s/^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=(.*)\$/\\2/p" | tail -1 \
+  local stack="${1##*/}" ef
+  ef="${KAMI_WORKER_ENV_DIR:-/etc/kami-lease}/${stack#vault-kit-}.env"
+  [ -r "$ef" ] || ef="$1/.env"
+  [ -r "$ef" ] || return 0
+  tr -d '\r' < "$ef" | sed -nE "s/^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=(.*)\$/\\2/p" | tail -1 \
     | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
 }
 state_file_for() {
