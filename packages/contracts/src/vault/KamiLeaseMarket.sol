@@ -198,6 +198,8 @@ contract KamiLeaseMarket {
   error ProvisioningRequired();
   error InvalidPool();
   error StillHarvesting();
+  error NotHarvesting();
+  error ClaimsNotBacked();
 
   ///////////////////
   // EVENTS
@@ -567,7 +569,9 @@ contract KamiLeaseMarket {
     require(l.staked, NotInPoolYet());
     require(termSecs >= MIN_TERM && termSecs <= l.maxTermSecs, TermRails());
     require(LibKami.getAccount(_comps(), l.kamiID) == IRenterRoomPod(pod).accID(), NotArrived());
-    require(!LibKami.isState(_comps(), l.kamiID, "DEAD"), KamiDead());
+    // Custody arrival alone is not service delivery: cooldown/rest time must
+    // never consume the renter's paid term.
+    require(LibKami.isState(_comps(), l.kamiID, "HARVESTING"), NotHarvesting());
 
     _creditPending(tokenIndex); // setup-time XP remains the owner's
     l.renter = renter;
@@ -618,6 +622,8 @@ contract KamiLeaseMarket {
   function extendLease(uint32 tokenIndex, uint32 extraSecs) external {
     Listing storage l = _listings[tokenIndex];
     require(msg.sender == leaseFactory, NotFactory());
+    require(l.renter != address(0), NotLeased());
+    require(extraSecs != 0, TermRails());
     require(!l.ending, EndingNow());
     uint64 newEnd = l.leaseEnd + extraSecs;
     if (uint256(newEnd) - l.leaseStart > l.maxTermSecs) revert TermRails();
@@ -761,15 +767,10 @@ contract KamiLeaseMarket {
 
   /// @notice claim held MUSU (payee had no game account, or amount was below the
   ///         transfer fee). the fee comes out of the claimed amount.
-  /// @notice Claim your held balance. Pays in full when the hub is fully backed,
-  ///         and your PRO-RATA share of the balance when it is not.
-  /// @dev The old all-or-nothing `bal >= amount` guard settled a pool-wide
-  ///      shortfall by arrival order: early claimants were paid whole and the
-  ///      last one absorbed the entire gap. That fell hardest on exactly the
-  ///      wrong people — a renter can spread claims across a fresh EOA per lease,
-  ///      while an owner's earnings all land on the single beneficiary the pool
-  ///      registry records, so owners were structurally the ones left holding it.
-  ///      A partial claim shares the shortfall instead of assigning it.
+  /// @notice Claim your held balance once every user claim is backed.
+  /// @dev Preserve all claims during a shortfall until a sweep or replenishment
+  /// restores backing. Recomputing a partial ratio after each claim favors early
+  /// callers; checking only this caller's amount has the same ordering defect.
   function claimOwed() external nonReentrant {
     uint256 owed = owedMusu[msg.sender];
     require(owed > _claimFee(), NothingClaimable());
@@ -778,12 +779,7 @@ contract KamiLeaseMarket {
 
     uint256 bal = LibInventory.getBalanceOf(_comps(), accID, payItem);
     uint256 amount = owed;
-    if (bal < owedMusuTotal) {
-      // floor divides in the hub's favour, so the sum of every payee's share can
-      // never exceed the balance
-      amount = (bal * owed) / owedMusuTotal;
-      require(amount > _claimFee(), NothingClaimable());
-    }
+    require(bal >= owedMusuTotal, ClaimsNotBacked());
 
     owedMusu[msg.sender] = owed - amount; // remainder stays claimable
     owedMusuTotal -= amount; // release only what actually leaves

@@ -32,4 +32,5 @@ out = "out-v14"
 via_ir = true
 optimizer = true
 optimizer_runs = 1
+evm_version = "prague"
 out = "out-v17"

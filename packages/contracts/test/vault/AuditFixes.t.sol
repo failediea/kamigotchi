@@ -140,8 +140,18 @@ contract AuditFixesTest is SetupTemplate {
         podFactory.markLeasePreparing(q.tokenIndex);
         vm.prank(keeper);
         podFactory.routePreparedKami(q.tokenIndex);
+        // These accounting/recovery fixtures do not exercise harvest math.
+        // Model the verified start and subsequent rest; the personal-vault
+        // suite separately starts a real harvest before activation.
+        uint256 kamiID = market.listingKamiID(q.tokenIndex);
+        vm.startPrank(deployer);
+        LibKami.setState(components, kamiID, "HARVESTING");
+        vm.stopPrank();
         vm.prank(keeper);
         podFactory.activateProvisionedLease(q.tokenIndex);
+        vm.startPrank(deployer);
+        LibKami.setState(components, kamiID, "RESTING");
+        vm.stopPrank();
     }
 
     /////////////////
@@ -377,13 +387,7 @@ contract AuditFixesTest is SetupTemplate {
 
     function testRecoveryRotationIsRetryableWhenSquatted() public {
         uint32 tokenIndex = _listKami();
-        _submit(_quote(tokenIndex, bob.owner, "squatpod"));
-        vm.prank(keeper);
-        podFactory.markLeasePreparing(tokenIndex);
-        vm.prank(keeper);
-        podFactory.routePreparedKami(tokenIndex);
-        vm.prank(keeper);
-        podFactory.activateProvisionedLease(tokenIndex);
+        _activate(_quote(tokenIndex, bob.owner, "squatpod"));
         (, address podAddr,,,,) = podFactory.requests(tokenIndex);
 
         // the attack: claim the address the pod WOULD have rotated to. Under the
@@ -521,34 +525,43 @@ contract AuditFixesTest is SetupTemplate {
     /////////////////
     // FINDING 14 — a shortfall must be shared, not dumped on the last claimant
 
-    function testShortfallIsSplitProRataNotFirstComeFirstServed() public {
-        // two payees owed 1,000 each against only 1,000 of backing. Under the old
-        // all-or-nothing guard the first caller took the lot and the second could
-        // never claim a single unit.
+    function testShortfallPreservesAllClaimsUntilFullyBacked() public {
+        _assertShortfallHasNoClaimOrderAdvantage(alice.owner, bob.owner);
+    }
+
+    function testShortfallPreservesAllClaimsInReverseOrder() public {
+        _assertShortfallHasNoClaimOrderAdvantage(bob.owner, alice.owner);
+    }
+
+    function _assertShortfallHasNoClaimOrderAdvantage(address first, address second) internal {
         _credit(alice.owner, 1_000);
         _credit(bob.owner, 1_000);
         vm.startPrank(deployer);
         LibInventory.incFor(components, market.accID(), MUSU_INDEX, 1_000);
         vm.stopPrank();
 
+        vm.prank(first);
+        vm.expectRevert(KamiLeaseMarket.ClaimsNotBacked.selector);
+        market.claimOwed();
+        vm.prank(second);
+        vm.expectRevert(KamiLeaseMarket.ClaimsNotBacked.selector);
+        market.claimOwed();
+        assertEq(market.owedMusu(alice.owner), 1_000, "alice's full claim is preserved");
+        assertEq(market.owedMusu(bob.owner), 1_000, "bob's full claim is preserved");
+        assertEq(market.owedMusuTotal(), 2_000, "no liability disappears during a shortfall");
+
+        vm.startPrank(deployer);
+        LibInventory.incFor(components, market.accID(), MUSU_INDEX, 1_000);
+        vm.stopPrank();
         uint256 aliceBefore = LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX);
-        vm.prank(alice.owner);
-        market.claimOwed();
-        uint256 alicePaid = LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX) - aliceBefore;
-
-        // half the pool, minus the in-world transfer fee
-        assertEq(alicePaid, 500 - 15, "alice takes her share, not everything");
-        assertEq(market.owedMusu(alice.owner), 500, "the rest stays claimable");
-
-        // and bob can still claim — the whole point
         uint256 bobBefore = LibInventory.getBalanceOf(components, bob.id, MUSU_INDEX);
-        vm.prank(bob.owner);
+        vm.prank(first);
         market.claimOwed();
-        assertGt(
-            LibInventory.getBalanceOf(components, bob.id, MUSU_INDEX),
-            bobBefore,
-            "the last claimant is no longer left with nothing"
-        );
+        vm.prank(second);
+        market.claimOwed();
+        assertEq(LibInventory.getBalanceOf(components, alice.id, MUSU_INDEX) - aliceBefore, 985);
+        assertEq(LibInventory.getBalanceOf(components, bob.id, MUSU_INDEX) - bobBefore, 985);
+        assertEq(market.owedMusuTotal(), 0, "both full claims paid after backing is restored");
     }
 
     function testFullyBackedClaimsStillPayInFull() public {

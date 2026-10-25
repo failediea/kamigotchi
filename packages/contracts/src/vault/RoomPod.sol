@@ -36,13 +36,14 @@ interface IHub {
  *
  * Trust model (same shape as the hub):
  *  - this contract OWNS the game account; no human ever holds owner keys
- *  - kami movement is operator-gated in-game; during farming the contract has
- *    no operator authority. After a proved timeout it becomes its own operator
- *    and exposes only a return to the market's recorded Personal Rental Pool
- *  - money path is ONE-WAY: sweepMusu() pushes this account's MUSU to the HUB
+ *  - the farming EOA is a TRUSTED game operator: the game's KamiSend allows it
+ *    to move the Kami to arbitrary game accounts. This pod does not constrain
+ *    that authority. After recovery rotation a constrained contract operator
+ *    exposes only a return to the market's recorded Personal Rental Pool
+ *  - sweepMusu() pushes this account's pay item to the HUB
  *    account (hard-wired, anyone may call), where settle() pays owners/renters.
- *    No other outflow exists. ItemTransfer is owner-gated in-game, so the pod's
- *    operator cannot move funds either.
+ *    ItemTransfer is owner-gated in-game, so the farming operator cannot use it
+ *    to redirect inventory; it still controls gameplay and its gas escrow.
  *  - recovery rotation targets a fresh CREATE2 PodRecoveryOperator, retryable
  *    with a new salt if the address is squatted, and irreversible once it lands
  */
@@ -67,6 +68,13 @@ contract RoomPod {
   string public label; // human tile name, e.g. "Misty Riverside (EERIE)"
   bool public recoveryMode;
 
+  error NotAdmin();
+  error AlreadyBound();
+  error AlreadyInitialized();
+  error Unbound();
+  error AlreadyRecovering();
+  error NotRecovering();
+  error NoPool();
 
   event Initialized(uint256 accID, address operator, string name);
   event OperatorRotated(address newOperator);
@@ -79,7 +87,7 @@ contract RoomPod {
   event LeaseBound(uint32 indexed tokenIndex);
 
   modifier onlyAdmin() {
-    require(msg.sender == admin, "Pod: not admin");
+    require(msg.sender == admin, NotAdmin());
     _;
   }
 
@@ -104,7 +112,7 @@ contract RoomPod {
   /// @notice One-time lease binding used by renter-created pods. Legacy shared
   /// pods can remain unbound but cannot enter the personal-lease recovery path.
   function bindLease(uint32 _tokenIndex) external onlyAdmin {
-    require(!leaseBound && accID == 0, "Pod: already bound");
+    require(!leaseBound && accID == 0, AlreadyBound());
     tokenIndex = _tokenIndex;
     leaseBound = true;
     emit LeaseBound(_tokenIndex);
@@ -112,7 +120,7 @@ contract RoomPod {
 
   /// @notice register this pod's game account (contract-owned, like the hub's)
   function initialize(address operator, string calldata name) external onlyAdmin {
-    require(accID == 0, "Pod: initialized");
+    require(accID == 0, AlreadyInitialized());
     bytes memory result = AccountRegisterSystem(_sys(AccountRegisterSystemID)).executeTyped(
       operator,
       name
@@ -130,8 +138,8 @@ contract RoomPod {
   /// reverts and the caller retries with a different salt, burning no state.
   /// Recovery mode still can never be exited.
   function enterRecoveryMode(bytes32 salt) external onlyAdmin {
-    require(leaseBound, "Pod: unbound");
-    require(!recoveryMode, "Pod: recovery active");
+    require(leaseBound, Unbound());
+    require(!recoveryMode, AlreadyRecovering());
     address op = LibClone.cloneDeterministic(recoveryOpImpl, salt);
     PodRecoveryOperator(op).initialize(address(this));
     // rotate FIRST: a squatted address must revert before any state is written
@@ -153,7 +161,7 @@ contract RoomPod {
   /// allow-failure stop so a caller cannot wedge recovery while a cooldown is
   /// still active. A false result simply means retry later.
   function stopHarvestForRecovery() external returns (bool stopped) {
-    require(recoveryMode, "Pod: not recovering");
+    require(recoveryMode, NotRecovering());
     uint256 kamiID = hub.listingKamiID(tokenIndex);
     uint256 harvestID = LibHarvest.getForKami(_comps(), kamiID);
     if (harvestID == 0 || !LibKami.isState(_comps(), kamiID, "HARVESTING")) {
@@ -172,7 +180,7 @@ contract RoomPod {
   /// pod. Anyone may fund the pod's game account with Onyx and retry; the call
   /// can revive only this bound lease's Kami and cannot move inventory out.
   function reviveWithPodOnyxForRecovery() external {
-    require(recoveryMode, "Pod: not recovering");
+    require(recoveryMode, NotRecovering());
     _asOperator(
       KamiOnyxReviveSystemID,
       abi.encodeWithSelector(KamiOnyxReviveSystem.executeTyped.selector, tokenIndex)
@@ -184,9 +192,9 @@ contract RoomPod {
   /// KamiSend itself enforces RESTING state and cooldown, so callers retry after
   /// stop/send cooldowns rather than gaining a bypass.
   function returnKamiToPool() external {
-    require(recoveryMode, "Pod: not recovering");
+    require(recoveryMode, NotRecovering());
     address pool = hub.listingPool(tokenIndex);
-    require(pool != address(0), "Pod: no pool");
+    require(pool != address(0), NoPool());
     // executeTyped is overloaded (single / batch), so name the exact signature
     _asOperator(
       KamiSendSystemID,
@@ -237,9 +245,12 @@ contract RoomPod {
     // A non-MUSU pod earns only payItem but the game still charges its fee in
     // MUSU, so without a seeded float the sweep can never happen and the pod's
     // whole balance strands while the hub keeps crediting the xp delta. The
-    // factory seeds this at pod creation; feeFloat() lets ops see it draining.
+    // factory seeds this at dispatch; feeFloat() lets ops see it draining.
     // A positive floatReturn already proves the float covers every fee below.
-    if (payItem != MUSU_INDEX && floatReturn == 0 && feeFloat() < TRANSFER_FEE) return 0;
+    // Public callers must fund their fee AND preserve one final pay-item fee.
+    if (payItem != MUSU_INDEX && floatReturn == 0 && feeFloat() < (terminal ? TRANSFER_FEE : 2 * TRANSFER_FEE)) {
+      return 0;
+    }
     swept = bal > feeFromProceeds ? bal - feeFromProceeds : 0;
 
     uint256 n = (swept > 0 ? 1 : 0) + (floatReturn > 0 ? 1 : 0);

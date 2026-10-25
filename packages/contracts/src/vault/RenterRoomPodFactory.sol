@@ -5,7 +5,7 @@ import {ECDSA} from "openzeppelin/utils/cryptography/ECDSA.sol";
 import {IWorld} from "solecs/interfaces/IWorld.sol";
 
 import {LibAccount} from "libraries/LibAccount.sol";
-import {MUSU_INDEX} from "libraries/LibInventory.sol";
+import {MUSU_INDEX, TRANSFER_FEE} from "libraries/LibInventory.sol";
 import {HubGuard} from "./HubGuard.sol";
 import {PodRecoveryOperator} from "./PodRecoveryOperator.sol";
 import {RoomPod} from "./RoomPod.sol";
@@ -30,6 +30,7 @@ interface IRenterFundedLeaseMarket {
     function leaseRenter(uint32 tokenIndex) external view returns (address);
     function listingPool(uint32 tokenIndex) external view returns (address);
     function seedPodFeeFloat(uint256 podAccID, uint256 amount) external;
+    function musuFeeFloat() external view returns (uint256);
     function setPrefs(uint32 tokenIndex, string calldata prefs) external;
     function extendLease(uint32 tokenIndex, uint32 extraSecs) external;
     function finalizeLease(uint32 tokenIndex) external;
@@ -48,7 +49,11 @@ interface IRenterFundedRoomPod {
  * supplies both setup gas and a refundable operating budget. The immutable
  * quote signer approves terms while the separately hosted immutable keeper
  * attests the reserved random pod operator and advances the constrained setup
- * state machine. Neither can redirect a Kami or administer the contracts.
+ * state machine. This factory exposes no arbitrary destination/admin setter.
+ * However the registered farming EOA remains a trusted game operator: it can
+ * call KamiSend directly to arbitrary game accounts and withdraw this lease's
+ * gas budget. Constraining it requires Kamibots contract-operator relay support;
+ * the factory's setup checks alone do not eliminate that custody dependency.
  *
  * The factory is each RoomPod's nominal admin only so a provable timeout can
  * irreversibly rotate that pod to its own constrained recovery surface. No
@@ -106,6 +111,9 @@ contract RenterRoomPodFactory {
 
     IWorld public immutable world;
     IRenterFundedLeaseMarket public immutable market;
+    // The market's currency is immutable; avoid repeated external reads on
+    // checkout and dispatch in this byte-constrained deployment factory.
+    uint32 private immutable _payItem;
     address public immutable quoteSigner;
     address public immutable keeper;
     /// @notice shared PodRecoveryOperator implementation cloned by every pod
@@ -136,6 +144,7 @@ contract RenterRoomPodFactory {
     error QuoteAlreadyUsed();
     error Reentrancy();
     error TransferFailed();
+    error FeeFloatEmpty();
 
     event RenterPodCreated(
         address indexed renter,
@@ -181,6 +190,7 @@ contract RenterRoomPodFactory {
         ) revert BadQuote();
         world = _world;
         market = IRenterFundedLeaseMarket(_market);
+        _payItem = market.payItem();
         quoteSigner = _quoteSigner;
         keeper = _keeper;
         // One shared implementation for every pod's recovery operator. Pods clone
@@ -262,20 +272,15 @@ contract RenterRoomPodFactory {
         nonceUsed[quote.nonce] = true;
 
         RoomPod created = new RoomPod(
-            world, address(market), quote.nodeIndex, quote.label, market.payItem(), recoveryOpImpl
+            world, address(market), quote.nodeIndex, quote.label, _payItem, recoveryOpImpl
         );
         created.bindLease(quote.tokenIndex);
         created.initialize(quote.operator, quote.accountName);
         pod = address(created);
 
-        // A non-MUSU pod earns only payItem, but the game charges its transfer
-        // fee in MUSU — so without a seeded float this pod could never sweep its
-        // own earnings to the hub and they would strand permanently. Seed it now,
-        // from the hub's float, while the hub still has a chance to say no: a dry
-        // float must block checkout rather than mint a lease that cannot pay out.
-        if (market.payItem() != MUSU_INDEX) {
-            market.seedPodFeeFloat(created.accID(), POD_FEE_FLOAT_SEED);
-        }
+        // Check capacity now, but seed only when custody is dispatched. A renter
+        // cancelling REQUESTED must not strand float or burn two transfer fees.
+        if (market.musuFeeFloat() < POD_FEE_FLOAT_SEED + TRANSFER_FEE) revert FeeFloatEmpty();
 
         requests[quote.tokenIndex] = Request({
             renter: quote.renter,
@@ -332,6 +337,9 @@ contract RenterRoomPodFactory {
     function markLeasePreparing(uint32 tokenIndex) external onlyKeeper nonReentrant {
         Request storage request = requests[tokenIndex];
         if (request.stage != REQUESTED) revert BadStage();
+        if (_payItem != MUSU_INDEX) {
+            market.seedPodFeeFloat(IRenterFundedRoomPod(request.pod).accID(), POD_FEE_FLOAT_SEED);
+        }
         market.prepareProvisionedLease(tokenIndex);
         request.stage = PREPARING;
         // Restart the grace clock on the stage it actually guards. It was stamped
@@ -540,8 +548,10 @@ contract RenterRoomPodFactory {
         // factory's activation timestamp is the authoritative expiry gate.
         if (
             request.stage != ACTIVE
+                || market.leaseRenter(tokenIndex) != request.renter
                 || block.timestamp > uint256(request.requestedAt) + request.termSecs
         ) revert BadStage();
+        if (extraSecs == 0) revert BadQuote();
         // A renter extending the owner's custody lock must also fund a real
         // operating reserve. Twelve million gas units/day covers the measured
         // safe Rest V3 cadence plus terminal headroom; tx.gasprice binds the
@@ -638,13 +648,18 @@ contract RenterRoomPodFactory {
     }
 
     function _refundAndClear(uint32 tokenIndex, bool ended) internal {
-        Request memory request = requests[tokenIndex];
+        Request storage request = requests[tokenIndex];
+        // PREPARING cancellations also leave a funded pod behind. Reclaim its
+        // inventory before deleting the only request that can terminally sweep.
+        // Unseeded REQUESTED pods and transfer-fee dust return without a transfer.
+        if (!ended) RoomPod(request.pod).sweepMusu();
         uint256 refund = request.gasBudget;
+        address renter = request.renter;
         delete requests[tokenIndex];
         delete _prefs[tokenIndex];
-        if (refund != 0) _sendOrOwe(request.renter, refund);
-        if (ended) emit GasRefunded(tokenIndex, request.renter, refund);
-        else emit RequestCancelled(tokenIndex, request.renter, refund);
+        if (refund != 0) _sendOrOwe(renter, refund);
+        if (ended) emit GasRefunded(tokenIndex, renter, refund);
+        else emit RequestCancelled(tokenIndex, renter, refund);
     }
 
     function _operator(address pod) internal view returns (address) {

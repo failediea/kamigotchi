@@ -345,4 +345,52 @@ contract RoomPodTest is SetupTemplate {
     assertEq(LibInventory.getBalanceOf(components, vippPod.accID(), MUSU_INDEX), 30, "float stays with the pod");
     assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), MUSU_INDEX), 0, "hub got no float");
   }
+
+  function testRepeatedPublicVippSweepsPreserveTerminalFee() public {
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, 2);
+    vippMarket.initialize(_getNextUserAddress(), "reservevipphub");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", 2, recoveryImpl);
+    vippPod.initialize(_getNextUserAddress(), "reservevipppod");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, 45);
+    vm.stopPrank();
+    address caller = _getNextUserAddress();
+
+    for (uint256 i; i < 2; i++) {
+      vm.startPrank(deployer);
+      LibInventory.incFor(components, vippPod.accID(), 2, 150);
+      vm.stopPrank();
+      vm.prank(caller);
+      assertEq(vippPod.sweepMusu(), 150);
+    }
+    assertEq(vippPod.feeFloat(), 15, "public sweeps preserve one exit fee");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), 2, 200);
+    vm.stopPrank();
+    vm.prank(caller);
+    assertEq(vippPod.sweepMusu(), 0, "third public sweep cannot spend exit reserve");
+    assertEq(vippPod.feeFloat(), 15);
+
+    assertEq(vippPod.sweepMusu(), 200, "factory terminal sweep still succeeds");
+    assertEq(vippPod.feeFloat(), 0);
+    assertEq(vippPod.musuBalance(), 0);
+    assertEq(LibInventory.getBalanceOf(components, vippMarket.accID(), 2), 500);
+  }
+
+  function testPublicVippSweepPreservesFullFeeWhenFloatIsNotFeeMultiple() public {
+    KamiLeaseMarket vippMarket = new KamiLeaseMarket(world, _Kami721, MGMT_BPS, 2);
+    vippMarket.initialize(_getNextUserAddress(), "oddvipphub");
+    RoomPod vippPod = new RoomPod(world, address(vippMarket), POD_NODE, "VIPP tile", 2, recoveryImpl);
+    vippPod.initialize(_getNextUserAddress(), "oddvipppod");
+    vm.startPrank(deployer);
+    LibInventory.incFor(components, vippPod.accID(), MUSU_INDEX, 29);
+    LibInventory.incFor(components, vippPod.accID(), 2, 200);
+    vm.stopPrank();
+
+    vm.prank(_getNextUserAddress());
+    assertEq(vippPod.sweepMusu(), 0, "29 MUSU cannot cover both public and terminal fees");
+    assertEq(vippPod.feeFloat(), 29);
+    assertEq(vippPod.sweepMusu(), 200, "terminal transfer remains funded");
+    assertEq(vippPod.feeFloat(), 14, "only uneconomic fee dust remains");
+  }
 }
