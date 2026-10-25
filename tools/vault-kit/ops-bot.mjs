@@ -14,18 +14,24 @@
  * leased, with the renter's node + risk. Pool kamis are NEVER farmed.
  *
  * Also: auto-confirmArrival, pod MUSU sweeps to the hub, owner returns
- * (hub -> owner + clearReturned), and the THEFT ALARM (kami outside hub+pods
- * without a return request -> alert + optional rotate of ALL operators).
+ * (hub/pod -> market-recorded return target + clearReturned), plus an alert-only
+ * theft alarm. The sealed market intentionally has no emergency admin key.
  *
  * Files: ./.env, ./pods.json (pod addresses + operator keys),
  * ./kamibots-credentials.json (hub), ./kamibots-credentials-pod<node>.json
  * (per-pod Kamibots registrations). State persists in ops-state.json.
  */
 import { JsonRpcProvider, Wallet, Contract, id as keccakId } from "ethers";
-import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import { nodeSupportsKamiLevel } from "./tile-eligibility.mjs";
+import {
+  buildKamibotsStartBody,
+  kamibotsStrategySignature,
+  normalizeKamibotsPrefs,
+} from "./kamibots-rental-config.mjs";
 
 // ---- env / config -----------------------------------------------------------
 // OPS_DIR: run several markets from ONE bot binary — each market gets its own
@@ -44,9 +50,6 @@ const RPC = process.env.YOMINET_RPC;
 const WORLD = process.env.WORLD_ADDR;
 const MARKET = process.env.MARKET_ADDRESS;
 const OP_KEY = process.env.OPERATOR_PRIVATE_KEY;
-// Keep emergency admin authority out of the always-on process unless it is
-// explicitly supplied. DEPLOYER_KEY is intentionally never treated as admin.
-const ADMIN_KEY = process.env.ADMIN_PRIVATE_KEY;
 const KAMIBOTS = process.env.KAMIBOTS_API || "https://api.kamibots.xyz";
 const POLL_MS = 30_000;
 const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
@@ -54,12 +57,11 @@ const SWEEP_MIN_MUSU = Number(process.env.SWEEP_MIN_MUSU || 100);
 // same tile starts instantly (no KamiSend, no 1h in-game cooldown). only after
 // the grace expires does it ship back to the hub pool.
 const PARK_GRACE_MS = Number(process.env.PARK_GRACE_HOURS || 2) * 3600_000;
-
 const STATE_FILE = join(OPS_DIR, "ops-state.json");
 const state = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
   : { lastBlock: 0, strategies: {}, prefs: {} };
-state.strategies ??= {}; // tokenIndex -> node:risk the strategy runs as
+state.strategies ??= {}; // tokenIndex -> node-prefixed exact Kamibots config signature
 state.prefs ??= {}; // tokenIndex -> latest prefs JSON string
 state.parkedAt ??= {}; // tokenIndex -> ms timestamp the pod-park grace started
 const saveState = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
@@ -75,7 +77,6 @@ if (!podsFile?.pods?.length) throw new Error("pods.json missing — deploy pods 
 // ---- chain wiring -----------------------------------------------------------
 const provider = new JsonRpcProvider(RPC);
 const operator = new Wallet(OP_KEY, provider); // HUB operator
-const admin = ADMIN_KEY ? new Wallet(ADMIN_KEY, provider) : null;
 
 const MARKET_ABI = [
   "function accID() view returns (uint256)",
@@ -86,7 +87,6 @@ const MARKET_ABI = [
   "function clearReturned(uint32 tokenIndex)",
   "function confirmArrival(uint32 tokenIndex)",
   "function finalizeLease(uint32 tokenIndex)",
-  "function rotateOperator(address newOperator)",
   "function operatorAddr() view returns (address)",
   "function settler() view returns (address)",
   "function pendingXpDelta(uint32) view returns (uint256)",
@@ -147,7 +147,7 @@ const world = new Contract(WORLD, ["function components() view returns (address)
 const REG_ABI = ["function getEntitiesWithValue(uint256 value) view returns (uint256[])"];
 const COMP_ABI = [...REG_ABI, "function getValue(uint256 entity) view returns (uint256)"];
 
-let comps, idOwnsKami, addrOperator, kamiSendAddr, marketAccID;
+let comps, idOwnsKami, kamiLevel, addrOperator, kamiSendAddr, marketAccID;
 const KAMI_SEND_ABI = ["function executeTyped(uint32 kamiIndex, address toAddress) returns (bytes)"];
 
 async function wire() {
@@ -166,7 +166,11 @@ async function wire() {
     ["function safeGet(uint256) view returns (uint256)"],
     provider
   );
-  // AddressOperatorComponent: use get(uint256)->address. getValue REVERTS on live.
+  kamiLevel = new Contract(
+    await lookup(comps, "component.level"),
+    ["function get(uint256) view returns (uint256)"],
+    provider
+  );
   addrOperator = new Contract(
     await lookup(comps, "component.address.operator"),
     ["function get(uint256) view returns (address)"],
@@ -303,54 +307,24 @@ async function kb(creds, path, opts = {}) {
   try { return JSON.parse(text); } catch { return { raw: text }; }
 }
 
-const RISK = {
-  safe: { useHpBasedRest: true, hpThresholdLow: 50, hpThresholdHigh: 90 },
-  balanced: { useHpBasedRest: true, hpThresholdLow: 30, hpThresholdHigh: 80 },
-  aggressive: { useHpBasedRest: true, hpThresholdLow: 15, hpThresholdHigh: 60 },
-};
-
-// renter-suppliable food (kamibots item ids). FEED mode uses the renter's own
-// food in the pod inventory — the pool never buys anything.
-const FOOD_IDS = new Set([11301, 11302, 11303, 11304, 11311, 11312, 11313, 11314]);
-
-// a running strategy is identified by node + risk + regen(+food) + rez — ANY
-// change must restart the strategy with the new config
-const stratSig = (node, risk, regen = "REST", food = 0, rez = 0) =>
-  `${node}:${risk}:${regen}:${food}:${rez ? 1 : 0}`;
-
 function parsePrefs(idx) {
-  let risk = "balanced";
-  let node = DEFAULT_NODE;
-  let mode = "bot";
-  let regen = "REST";
-  let food = 0;
-  let rez = 0;
   try {
-    const p = JSON.parse(state.prefs[idx] || "{}");
-    if (p.mode === "self" && selfPods.has(Number(p.node))) {
-      mode = "self";
-      node = Number(p.node);
-    } else if (pods.has(Number(p.node))) node = Number(p.node);
-    if (RISK[p.risk]) risk = p.risk;
-    // FEED mode: renter supplies the food (item id) into the pod inventory
-    if (p.regen === "FEED" && FOOD_IDS.has(Number(p.food))) {
-      regen = "FEED";
-      food = Number(p.food);
-    }
-    // DEATH PROTECTION: renter ships Red Ribbon Gummies (11001) to the pod and
-    // opts in — the strategy switches to rest_v3, whose runner auto-revives.
-    // rest_v3 has no feed support, so rez forces REST regen.
-    if (p.rez === 1 || p.rez === true) {
-      rez = 1;
-      regen = "REST";
-      food = 0;
-    }
-  } catch {}
-  return { risk, node, mode, regen, food, rez };
+    return normalizeKamibotsPrefs(JSON.parse(state.prefs[idx] || "{}"), {
+      defaultNode: DEFAULT_NODE,
+      botNodes: pods,
+      selfNodes: selfPods,
+    });
+  } catch {
+    return normalizeKamibotsPrefs({}, {
+      defaultNode: DEFAULT_NODE,
+      botNodes: pods,
+      selfNodes: selfPods,
+    });
+  }
 }
 
 const warnedPods = new Set();
-async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0, rez = 0) {
+async function startStrategy(pod, tokenIndex, prefs) {
   if (!pod.creds) {
     if (!warnedPods.has(pod.node)) {
       warnedPods.add(pod.node);
@@ -359,69 +333,12 @@ async function startStrategy(pod, tokenIndex, risk, regen = "REST", food = 0, re
     return;
   }
   try {
-    // FEED mode: renter supplied food (their items, in the pod inventory) — the
-    // kami eats instead of resting for far higher uptime. failsafe rests when
-    // the food runs out. REST mode: classic harvestAndRest. REZ mode: rest_v3,
-    // the only FREE strategy whose runner auto-revives (reviveOnDeath) — the
-    // renter keeps Red Ribbon Gummies (11001) in the pod inventory for it.
-    const base = { farmInterval: 1800, restInterval: 1800, initialCooldown: 60, ...(RISK[risk] || RISK.balanced) };
-    let body;
-    if (rez) {
-      body = {
-        strategyType: "rest_v3",
-        kamiId: tokenIndex,
-        nodeId: pod.node,
-        config: {
-          kamiIndices: [tokenIndex],
-          nodeId: pod.node,
-          restV3Preferences: [
-            {
-              kamiIndex: tokenIndex,
-              autoCollect: true,
-              bountyCollectThreshold: 10000,
-              reviveOnDeath: true,
-              safetyMargin: risk === "safe" ? 7 : risk === "aggressive" ? 2 : 5,
-            },
-          ],
-        },
-        keyData: { privy_id: pod.creds.privyId },
-      };
-    } else if (regen === "FEED" && food) {
-      body = {
-        strategyType: "harvestAndFeed",
-        kamiId: tokenIndex,
-        nodeId: pod.node,
-        config: {
-          ...base,
-          enableFeedInterval: true,
-          feedInterval: 3600,
-          foodType: food,
-          enableFailsafeRest: true,
-          failsafeRestDuration: 600,
-        },
-        keyData: { privy_id: pod.creds.privyId },
-      };
-    } else {
-      body = {
-        strategyType: "harvestAndRest",
-        kamiId: tokenIndex,
-        nodeId: pod.node,
-        config: base,
-        keyData: { privy_id: pod.creds.privyId },
-      };
-    }
-    try {
-      await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
-    } catch (e) {
-      if (!rez) throw e;
-      // rest_v3 rejected (schema drift?) — farm WITHOUT auto-revive rather than
-      // not at all. Sig still records the desired rez so we don't churn restarts.
-      console.error(`🚑 rest_v3 (auto-revive) refused for #${tokenIndex}: ${e.message?.slice(0, 160)} — falling back to harvestAndRest WITHOUT revive`);
-      body = { strategyType: "harvestAndRest", kamiId: tokenIndex, nodeId: pod.node, config: base, keyData: { privy_id: pod.creds.privyId } };
-      await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
-    }
-    state.strategies[tokenIndex] = stratSig(pod.node, risk, regen, food, rez);
-    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${risk}${regen === "FEED" ? ` · FEED item ${food}` : ""}${rez ? " · AUTO-REVIVE" : ""}) via ${pod.label}`);
+    const body = buildKamibotsStartBody(pod, tokenIndex, prefs);
+    // Never silently substitute a different Kamibots strategy. If the selected
+    // config is rejected, leave it visibly unarmed so the renter can fix it.
+    await kb(pod.creds, "/api/strategies/start", { method: "POST", body });
+    state.strategies[tokenIndex] = kamibotsStrategySignature(prefs);
+    console.log(`▶️  kami #${tokenIndex} farming node ${pod.node} (${prefs.strategy}) via ${pod.label}`);
   } catch (e) {
     console.error(`strategy start failed #${tokenIndex} on pod ${pod.node}: ${e.message}`);
   }
@@ -506,10 +423,25 @@ async function reconcile(idx, l) {
   const actualAcc = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
   if (actualAcc === null) return;
 
-  const { risk, node, mode, regen, food, rez } = parsePrefs(idx);
+  const prefs = parsePrefs(idx);
+  const { node, mode } = prefs;
   const leased = l.renter !== "0x0000000000000000000000000000000000000000";
   const holdingPod = podByAccID(actualAcc);
   const targetPod = leased ? (mode === "self" ? selfPods.get(node) : pods.get(node)) : null;
+
+  if (leased) {
+    const level = await kamiLevel.get(l.kamiID).catch(() => null);
+    if (level === null) {
+      if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+      console.error(`reconcile #${idx}: Kami level unavailable; refusing to route`);
+      return;
+    }
+    if (!nodeSupportsKamiLevel(node, Number(level))) {
+      if (state.strategies[idx] !== undefined) await stopStrategy(idx);
+      console.error(`reconcile #${idx}: node ${node} only supports level 15 and below; Kami is level ${level}; refusing to route`);
+      return;
+    }
+  }
 
   // Bad or stale prefs must never crash the whole reconciler and must never
   // silently route a kami to an arbitrary account. Stop any known strategy and
@@ -539,10 +471,10 @@ async function reconcile(idx, l) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
       return;
     }
-    // right tile: the renter's exact strategy (node/risk/regen/food) should run
-    if (leased && state.strategies[idx] !== stratSig(targetPod.node, risk, regen, food, rez)) {
+    // right tile: the renter's exact Kamibots strategy should run
+    if (leased && state.strategies[idx] !== kamibotsStrategySignature(prefs)) {
       if (state.strategies[idx] !== undefined) await stopStrategy(idx);
-      await startStrategy(targetPod, idx, risk, regen, food, rez);
+      await startStrategy(targetPod, idx, prefs);
     }
     return;
   }
@@ -578,6 +510,9 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
   const holder = at === marketAccID ? null : podByAccID(at);
   if (at !== marketAccID && !holder) return; // outside the protocol: theft alarm's turf
 
+  // The market records the immutable return ACCOUNT. Personal listings record
+  // the pool contract; legacy listings record the owner. Resolve that account's
+  // current operator on-chain instead of trusting a bot-configured destination.
   const opAddr = await addrOperator.get(BigInt(ownerAddr)).catch(() => null);
   if (!opAddr || opAddr === "0x0000000000000000000000000000000000000000") {
     console.error(`return #${idx}: owner has no operator on file — manual return needed`);
@@ -679,54 +614,22 @@ async function theftCheck() {
   for (let i = 0; i < n; i++) {
     const idx = Number(await market.tokenIndices(i));
     const l = await market.listings(idx);
+    // Idle personal listings intentionally remain in their owner custody pool.
+    // A requested return is also intentionally leaving hub/pod custody.
     if (!l.staked || l.returning) continue;
     const at = await idOwnsKami.safeGet(l.kamiID).catch(() => null);
     if (at === null || allowed.has(at)) continue;
 
-    console.error(`🚨🚨 THEFT ALARM: listed kami #${idx} left the protocol (now in acc ${at}) WITHOUT a return request!`);
-    writeFileSync(join(OPS_DIR, "THEFT-ALARM.txt"),
-      `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`, { flag: "a" });
-
-    // LATCH: rotate ONCE per incident, never every tick. after an auto-rotate the
-    // stolen kami is still gone (condition persists), so without this the bot
-    // would re-rotate — and re-mint keys — on every poll.
-    if (state.alarmLatched) {
-      console.error(`🔒 alarm already latched — automation cut off; manual intervention required (clear state.alarmLatched to re-arm)`);
-      return;
-    }
-
-    if (admin) {
-      // rotate EVERY key-holding operator to a fresh QUARANTINE key. self pods are
-      // skipped: their operator is the guard CONTRACT (no key to compromise).
-      const rotations = [["hub", (a) => market.connect(admin).rotateOperator(a)]];
-      for (const pod of pods.values())
-        rotations.push([`pod ${pod.node}`, (a) => pod.contract.connect(admin).rotateOperator(a)]);
-
-      // fresh keys are written to a 0600 file, NEVER to the log
-      const quarantine = {};
-      for (const [name, rotate] of rotations) {
-        try {
-          const fresh = Wallet.createRandom();
-          quarantine[name] = { address: fresh.address, privateKey: fresh.privateKey };
-          const tx = await rotate(fresh.address);
-          await tx.wait();
-          console.error(`🔒 ${name} operator rotated to ${fresh.address} (key in quarantine-keys.json, mode 600)`);
-        } catch (e) {
-          console.error(`rotate ${name} failed: ${e.message?.slice(0, 120)}`);
-        }
-      }
-      const qpath = join(OPS_DIR, "quarantine-keys.json");
-      writeFileSync(qpath, JSON.stringify({ at: new Date().toISOString(), keys: quarantine }, null, 2), { mode: 0o600 });
-      try { chmodSync(qpath, 0o600); } catch {}
-      state.alarmLatched = true;
-      saveState();
-      console.error(`🔒 all operators rotated — automation cut off. keys quarantined; alarm LATCHED (no further auto-rotation).`);
-    } else {
-      // no admin key on this bot: alert only, and latch so we don't spam the alert
-      state.alarmLatched = true;
-      saveState();
-      console.error(`⚠️  no ADMIN key on this bot — CANNOT auto-rotate. Rotate operators manually NOW. Alarm latched.`);
-    }
+    console.error(`THEFT ALARM: listed kami #${idx} left hub/pod custody (account ${at})`);
+    writeFileSync(
+      join(OPS_DIR, "THEFT-ALARM.txt"),
+      `${new Date().toISOString()} kami #${idx} moved to acc ${at}\n`,
+      { flag: "a" }
+    );
+    state.alarmLatched = true;
+    saveState();
+    console.error("sealed market: alarm latched; no emergency admin authority exists");
+    return;
   }
 }
 
@@ -757,11 +660,19 @@ async function tick() {
   const head = await provider.getBlockNumber();
   const from = state.lastBlock ? state.lastBlock + 1 : Math.max(0, head - 5_000);
 
-  const [accepted, ended, prefEvents] = await Promise.all([
-    market.queryFilter(market.filters.LeaseAccepted(), from, head),
-    market.queryFilter(market.filters.LeaseEnded(), from, head),
-    market.queryFilter(market.filters.PrefsUpdated(), from, head),
-  ]);
+  // Some RPC load-balancers can briefly report the same (or an older) head on
+  // the next poll. Do not issue eth_getLogs with fromBlock > toBlock; continue
+  // the reconciler and scan events once the reported head advances again.
+  let accepted = [];
+  let ended = [];
+  let prefEvents = [];
+  if (from <= head) {
+    [accepted, ended, prefEvents] = await Promise.all([
+      market.queryFilter(market.filters.LeaseAccepted(), from, head),
+      market.queryFilter(market.filters.LeaseEnded(), from, head),
+      market.queryFilter(market.filters.PrefsUpdated(), from, head),
+    ]);
+  }
   for (const e of accepted) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs || "";
   for (const e of prefEvents) state.prefs[Number(e.args.tokenIndex)] = e.args.prefs || "";
   for (const e of ended) {
@@ -831,7 +742,7 @@ async function tick() {
 }
 
 await wire();
-console.log(`ops-bot v12 online. hub ${MARKET}, hub operator ${operator.address}, pods [${[...pods.keys()].join(", ")}], emergency admin ${admin ? "explicitly armed" : "not loaded"}`);
+console.log(`ops-bot v13 online. hub ${MARKET}, hub operator ${operator.address}, pods [${[...pods.keys()].join(", ")}], market admin permanently sealed`);
 for (;;) {
   try { await tick(); } catch (e) { console.error(`tick error: ${e.message?.slice(0, 200)}`); }
   await new Promise((r) => setTimeout(r, POLL_MS));
