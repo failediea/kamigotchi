@@ -1,0 +1,17 @@
+# H7 / CON-01: permissionless endLease for expired, not-ending v16 leases.
+# NOT installed by default. Install with ../install-launch-ops.sh --component keeper
+# only after SPONSOR_KEY_FILE and SPONSOR_ADDRESS are set in the env file.
+[Unit]
+Description=Kami lease v16 expiry keeper (endLease after leaseEnd)
+After=network-online.target
+Wants=network-online.target
+OnFailure=kami-lease-ops-onfailure@%n.service
+
+[Service]
+Type=oneshot
+Environment=LAUNCH_OPS_ENV=/etc/kami-lease-ops/launch-ops.env
+# /bin/bash: the unit runs even if the script lost its exec bit (git archive of a
+# 100644 commit); install-launch-ops.sh still enforces the mode.
+ExecStart=/bin/bash /root/kamigotchi/tools/launch-ops/keeper/lease-expiry-keeper.sh --apply
+TimeoutStartSec=900
+SyslogIdentifier=kami-lease-expiry-keeper
