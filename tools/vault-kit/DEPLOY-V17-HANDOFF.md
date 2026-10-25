@@ -1,5 +1,11 @@
 # V17 lease-hardening handoff — prepared, not broadcast
 
+> **Historical snapshot — superseded for deployment by the October 25 review.**
+> The old source, size numbers, predicted addresses and funding gates below are
+> not approval to broadcast the current repair branch. Read
+> [REVIEW-2026-10-25.md](REVIEW-2026-10-25.md), restore healthy RPC access, and
+> regenerate the exact deployment simulation and wiring checks first.
+
 Snapshot: 2026-08-01.
 
 ## Status

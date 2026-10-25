@@ -1,5 +1,10 @@
 # v16 deploy runbook — LAUNCHED 2026-07-31
 
+> **Historical launch record, not current operational status.** October 25
+> repairs are in a separate review branch and have not been deployed. Do not
+> copy old gas-mode values or repeat this deploy against the live markets.
+> See [REVIEW-2026-10-25.md](REVIEW-2026-10-25.md) for the current gates.
+
 > **Status: V16 infrastructure is the production stack as of 2026-07-31.**
 > Workers staged from `c8346aae`; both V16 services are active/enabled with
 > `terminalGasReturn=factory` on ports 8791/8792; Caddy and Vercel point at V16.
