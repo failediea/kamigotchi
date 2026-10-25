@@ -27,6 +27,7 @@ import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { nodeSupportsKamiLevel } from "./tile-eligibility.mjs";
+import { returnCheckDue, recordReturnState } from "./legacy-return-state.mjs";
 import {
   buildKamibotsStartBody,
   kamibotsStrategySignature,
@@ -147,7 +148,7 @@ const world = new Contract(WORLD, ["function components() view returns (address)
 const REG_ABI = ["function getEntitiesWithValue(uint256 value) view returns (uint256[])"];
 const COMP_ABI = [...REG_ABI, "function getValue(uint256 entity) view returns (uint256)"];
 
-let comps, idOwnsKami, kamiLevel, addrOperator, kamiSendAddr, marketAccID;
+let comps, idOwnsKami, kamiLevel, kamiState, addrOperator, kamiSendAddr, marketAccID;
 const KAMI_SEND_ABI = ["function executeTyped(uint32 kamiIndex, address toAddress) returns (bytes)"];
 
 async function wire() {
@@ -169,6 +170,11 @@ async function wire() {
   kamiLevel = new Contract(
     await lookup(comps, "component.level"),
     ["function get(uint256) view returns (uint256)"],
+    provider
+  );
+  kamiState = new Contract(
+    await lookup(comps, "component.state"),
+    ["function get(uint256) view returns (string)"],
     provider
   );
   addrOperator = new Contract(
@@ -505,6 +511,14 @@ async function reconcile(idx, l) {
 // ---- return flow: ONE direct KamiSend from wherever the kami is (hub OR a
 // parked pod) straight to the owner — no intermediate hop, no extra cooldown
 async function sendKamiHome(idx, ownerAddr, kamiID) {
+  if (!returnCheckDue(state, idx, Date.now())) return;
+  const status = await kamiState.get(kamiID).catch(() => null);
+  const gate = recordReturnState(state, idx, status, Date.now());
+  if (gate.changed) saveState();
+  if (!gate.send) {
+    if (gate.notify) console.error(`[LEASE-ALERT] ${gate.reason === "DEAD" ? "DEAD_KAMI" : "STAGE_STUCK"} token=${idx} phase=legacy-return reason=${gate.reason} action=waiting-for-state-change`);
+    return;
+  }
   const at = await idOwnsKami.safeGet(kamiID).catch(() => null);
   if (at === null) return;
   const holder = at === marketAccID ? null : podByAccID(at);
@@ -526,7 +540,7 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
     delete state.parkedAt[idx];
     console.log(`✅ return finalized on-chain for #${idx}`);
   } catch (e) {
-    console.error(`return send failed #${idx}: ${e.message?.slice(0, 160)} (cooldown? retrying next tick)`);
+    console.error(`return send failed #${idx}: ${e.message?.slice(0, 160)} (transaction failed; next attempt rechecks Kami state)`);
   }
 }
 
@@ -536,7 +550,7 @@ async function sendKamiHome(idx, ownerAddr, kamiID) {
 // without ever handing pod API keys to the web app.
 const LIVE_STATUS_FILE = join(OPS_DIR, "live-status.json");
 async function exportLiveStatus() {
-  const out = { t: Date.now(), strategies: state.strategies, parkedAt: state.parkedAt, pods: {} };
+  const out = { t: Date.now(), strategies: state.strategies, parkedAt: state.parkedAt, blockedReturns: state.blockedReturns ?? {}, pods: {} };
   for (const pod of pods.values()) {
     if (!pod.creds) continue;
     try {
